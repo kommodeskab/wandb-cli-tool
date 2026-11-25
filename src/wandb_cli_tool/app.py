@@ -24,10 +24,12 @@ class WandbCliApp(App):
     #items { height: 1fr; }
     #entities { height: auto; max-height: 20; }
     """
+    # These work everywhere but are only listed on the projects page (ProjectsScreen), where they
+    # matter; elsewhere they would only crowd the key bar.
     BINDINGS = [
-        Binding("q", "quit", "Quit"),
-        Binding("e", "change_entity", "Change entity"),
-        Binding("l", "logout", "Logout"),
+        Binding("q", "quit", "Quit", show=False),
+        Binding("e", "change_entity", "Change entity", show=False),
+        Binding("l", "logout", "Logout", show=False),
     ]
 
     def __init__(

@@ -12,9 +12,10 @@ from rich.console import RenderableType
 from textual import work
 from textual.app import ComposeResult
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, Static
+from textual.widgets import DataTable, Header, Static
 from textual.widgets.data_table import RowDoesNotExist
 
+from .keybar import KeyBar
 from ..plain import plain
 from textual.worker import get_current_worker
 
@@ -99,7 +100,7 @@ class BrowseScreen(Screen):
         yield Header()
         yield Static("Loading…", id="status")
         yield DataTable(id="items", cursor_type="row", zebra_stripes=True)
-        yield Footer()
+        yield KeyBar()
 
     def on_mount(self) -> None:
         self.title = self.title_text

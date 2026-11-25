@@ -12,7 +12,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Footer, Header, OptionList, Static
+from textual.widgets import Header, OptionList, Static
 from textual.widgets.option_list import Option
 
 from ..api import RunRef
@@ -23,6 +23,7 @@ from ..images import ImageInfo, ImageSeries, ImageStep, make_thumbnail
 from ..media import MAX_IMAGE_BYTES
 from ..api import FileInfo
 from ..layout_store import project_key
+from .keybar import KeyBar
 from ..plain import plain
 from ..refresh import PREF_KEY, interval_from_pref, label as interval_label, next_choice, to_pref
 from ..series import Point, extract_points, is_number, last_values
@@ -134,7 +135,7 @@ class ChartsScreen(Screen):
         with Horizontal():
             yield OptionList(id="panels")
             yield VerticalScroll(id="charts")
-        yield Footer()
+        yield KeyBar()
 
     def on_mount(self) -> None:
         self.title = f"Charts — {self.run_name}"
@@ -305,7 +306,20 @@ class ChartsScreen(Screen):
             parts.append(f"refresh failed: {self._refresh_error}")
         return "  ·  ".join(parts)
 
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        """Only list the keys that do something right now (the key bar shows what is left)."""
+        if action in ("change_x", "delete_chart"):
+            return isinstance(self.focused, ChartBase)
+        if action == "cycle_focus":
+            return bool(self.ready and self.panels and self.panels[self.selected].charts)
+        if action == "reset_layout":
+            return bool(self.chart_layout and self.chart_layout.is_customized)
+        if action == "cycle_refresh":
+            return self.live
+        return True
+
     def _update_status(self) -> None:
+        self.refresh_bindings()  # the live/customized state may have changed what keys apply
         custom = (
             "custom layout shared by all runs in this project (d: back to default)"
             if self.chart_layout and self.chart_layout.is_customized

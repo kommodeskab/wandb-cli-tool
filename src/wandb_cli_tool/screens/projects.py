@@ -15,7 +15,12 @@ if TYPE_CHECKING:
 
 
 class ProjectsScreen(BrowseScreen):
-    BINDINGS = [Binding("r", "reload", "Refresh")]
+    BINDINGS = [
+        Binding("r", "reload", "Refresh"),
+        Binding("e", "app.change_entity", "Change entity"),
+        Binding("l", "app.logout", "Logout"),
+        Binding("q", "app.quit", "Quit"),
+    ]
     columns = ("Project", "Last run", "Runs", "Active")
     empty_text = "No projects for this entity."
     app: "WandbCliApp"

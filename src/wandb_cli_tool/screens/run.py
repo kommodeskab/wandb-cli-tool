@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 from rich.table import Table
@@ -10,12 +9,13 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.screen import Screen
-from textual.widgets import Footer, Header, OptionList, Static
+from textual.widgets import Header, OptionList, Static
 from textual.widgets.option_list import Option
 
 from ..api import CopyEstimate, RunInfo, RunMetadata, RunRef
-from ..formatting import fmt_duration, fmt_time
+from .keybar import KeyBar
 from ..plain import plain
+from ..runfacts import summary_fields
 from .charts import ChartsScreen
 from .config import ConfigScreen
 from .copy import CopyOutcome, CopyProgressScreen, describe_copy
@@ -25,44 +25,6 @@ from .logs import LogsScreen
 
 if TYPE_CHECKING:
     from ..app import WandbCliApp
-
-Fields = list[tuple[str, str]]
-
-
-def git_state(meta: RunMetadata) -> str:
-    if not meta.git_commit:
-        return "—"
-    state = {True: " (uncommitted changes)", False: " (clean)", None: ""}[meta.git_dirty]
-    return meta.git_commit[:10] + state
-
-
-def summary_fields(
-    info: RunInfo | None, meta: RunMetadata | None, now: datetime | None = None
-) -> tuple[Fields, Fields]:
-    """(short, wide) label/value pairs. None for info/meta means 'still loading'."""
-
-    def v(value: str | None, loading: bool) -> str:
-        return "…" if loading else (value or "—")
-
-    li, lm = info is None, meta is None
-    status = ("● " if info and info.state == "running" else "") + (info.state if info else "")
-    short: Fields = [
-        ("Status", v(status, li)),
-        ("Started", v(info and fmt_time(info.created_at), li)),
-        ("Run time", v(info and fmt_duration(info.runtime_seconds(now)), li)),
-        ("Group", v(info and info.group, li)),
-        ("Host", v(meta and meta.host, lm)),
-        ("GPU", v(meta and meta.gpu, lm)),
-        ("CPU cores", v(meta and meta.cpu_cores, lm)),
-        ("Python", v(meta and meta.python, lm)),
-    ]
-    wide: Fields = [
-        ("Git repo", v(meta and meta.git_remote, lm)),
-        ("Git state", "…" if lm else git_state(meta)),
-        ("Command", v(meta and meta.command, lm)),
-    ]
-    return short, wide
-
 
 class RunScreen(Screen):
     """A run: tags and key facts at the top, then a menu (Logs, Charts, Config, Files)."""
@@ -109,7 +71,7 @@ class RunScreen(Screen):
             Option("Files", id="files"),
             id="menu",
         )
-        yield Footer()
+        yield KeyBar()
 
     def on_mount(self) -> None:
         self.title = f"Run — {self.run_name}"

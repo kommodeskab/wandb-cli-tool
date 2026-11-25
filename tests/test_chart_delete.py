@@ -151,9 +151,10 @@ async def test_delete_needs_a_focused_chart(make_app):
     app, ctx = await start(make_app)
     async with ctx as pilot:
         screen = await open_charts(pilot)  # focus is on the panel list
+        assert screen.check_action("delete_chart", ()) is False  # not offered in the key bar either
         await pilot.press("delete")
         await settle(pilot)
-        assert app.screen is screen and any("Focus a chart first" in n.message for n in app._notifications)
+        assert app.screen is screen  # nothing opened, nothing deleted
         assert saved() is None
 
 

@@ -14,6 +14,8 @@ from ..runsort import (
     HEADER_TO_COLUMN, SORT_FIELDS, SortState, sort_items, status_rank,
 )
 from .browse import BrowseScreen, Item, items_from_cache
+from ..compare import MAX_RUNS
+from .compare import CompareScreen
 from .dialogs import SortDialog
 from .run import RunScreen
 
@@ -34,6 +36,9 @@ class RunsScreen(BrowseScreen):
         Binding("escape", "app.pop_screen", "Back"),
         Binding("r", "reload", "Refresh"),
         Binding("s", "sort", "Sort"),
+        Binding("space", "toggle_select", "Select run"),
+        Binding("c", "compare", "Compare selected"),
+        Binding("u", "clear_selection", "Clear selection"),
     ]
     columns = ("Run", "Status", "Started", "Run time", "Group", "Tags", "ID")
     empty_text = "No runs in this project."
@@ -45,6 +50,7 @@ class RunsScreen(BrowseScreen):
         self.project = project
         self.title_text = f"Runs — {entity}/{project}"
         self.sort_state = SortState()
+        self.selected: list[str] = []  # run ids marked for comparison, in the order they were marked
 
     def prepare(self) -> None:
         self.sort_state = SortState.from_json(self.app.preferences.get("runs_sort"))
@@ -58,7 +64,57 @@ class RunsScreen(BrowseScreen):
         return not self.sort_state.is_server_order
 
     def status_suffix(self) -> str:
-        return "" if self.sort_state.is_server_order else f"  ·  sorted by {self.sort_state.label}"
+        sort = "" if self.sort_state.is_server_order else f"  ·  sorted by {self.sort_state.label}"
+        return sort + (f"  ·  {len(self.selected)} selected (c: compare)" if self.selected else "")
+
+    # ---- selecting runs to compare ----------------------------------------------------
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "compare":
+            return len(self.selected) >= 2
+        if action == "clear_selection":
+            return bool(self.selected)
+        return True
+
+    def action_toggle_select(self) -> None:
+        key = self._cursor_key()
+        if key is None or key not in self._items:
+            return
+        if key in self.selected:
+            self.selected.remove(key)
+        elif len(self.selected) >= MAX_RUNS:
+            self.notify(f"At most {MAX_RUNS} runs can be compared at once.", severity="warning")
+            return
+        else:
+            self.selected.append(key)
+        self._selection_changed([key])
+
+    def action_clear_selection(self) -> None:
+        keys, self.selected = self.selected, []
+        self._selection_changed(keys)
+
+    def _selection_changed(self, keys: list[str]) -> None:
+        table = self.query_one("#items", DataTable)
+        for key in keys:  # redraw just the name cell of the rows that changed
+            item = self._items.get(key)
+            if item is not None:
+                table.update_cell(key, self.columns[0], self._cell(self.render_cells(item)[0]))
+        self.refresh_bindings()
+        self._status_done()
+
+    def action_compare(self) -> None:
+        chosen = [self._items[k] for k in self.selected if k in self._items]
+        if len(chosen) < 2:
+            return
+        runs = [(self._ref(item), item.label) for item in chosen]
+        self.app.push_screen(CompareScreen(self.entity, self.project, runs))
+
+    @staticmethod
+    def _cell(value):
+        return plain(value) if isinstance(value, str) else value
+
+    def _ref(self, item: Item) -> RunRef:
+        # meta is the run's cache version; empty (not finished) means "don't cache"
+        return RunRef(self.entity, self.project, item.key, item.meta or None)
 
     @staticmethod
     def _sort_value(item: Item, column: str):
@@ -123,6 +179,8 @@ class RunsScreen(BrowseScreen):
 
     def render_cells(self, item: Item) -> tuple[RenderableType, ...]:
         name, state, started, runtime, group, tags, run_id = item.cells
+        if item.key in self.selected:
+            name = Text.assemble(("✓ ", "bold green"), name)
         status = Text("● " + state if state == "running" else state, style=STATE_STYLES.get(state, ""))
         return (name, status, started, Text(runtime, justify="right"), group, tags, run_id)
 
@@ -139,8 +197,7 @@ class RunsScreen(BrowseScreen):
         self.app.cache.set("list", self._cache_key, [i.to_json() for i in items])
 
     def open_item(self, item: Item) -> None:
-        # meta is the run's cache version; empty (not finished) means "don't cache"
-        ref = RunRef(self.entity, self.project, item.key, item.meta or None)
+        ref = self._ref(item)
         groups, tags = self.known_groups_and_tags()
         self.app.push_screen(RunScreen(ref, item.label, groups, tags))
 

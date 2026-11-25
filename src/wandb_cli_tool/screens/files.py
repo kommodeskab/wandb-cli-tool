@@ -14,13 +14,14 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import ScrollableContainer, Vertical
 from textual.screen import Screen
-from textual.widgets import Footer, Header, RichLog, Static, Tree
+from textual.widgets import Header, RichLog, Static, Tree
 from textual.widgets.tree import TreeNode
 from textual_image.widget import AutoImage, HalfcellImage, UnicodeImage
 from textual_image.widget import Image as BestImage
 
 from ..api import FileInfo, RunRef
 from ..formatting import fmt_size
+from .keybar import KeyBar
 from ..plain import plain
 from ..media import MAX_AUDIO_BYTES, MAX_IMAGE_BYTES, MAX_TEXT_BYTES, file_kind
 from ..player import INSTALL_HINT
@@ -103,7 +104,7 @@ class FilesScreen(Screen):
         yield Header()
         yield Static("Loading…", id="status")
         yield Tree("files", id="files")
-        yield Footer()
+        yield KeyBar()
 
     def on_mount(self) -> None:
         self.title = f"Files — {self.run_name}"
@@ -188,7 +189,7 @@ class FileScreen(Screen):
         yield Header()
         yield Static("", id="file-status")
         yield Vertical(id="preview")
-        yield Footer()
+        yield KeyBar()
 
     def on_mount(self) -> None:
         self.title = self.info.name
@@ -358,7 +359,8 @@ class FileScreen(Screen):
     def action_zoom(self, step: int) -> None:
         new = max(0, min(len(ZOOMS) - 1, self.zoom_index + step))
         if new != self.zoom_index:
-            if self._fit_cells is None:  # zooming before the first layout finished
+            if self._fit_cells is None or self.zoom_index == FIT:  # measure the fit size as it is now:
+                # the layout can still have changed since it was first recorded (e.g. the key bar grew)
                 self._fit_cells = (self.image_widget.size.width, self.image_widget.size.height)
             self.zoom_index = new
         self._apply_zoom()

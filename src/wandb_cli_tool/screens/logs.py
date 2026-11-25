@@ -7,10 +7,11 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.screen import Screen
-from textual.widgets import Footer, Header, RichLog, Static
+from textual.widgets import Header, RichLog, Static
 from textual.worker import get_current_worker
 
 from ..api import RunRef
+from .keybar import KeyBar
 from ..plain import plain
 
 if TYPE_CHECKING:
@@ -35,7 +36,7 @@ class LogsScreen(Screen):
         yield Header()
         yield Static("Loading…", id="status")
         yield RichLog(id="log", wrap=True, markup=False, highlight=False, auto_scroll=False)
-        yield Footer()
+        yield KeyBar()
 
     def on_mount(self) -> None:
         self.title = f"Logs — {self.run_name}"

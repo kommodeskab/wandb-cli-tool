@@ -9,11 +9,21 @@ uv sync
 uv run wandb-cli-tool          # or: uv tool install .   and then just: wandb-cli-tool
 ```
 
-On first launch you are asked for your API key and then pick an entity. Navigate with the arrow keys, `Enter` to open, `Esc` to go back, `q` to quit. The footer shows the keys available on each screen.
+On first launch you are asked for your API key and then pick an entity. Navigate with the arrow keys, `Enter` to open, `Esc` to go back, `q` to quit. The key bar at the bottom shows the keys that apply right now (it wraps onto more lines on a narrow terminal). Logout (`l`), change entity (`e`) and quit (`q`) are listed on the projects page only, but work everywhere.
 
 ## Sorting runs
 
 In a project's run list, `s` opens a sort menu: last activity (the default, newest first), name, status, started, run time, group, tags, or ID. Choosing the column that is already in use reverses it; clicking a column header does the same. Names sort naturally (`run-2` before `run-10`), run time sorts by the actual duration, and empty values always come last. The current sort is shown in the status line and as an arrow in the column header, and it is remembered for next time.
+
+## Comparing runs
+
+In a project's run list, press `Space` to select the run under the cursor (a ✓ appears; `Space` again unselects, `u` clears the selection). Select 2 to 8 runs of the same project and press `c` to compare them. Each run gets a color that follows it everywhere (shown in the legend at the top).
+
+- **Overview** (`1`): the facts from the top of a run screen (status, start, run time, group, tags, host, GPU, git, command, ID), one column per run. Rows where the runs differ are marked `≠`; `d` hides the identical rows.
+- **Config** (`2`): only what differs. A row is an entry (nested keys are written `model.name`, list items `layers[0]`) with each run's value; `—` means that run's config lacks the entry, and entries only some runs have are yellow. Entries that are the same in every run are hidden (`d` shows them), and the status line says how many there are.
+- **Charts** (`3`): the project's chart layout (the panels and charts you set up in the run screens) over all the selected runs. A plot overlays one curve per run. A plot with several metrics is split into one plot per metric, so the lines stay readable. A bar chart draws, for each metric, one bar per run side by side. A plot where every run logged a single value is drawn as bars instead. Runs that did not log a metric are named in the chart and never queried. Tables and images are not compared yet.
+
+Logs and files are not compared. Comparing only reads data; it changes nothing in W&B and does not edit the chart layout.
 
 ## Editing runs
 

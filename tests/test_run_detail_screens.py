@@ -29,7 +29,8 @@ async def settle(pilot, n=4):
 
 
 def screen_text(app):
-    return "\n".join(s.text.rstrip() for s in app.screen._compositor.render_strips())
+    # the key bar joins "key label" with non-breaking spaces so that pairs wrap whole
+    return "\n".join(s.text.rstrip() for s in app.screen._compositor.render_strips()).replace("\xa0", " ")
 
 
 def tags_line(app):

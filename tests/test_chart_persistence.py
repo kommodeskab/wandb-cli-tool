@@ -112,7 +112,7 @@ async def test_reset_asks_first_and_then_restores_the_default(make_app):
         await pilot.press("d")  # nothing customized yet
         await settle(pilot)
         assert not isinstance(app.screen, ConfirmDialog)
-        assert any("already uses the default layout" in n.message for n in app._notifications)
+        assert screen.check_action("reset_layout", ()) is False  # nothing to reset: key not offered
 
         await customize(pilot)
         await pilot.press("d")  # works from wherever the focus is on this screen

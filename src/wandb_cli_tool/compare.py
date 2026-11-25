@@ -1,0 +1,175 @@
+"""Comparing several runs of one project. UI-free.
+
+Three things are compared: the facts shown at the top of a run (`overview_rows`), the configs
+(`diff_config`: only what differs is interesting) and the charts (`compare_charts`: the
+project's chart layout, with every chart reduced to what can be overlaid across runs).
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Iterable, Sequence
+
+from .api import RunInfo, RunMetadata
+from .charts import BAR, PLOT, Panel, display_names
+from .palette import MAX_SERIES
+from .runfacts import summary_fields
+from .series import Point
+
+MAX_RUNS = MAX_SERIES  # one palette color per run, never cycled
+MAX_LIST_ITEMS = 20  # a longer list in a config is shown as one value instead of one row per item
+MAX_CONFIG_KEYS = 5000  # a pathological config cannot make the table huge
+VALUE_WIDTH = 60
+MISSING = "—"
+
+
+# ---- labels ------------------------------------------------------------------------------
+def run_labels(names: Sequence[str], ids: Sequence[str]) -> list[str]:
+    """Names to tell the runs apart by: the run name, plus the id where two runs share a name."""
+    counts = {n: names.count(n) for n in names}
+    return [f"{n} ({i})" if counts[n] > 1 else n for n, i in zip(names, ids)]
+
+
+# ---- overview ------------------------------------------------------------------------------
+@dataclass(frozen=True)
+class FieldRow:
+    label: str
+    values: tuple[str, ...]  # one per run
+    differs: bool  # not every run has the same value
+
+
+def _row(label: str, values: Sequence[str]) -> FieldRow:
+    return FieldRow(label, tuple(values), len(set(values)) > 1)
+
+
+def overview_rows(
+    infos: Sequence[RunInfo | None],
+    metas: Sequence[RunMetadata | None],
+    now: datetime | None = None,
+) -> list[FieldRow]:
+    """The run screen's header facts, one row per fact and one value per run (None = still loading)."""
+    per_run = [summary_fields(i, m, now) for i, m in zip(infos, metas)]
+    short = [dict(s) for s, _ in per_run]
+    wide = [dict(w) for _, w in per_run]
+    rows = [_row(label, [s[label] for s in short]) for label in short[0]] if short else []
+    tags = [("…" if i is None else ", ".join(i.tags) or MISSING) for i in infos]
+    rows.insert(4, _row("Tags", tags))  # after Status, Started, Run time, Group
+    rows += [_row(label, [w[label] for w in wide]) for label in wide[0]] if wide else []
+    rows.append(_row("ID", [i.id if i else "…" for i in infos]))
+    return rows
+
+
+# ---- configs -------------------------------------------------------------------------------
+def _leaf(value: Any) -> str:
+    text = "null" if value is None else str(value)
+    return text if len(text) <= VALUE_WIDTH else text[: VALUE_WIDTH - 1] + "…"
+
+
+def flatten_config(config: Any, prefix: str = "") -> dict[str, str]:
+    """A nested config as `{"optimizer.lr": "0.001", "layers[0]": "64"}`: one entry per leaf.
+    Empty containers and long lists are single values. Capped at MAX_CONFIG_KEYS entries."""
+    out: dict[str, str] = {}
+    if not config:  # no config at all has no entries (not one entry reading "{}")
+        return out
+
+    def walk(value: Any, path: str) -> None:
+        if len(out) >= MAX_CONFIG_KEYS:
+            return
+        if isinstance(value, dict) and value:
+            for key in sorted(value, key=str):
+                walk(value[key], f"{path}.{key}" if path else str(key))
+        elif isinstance(value, (list, tuple)) and 0 < len(value) <= MAX_LIST_ITEMS:
+            for i, item in enumerate(value):
+                walk(item, f"{path}[{i}]")
+        else:
+            out[path or "(config)"] = _leaf(value)
+
+    walk(config, prefix)
+    return out
+
+
+@dataclass(frozen=True)
+class ConfigRow:
+    path: str
+    values: tuple[str | None, ...]  # per run; None = this run's config has no such entry
+    only_some: bool  # some runs lack the entry (otherwise all have it, with different values)
+
+
+@dataclass(frozen=True)
+class ConfigDiff:
+    rows: list[ConfigRow]  # the entries that differ, by path
+    same: int  # how many entries are identical in every run (hidden by default)
+
+    @property
+    def different(self) -> int:
+        return sum(1 for r in self.rows if not r.only_some)
+
+    @property
+    def partial(self) -> int:
+        return sum(1 for r in self.rows if r.only_some)
+
+
+def diff_config(configs: Sequence[dict[str, Any] | None], show_all: bool = False) -> ConfigDiff:
+    """What differs between the configs: entries with different values, and entries only some of the
+    runs have. Entries every run has with the same value are only counted (or listed with `show_all`)."""
+    flat = [flatten_config(c or {}) for c in configs]
+    paths = sorted({p for f in flat for p in f})
+    rows, same = [], 0
+    for path in paths:
+        values = tuple(f.get(path) for f in flat)
+        missing = any(v is None for v in values)
+        if not missing and len(set(values)) == 1:
+            same += 1
+            if not show_all:
+                continue
+        rows.append(ConfigRow(path, values, missing))
+    return ConfigDiff(rows, same)
+
+
+# ---- charts --------------------------------------------------------------------------------
+@dataclass(frozen=True)
+class CompareChart:
+    """One chart of the comparison.
+    plot: one metric's curves overlaid, one color per run (drawn as bars instead when every run
+          logged a single value). bar: `metrics` as groups of bars, one bar per run in each group.
+    A multi-metric plot of the project's layout becomes one plot per metric (small multiples)
+    rather than runs x metrics lines in one chart."""
+
+    kind: str  # PLOT or BAR
+    metrics: tuple[str, ...]
+    x: str = "_step"
+    system: bool = False
+    title: str = ""
+    subtitle: str = ""  # the layout chart a split-up plot came from
+
+    @property
+    def metric(self) -> str:
+        return self.metrics[0]
+
+
+def compare_charts(panel: Panel) -> list[CompareChart]:
+    """The comparable charts of a layout panel. Tables and images are not compared."""
+    out: list[CompareChart] = []
+    for spec in panel.charts:
+        if spec.kind == PLOT:
+            labels = display_names(spec.series, spec.system)
+            multi = len(spec.series) > 1
+            out += [
+                CompareChart(PLOT, (m,), spec.x, spec.system, label, spec.title if multi else "")
+                for m, label in zip(spec.series, labels)
+            ]
+        elif spec.kind == BAR:
+            out.append(CompareChart(BAR, spec.series, title=spec.title))
+    return out
+
+
+def is_single_value(per_run: Iterable[list[Point]]) -> bool:
+    """Every run that has data has exactly one point: a number per run, so bars rather than lines."""
+    counts = [len(points) for points in per_run if points]
+    return bool(counts) and all(c == 1 for c in counts)
+
+
+def latest(points: list[Point]) -> float | None:
+    return points[-1][1] if points and math.isfinite(points[-1][1]) else None

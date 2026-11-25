@@ -172,3 +172,54 @@ async def test_notifications_with_bracketed_text_do_not_crash(make_app):
         await settle(pilot, 5)
         assert any("new [/group]" in n.message for n in app._notifications)
         assert "new [/group]" in screen_text(app)
+
+
+class HostilePair(Hostile):
+    """Two runs whose names, groups, tags, config and metrics are all bracketed text."""
+
+    RUNS = {("me", "alpha"): [
+        RunInfo("id1", RUN, "finished", "2024-05-01T09:00:00", "2024-05-01T08:00:00", GROUP, (TAG1, TAG2)),
+        RunInfo("id2", "[bold]other [/x]", "failed", "2024-05-01T09:00:00", "2024-05-01T08:00:00", "[/g2]", ()),
+    ]}
+
+    def run_details(self, ref):
+        return next(r for r in self.RUNS[("me", "alpha")] if r.id == ref.id)
+
+    def run_config(self, ref):
+        return {"lr [/o]": 0.1 if ref.id == "id1" else "[/v] 0.2", "only[0]": {"k [/k]": "[bold]x"}} if ref.id == "id1" else {"lr [/o]": "[/v] 0.2"}
+
+
+async def test_comparing_runs_with_bracketed_text(make_app):
+    from wandb_cli_tool.screens.compare import CompareScreen
+    from wandb_cli_tool.screens.compare_widgets import ComparePlotView
+
+    app, ctx = await hostile_app(HostilePair)
+    async with ctx as pilot:
+        await settle(pilot, 5)
+        await pilot.press("enter")  # alpha
+        await settle(pilot, 5)
+        await pilot.press("space", "down", "space", "c")
+        await settle(pilot, 8)
+        screen = app.screen
+        assert isinstance(screen, CompareScreen)
+        legend = screen.query_one("#legend", Static).render().plain
+        assert RUN in legend and "[bold]other [/x]" in legend
+        table = screen.query_one("#overview", DataTable)
+        assert [str(c.label) for c in table.columns.values()] == ["", f"■ {RUN}", "■ [bold]other [/x]"]
+        cells = {str(table.get_row_at(i)[0]).strip(" ≠"): [str(c) for c in table.get_row_at(i)[1:]] for i in range(table.row_count)}
+        assert cells["Group"] == [GROUP, "[/g2]"] and cells["Tags"] == [f"{TAG1}, {TAG2}", "—"]
+        await pilot.press("2")
+        await settle(pilot)
+        config_table = screen.query_one("#config-table", DataTable)
+        rows = {str(config_table.get_row_at(i)[0]): [str(c) for c in config_table.get_row_at(i)[1:]] for i in range(config_table.row_count)}
+        assert rows["lr [/o]"] == ["0.1", "[/v] 0.2"] and rows["only[0].k [/k]"] == ["[bold]x", "—"]
+        await pilot.press("3")
+        await settle(pilot, 6)
+        panels = screen.query_one("#panels", OptionList)
+        assert panels.option_count >= 1
+        assert any("weights[0]" in str(panels.get_option_at_index(i).prompt) for i in range(panels.option_count))
+        for i in range(panels.option_count):  # draw every panel: none may crash
+            screen.selected = i
+            await screen._show_panel()
+            await settle(pilot, 4)
+        assert list(screen.query(ComparePlotView))

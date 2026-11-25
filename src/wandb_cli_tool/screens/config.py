@@ -7,10 +7,11 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.screen import Screen
-from textual.widgets import Footer, Header, Static, Tree
+from textual.widgets import Header, Static, Tree
 from textual.widgets.tree import TreeNode
 
 from ..api import RunRef
+from .keybar import KeyBar
 from ..plain import plain
 
 if TYPE_CHECKING:
@@ -62,7 +63,7 @@ class ConfigScreen(Screen):
         yield Header()
         yield Static("Loading…", id="status")
         yield Tree("config", id="config")
-        yield Footer()
+        yield KeyBar()
 
     def on_mount(self) -> None:
         self.title = f"Config — {self.run_name}"
