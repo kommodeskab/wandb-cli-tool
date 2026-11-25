@@ -39,7 +39,7 @@ class RunScreen(Screen):
         Binding("c", "copy_run", "Copy run"),
         Binding("s", "stop_run", "Stop run"),
         Binding("delete", "delete_run", "Delete run"),
-        Binding("y", "copy_link", "Copy link"),
+        Binding("o", "open_in_browser", "Open in browser"),
     ]
     DEFAULT_CSS = """
     #tags { padding: 1 1 0 1; }
@@ -124,7 +124,7 @@ class RunScreen(Screen):
         if self.info is None:
             tags.append("…")
         elif not self.info.tags:
-            tags.append("none  (press t to add)", style="dim")
+            tags.append("none", style="dim")
         else:
             for tag in self.info.tags:
                 tags.append(f" {tag} ", style="black on cyan")
@@ -262,13 +262,13 @@ class RunScreen(Screen):
             self._mark_project_edited()
 
     @work(thread=True, group="link", exclusive=True)
-    def action_copy_link(self) -> None:
+    def action_open_in_browser(self) -> None:
         try:
             url = self.app.client.run_url(self.ref)
         except Exception as exc:
             self.app.call_from_thread(self.notify, f"Could not get the link: {exc}", severity="error")
             return
-        self.app.call_from_thread(self.app.copy_link, url)
+        self.app.call_from_thread(self.app.open_link, url)
 
     # ---- stop and delete -------------------------------------------------------------
     def action_stop_run(self) -> None:
@@ -278,9 +278,7 @@ class RunScreen(Screen):
             ConfirmDialog(
                 "Stop this run?",
                 f"“{self.info.name}”\n\n"
-                "This asks the run to stop, like the Stop button in W&B: its own process shuts\n"
-                "down gracefully on its next heartbeat (a few seconds to a minute). Nothing is\n"
-                "deleted. A run that is not listening (e.g. its machine is gone) will not react.",
+                "The run is asked to stop gracefully, like the Stop button in W&B. Nothing is deleted.",
                 yes="Yes, stop it", no="No",
             ),
             self._on_stop_confirmed,
@@ -301,7 +299,7 @@ class RunScreen(Screen):
 
     def _stop_requested(self) -> None:
         self._mark_project_edited()
-        self.notify("Stop requested. The run shuts down on its next heartbeat (r in the list refreshes it).")
+        self.notify("Stop requested.")
 
     def action_delete_run(self) -> None:
         if self.info is None:
@@ -333,6 +331,7 @@ class RunScreen(Screen):
         self.app.call_from_thread(self._deleted, artifacts)
 
     def _deleted(self, artifacts: bool) -> None:
+        self.app.deleted_runs.add((self.ref.entity, self.ref.project, self.ref.id))
         self._mark_project_edited()
         self.notify(f"Run “{self.run_name}” deleted" + (" together with its artifacts." if artifacts else "."))
         self.app.pop_screen()  # nothing left to show: back to the list

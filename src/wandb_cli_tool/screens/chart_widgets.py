@@ -203,6 +203,7 @@ class BarView(ChartBase, Widget):
     def show(self, values: list[tuple[str, float | None]]) -> None:
         self.items, self.error, self.note = values, "", None
         self.styles.height = min(len(self.spec.series) + 2, 42)
+        self.border_subtitle = plain_title(f"axis {self.spec.opts.range_text()}") if self.spec.opts.range_text() else ""
         self.refresh()
 
     def show_unavailable(self, message: str) -> None:
@@ -228,7 +229,7 @@ class BarView(ChartBase, Widget):
             body.append(name, style="dim")
             return Align.center(body, vertical="middle")
         width = max(self.content_size.width, 20)
-        layout = layout_bars(self.items, width)
+        layout = layout_bars(self.items, width, self.spec.opts.ymin, self.spec.opts.ymax)
         color = series_color(0, is_dark(self))  # one series of bars: one hue, slot 1
         out = Text(no_wrap=True, overflow="crop")
         for i, row in enumerate(layout.rows):
@@ -365,8 +366,8 @@ class ImageChartView(ChartBase, Vertical):
         Binding("shift+right", "step(10)", "10 steps on", show=False),
         Binding("home", "jump_to(0)", "First step", show=False),
         Binding("end", "jump_to(-1)", "Last step", show=False),
-        Binding("left_square_bracket", "sub(-1)", "Previous image", show=False),
-        Binding("right_square_bracket", "sub(1)", "Next image", show=False),
+        Binding("left_square_bracket", "sub(-1)", "Previous image", key_display="["),
+        Binding("right_square_bracket", "sub(1)", "Next image", key_display="]"),
         Binding("up", "screen.focus_chart(-1)", "Prev chart", show=False),
         Binding("down", "screen.focus_chart(1)", "Next chart", show=False),
     ]
@@ -406,6 +407,12 @@ class ImageChartView(ChartBase, Vertical):
             yield image
         yield StepSlider(id="slider")
         yield Static("loading…", id="img-info")
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "sub":  # only offered when the step has several images
+            step = self.current_step
+            return step is not None and len(step.paths) > 1
+        return True
 
     # ---- state ---------------------------------------------------------------------------
     @property
@@ -497,8 +504,8 @@ class ImageChartView(ChartBase, Vertical):
                 parts.append(f"sampled: {len(self.steps):,} of {self.series.total:,} steps")
             text = " · ".join(parts)
         self.query_one("#img-info", Static).update(plain(text))
-        multi = step is not None and len(step.paths) > 1
-        self.border_subtitle = plain_title("←/→ step · Shift ±10 · Home/End" + (" · [ ] image" if multi else ""))
+        self.border_subtitle = ""
+        self.refresh_bindings()  # "[" / "]" only apply to a step with several images
 
     # ---- results from the screen -----------------------------------------------------------
     def show_image(self, path: Path, key: tuple[int, int]) -> None:

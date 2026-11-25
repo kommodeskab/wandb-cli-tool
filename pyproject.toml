@@ -25,10 +25,13 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.2.0",
     "pytest-asyncio>=1.5.0",
+    "pytest-xdist>=3.8.0",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+# every core by default; a few tests or a debugger: `-n0`
+addopts = "-n auto"
 filterwarnings = ["ignore:Image.Image.getdata is deprecated:DeprecationWarning"]

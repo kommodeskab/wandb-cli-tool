@@ -45,6 +45,11 @@ def last_values(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
     return out
 
 
+def batches(items: list, size: int) -> list[list]:
+    """`items` in consecutive groups of at most `size` (the order is kept)."""
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
 def smooth_ema(points: list[Point], weight: float) -> list[Point]:
     """Exponential moving average of the y values, the way W&B draws "smoothing": each value is
     mixed with the running average (weight 0.9 = 90% old), corrected for the start-up bias so the

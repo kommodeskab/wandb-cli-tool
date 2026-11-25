@@ -24,7 +24,7 @@ class LoginScreen(Screen[Credentials]):
     def compose(self) -> ComposeResult:
         with Vertical(id="login"):
             yield Label("Log in to Weights & Biases")
-            yield Label("API key (press Enter to continue):")
+            yield Label("API key:")
             yield Input(password=True, id="api-key")
             yield Static("", id="message")
             with Vertical(id="entity-step"):
@@ -92,7 +92,7 @@ class EntityScreen(ModalScreen[str]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="entity-picker"):
-            yield Label("Select entity (Enter to choose, Esc to cancel)")
+            yield Label("Select entity")
             yield Static("Loading…", id="entity-status")
             yield OptionList(id="entities")
 

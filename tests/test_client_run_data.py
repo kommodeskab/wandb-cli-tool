@@ -362,3 +362,110 @@ def test_delete_keeps_the_runs_artifacts_unless_asked_and_forgets_the_run(client
 def test_run_url_comes_from_the_sdk_not_from_a_hard_coded_host(client_and_run):
     client, run, _ = client_and_run
     assert client.run_url(REF) == "https://example.wandb/e/p/runs/r"
+
+
+# ---- several metrics in one request --------------------------------------------------------------
+import json as _json
+
+
+class SeriesRun(FakeRun):
+    """A run whose sampled-history query records what was asked, like the SDK's `Run._exec`."""
+
+    def __init__(self):
+        super().__init__()
+        self.queries = []
+        self.history_calls = []
+        self.exec_fails = False
+
+    def _exec(self, query, **kwargs):
+        self.queries.append((query, [_json.loads(s) for s in kwargs["specs"]]))
+        if self.exec_fails:
+            raise RuntimeError("schema changed")
+        return {"project": {"run": {"sampledHistory": [
+            [{"_step": 0, spec["keys"][1]: 1.0}, {"_step": 1, spec["keys"][1]: 2.0}, {"_step": 2}]  # a row without the metric
+            for spec in (q[1] for q in [self.queries[-1]]) for spec in spec
+        ]}}}
+
+    def history(self, keys=None, x_axis="_step", samples=500, pandas=True, stream="default"):
+        self.history_calls.append(keys)
+        return [{"_step": 0, keys[0]: 10.0}, {"_step": 1, keys[0]: 20.0}]
+
+
+@pytest.fixture
+def series_client(monkeypatch):
+    run = SeriesRun()
+
+    class Api:
+        def __init__(self, api_key=None):
+            self._service_api = Service()
+
+        def run(self, path):
+            return run
+
+    monkeypatch.setattr(wandb, "Api", Api)
+    return WandbApiClient("key"), run
+
+
+def test_several_metrics_are_one_request_with_one_spec_each(series_client):
+    client, run = series_client
+    result = client.metric_series_many(REF, ["a/x", "b/y", "a/x"], "_step")  # a duplicate is asked once
+    assert len(run.queries) == 1  # one round trip
+    specs = run.queries[0][1]
+    assert [s["keys"] for s in specs] == [["_step", "a/x"], ["_step", "b/y"]] and all(s["samples"] == 1000 for s in specs)
+    assert result == {"a/x": [(0.0, 1.0), (1.0, 2.0)], "b/y": [(0.0, 1.0), (1.0, 2.0)]}  # rows lacking the metric are skipped
+    assert run.history_calls == []
+
+
+def test_one_metric_uses_the_public_call_and_a_failing_batch_falls_back_to_it(series_client):
+    client, run = series_client
+    assert client.metric_series_many(REF, ["only"], "_step") == {"only": [(0.0, 10.0), (1.0, 20.0)]}
+    assert run.queries == [] and run.history_calls == [["only"]]
+    run.exec_fails = True  # the private query stops working (e.g. an SDK change): still answered
+    result = client.metric_series_many(REF, ["a", "b"], "_step")
+    assert result == {"a": [(0.0, 10.0), (1.0, 20.0)], "b": [(0.0, 10.0), (1.0, 20.0)]}
+    assert run.history_calls == [["only"], ["a"], ["b"]]
+
+
+def test_the_cache_only_asks_for_the_metrics_it_does_not_have(tmp_path, series_client):
+    inner, run = series_client
+    cached = CachedClient(inner, DiskCache(tmp_path))
+    finished = RunRef("e", "p", "r", version="v1")
+    first = cached.metric_series_many(finished, ["a", "b"], "_step")
+    assert len(run.queries) == 1
+    second = cached.metric_series_many(finished, ["b", "c", "a"], "_step")  # only c is new
+    assert len(run.queries) == 1 and run.history_calls == [["c"]]  # only "c" was missing: a single metric, so the public call
+    assert list(second) == ["b", "c", "a"] and second["a"] == first["a"]
+    live = RunRef("e", "p", "r")  # an unfinished run is never cached
+    cached.metric_series_many(live, ["a", "b"], "_step")
+    cached.metric_series_many(live, ["a", "b"], "_step")
+    assert len(run.queries) == 3
+
+
+# ---- runs load side by side ----------------------------------------------------------------------------
+import threading as _threading
+from concurrent.futures import ThreadPoolExecutor as _Pool
+
+
+def test_different_runs_load_at_the_same_time_and_one_run_loads_once(monkeypatch):
+    loads = []
+    together = _threading.Barrier(2, timeout=5)  # two loads must be in flight at once
+
+    class Api:
+        def __init__(self, api_key=None):
+            self._service_api = Service()
+
+        def run(self, path):
+            loads.append(path)
+            if path.endswith("/a") or path.endswith("/b"):
+                together.wait()  # raises BrokenBarrierError if the loads take turns
+            return FakeRun()
+
+    monkeypatch.setattr(wandb, "Api", Api)
+    client = WandbApiClient("key")
+    a, b = RunRef("e", "p", "a"), RunRef("e", "p", "b")
+    with _Pool(max_workers=4) as pool:
+        results = list(pool.map(client._run, [a, b]))
+    assert len(results) == 2 and sorted(loads) == ["e/p/a", "e/p/b"]
+    with _Pool(max_workers=4) as pool:  # asking for the same run from several threads: one load
+        same = list(pool.map(client._run, [a, a, a, a]))
+    assert len(loads) == 2 and all(r is results[0] for r in same)

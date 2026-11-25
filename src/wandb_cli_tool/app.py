@@ -7,6 +7,7 @@ from textual.binding import Binding
 from textual.screen import Screen
 
 from . import config
+from .browser import open_in_browser
 from .api import CachedClient, DiskCache, WandbApiClient, WandbClient
 from .config import Credentials
 from .layout_store import LayoutStore
@@ -47,6 +48,9 @@ class WandbCliApp(App):
         self.audio_player = audio_player or AudioPlayer()
         # (entity, project) pairs whose run list is stale because a run was edited
         self.touched_projects: set[tuple[str, str]] = set()
+        # (entity, project, run id) of runs deleted in this session: W&B's run listing can still return
+        # a deleted run for a while, and the cached list still has it, so the lists hide these themselves
+        self.deleted_runs: set[tuple[str, str, str]] = set()
         self.client_factory = client_factory or self._default_client
         self.creds: Credentials | None = None
         self.client: WandbClient
@@ -58,11 +62,14 @@ class WandbCliApp(App):
         """Notifications often carry names and server errors: never parse them as markup."""
         return super().notify(message, title=title, severity=severity, timeout=timeout, markup=False)
 
-    def copy_link(self, url: str) -> None:
-        """Put a URL on the clipboard (through the terminal, so it also works over SSH) and show it,
-        in case the terminal does not support that."""
-        self.copy_to_clipboard(url)
-        self.notify(f"Link copied: {url}")
+    def open_link(self, url: str) -> None:
+        """Open a URL in the browser. Where that is not possible (an SSH session without a display or
+        $BROWSER) the link is put on the clipboard through the terminal instead, and shown."""
+        if open_in_browser(url):
+            self.notify(f"Opening {url}")
+        else:
+            self.copy_to_clipboard(url)
+            self.notify(f"No browser could be opened from here; link copied: {url}", severity="warning")
 
     def _default_client(self, api_key: str) -> WandbClient:
         return CachedClient(WandbApiClient(api_key), self.cache)

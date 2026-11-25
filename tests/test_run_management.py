@@ -1,5 +1,7 @@
 """Stopping and deleting runs: one run (run screen) and many (run list)."""
 
+import threading
+
 from textual.widgets import Button, DataTable, Input, OptionList, Select
 
 from conftest import FakeClient
@@ -180,7 +182,7 @@ async def test_bulk_group_and_tags_write_to_every_selected_run():
         dialog.query_one("#new-group", Input).value = "team-x"
         await pilot.click("#ok")
         await settle(pilot, 8)
-        assert app.client.writes == [("group", "id1", "team-x"), ("group", "id2", "team-x")]
+        assert sorted(app.client.writes) == [("group", "id1", "team-x"), ("group", "id2", "team-x")]
         await pilot.press("a")
         await settle(pilot)
         await choose(pilot, "tags")
@@ -189,7 +191,7 @@ async def test_bulk_group_and_tags_write_to_every_selected_run():
         dialog.query_one("#new-tags", Input).value = "new-tag"
         await pilot.click("#ok")
         await settle(pilot, 8)
-        assert app.client.writes[2:] == [("tags", "id1", ["new-tag"]), ("tags", "id2", ["new-tag"])]
+        assert sorted(app.client.writes[2:]) == [("tags", "id1", ["new-tag"]), ("tags", "id2", ["new-tag"])]
 
 
 async def test_bulk_delete_removes_the_runs_and_their_selection():
@@ -309,3 +311,85 @@ async def test_bulk_delete_can_take_the_artifacts_along():
         assert sorted(app.client.writes) == [("delete+artifacts", "id2"), ("delete+artifacts", "id3")]
         assert names(app.screen) == ["run-1"] and screen.selected == []
         assert any("Delete (+ artifacts): done for 2 runs" in n.message for n in app._notifications)
+
+
+# ---- a deleted run leaves the list at once and stays out --------------------------------------------
+class Lagging(FakeClient):
+    """W&B's run listing still returns a run for a while after it was deleted."""
+
+    def iter_runs(self, entity, project):
+        deleted, self.deleted = self.deleted, set()
+        try:
+            yield from super().iter_runs(entity, project)
+        finally:
+            self.deleted = deleted
+
+
+def make_lagging():
+    config.save(Credentials("k", "me"))
+    return WandbCliApp(client_factory=Lagging)
+
+
+async def test_a_deleted_run_is_gone_from_the_list_even_if_the_server_still_lists_it():
+    app = make_lagging()
+    async with app.run_test(size=(130, 40)) as pilot:
+        await open_run(pilot, 1)
+        await pilot.press("delete", *"delete", "enter")
+        await settle(pilot, 10)
+        assert isinstance(app.screen, RunsScreen)
+        assert names(app.screen) == ["run-1", "run-3"]  # straight away ...
+        await pilot.press("r")  # ... after a full reload that the server answers with the run again ...
+        await settle(pilot, 8)
+        assert names(app.screen) == ["run-1", "run-3"]
+        await pilot.press("escape")  # ... and when the project is opened again from its cached list
+        await settle(pilot, 4)
+        await pilot.press("enter")
+        await settle(pilot, 8)
+        assert names(app.screen) == ["run-1", "run-3"]
+        assert app.cache.get("list", "runs:me/alpha") is not None
+        assert all(row[0] != "id2" for row in app.cache.get("list", "runs:me/alpha"))
+
+
+async def test_bulk_deleted_runs_leave_the_list_and_the_selection_at_once():
+    app = make_lagging()
+    async with app.run_test(size=(130, 40)) as pilot:
+        screen = await open_runs(pilot)
+        await pilot.press("down", "space", "down", "space", "a")
+        await settle(pilot)
+        await choose(pilot, "delete")
+        await pilot.press(*"delete", "enter")
+        await settle(pilot, 10)
+        assert names(app.screen) == ["run-1"] and screen.selected == []
+        assert "3 items" not in str(screen.query_one("#status").render())  # the count follows
+
+
+async def test_a_run_hidden_by_the_filter_is_still_forgotten_when_deleted():
+    app = make_lagging()
+    async with app.run_test(size=(130, 40)) as pilot:
+        screen = await open_runs(pilot)
+        screen.app.deleted_runs.add(("me", "alpha", "id3"))
+        await pilot.press("slash", *"run-1", "enter")  # run-3 is not shown
+        await settle(pilot)
+        screen._drop_deleted()
+        assert "id3" not in screen._items and names(screen) == ["run-1"]
+
+
+async def test_bulk_writes_run_a_few_at_a_time():
+    together = threading.Barrier(2, timeout=5)  # both deletes must be in flight at once
+
+    class Gated(FakeClient):
+        def delete_run(self, ref, delete_artifacts=False):
+            together.wait()
+            super().delete_run(ref, delete_artifacts)
+
+    config.save(Credentials("k", "me"))
+    app = WandbCliApp(client_factory=Gated)
+    async with app.run_test(size=(130, 40)) as pilot:
+        await open_runs(pilot)
+        await pilot.press("down", "space", "down", "space", "a")
+        await settle(pilot)
+        await choose(pilot, "delete")
+        await pilot.press(*"delete", "enter")
+        await settle(pilot, 10)
+        assert sorted(w[1] for w in app.client.writes if w[0] == "delete") == ["id2", "id3"]
+        assert not any("Failed" in n.message for n in app._notifications)

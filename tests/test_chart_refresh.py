@@ -260,7 +260,7 @@ async def test_the_f_key_cycles_the_interval_and_it_is_remembered():
     app2, ctx2 = await start(interval=None)  # next time: off is remembered
     async with ctx2 as pilot:
         screen = await charts_of(pilot)
-        assert screen.interval is None and screen._timer is None and "auto-refresh off (f to turn on)" in status(screen)
+        assert screen.interval is None and screen._timer is None and "auto-refresh off" in status(screen) and "(f" not in status(screen)
 
 
 async def test_leaving_the_screen_stops_refreshing():
@@ -342,3 +342,23 @@ async def test_a_failed_table_refresh_keeps_the_rows():
             Live.table_data = original
         assert "refresh failed: table boom" in status(screen)
         assert [tuple(str(c) for c in table.get_row_at(i)) for i in range(table.row_count)] == rows
+
+
+async def test_the_auto_refresh_key_shows_the_interval_in_use():
+    from wandb_cli_tool.screens.keybar import KeyBar
+
+    app, ctx = await start(interval=30)
+    async with ctx as pilot:
+        screen = await charts_of(pilot)
+
+        def bar():
+            return screen.query_one(KeyBar).query_one("KeyLine").render().plain.replace("\xa0", " ")
+
+        assert "f Auto-refresh: 30 s" in bar()
+        await pilot.press("f")  # the next choice
+        await settle(pilot, 3)
+        assert f"f Auto-refresh: {label(screen.interval)}" in bar() and "30 s" not in bar()
+        while screen.interval is not None:  # cycle on to "off"
+            await pilot.press("f")
+            await settle(pilot, 2)
+        assert "f Auto-refresh: off" in bar()

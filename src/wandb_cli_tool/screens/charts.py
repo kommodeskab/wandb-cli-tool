@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -12,6 +13,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
 from textual.screen import Screen
+from textual.worker import get_current_worker
 from textual.widgets import Header, OptionList, Static
 from textual.widgets.option_list import Option
 
@@ -24,20 +26,20 @@ from ..layout_store import project_key
 from .keybar import KeyBar
 from ..plain import plain
 from ..refresh import PREF_KEY, interval_from_pref, label as interval_label, next_choice, to_pref
-from ..series import Point, extract_points, is_number, last_values
+from ..series import Point, batches, extract_points, is_number, last_values
 from ..tables import TableData, TableInfo
-from .chart_dialogs import AxisDialog, BarDialog, ChartOptionsDialog, ChartKindDialog, ImageDialog, PlotDialog, TableDialog
+from .chart_editing import EDIT_ACTIONS, ChartEditing
 from .chart_widgets import (  # noqa: F401
     CHART_CLASS, BarView, ChartBase, ChartView, ImageChartView, TableView, make_chart_widget,
 )
 from .imagefetch import fetch_thumbnail
-from .dialogs import ConfirmDialog, NewPanelDialog
 
 if TYPE_CHECKING:
     from ..app import WandbCliApp
 
 T = TypeVar("T")
-SERIES_WORKERS = 4  # series of one chart fetched at once
+SERIES_WORKERS = 4  # requests in flight at once (compare screen: runs)
+SERIES_BATCH = 20  # metrics asked for in one request
 
 
 def _or_default(fetch: Callable[[], T], default: T) -> T:
@@ -61,7 +63,7 @@ class ChartData:
     images: list[ImageInfo] = field(default_factory=list)
 
 
-class ChartsScreen(Screen):
+class ChartsScreen(ChartEditing, Screen):
     """Panels on the left, the selected panel's charts on the right."""
 
     BINDINGS = [
@@ -69,7 +71,7 @@ class ChartsScreen(Screen):
         Binding("n", "new_panel", "New panel"),
         Binding("a", "add_chart", "Add chart"),
         Binding("x", "change_x", "X-axis"),
-        Binding("o", "chart_options", "Plot options"),
+        Binding("o", "chart_options", "Chart options"),
         Binding("delete", "delete_chart", "Delete chart"),
         Binding("backspace", "delete_chart", "Delete chart", show=False),  # laptops without a Delete key
         Binding("d", "reset_layout", "Default layout"),
@@ -117,7 +119,6 @@ class ChartsScreen(Screen):
         self._refreshing = False
         self._last_refresh: datetime | None = None
         self._refresh_error = ""
-        self._told_scope = False
 
     @property
     def panels(self) -> list[Panel]:
@@ -149,13 +150,14 @@ class ChartsScreen(Screen):
     def _fetch_data(self) -> ChartData:
         """Fetch everything shown (runs in a worker thread). Raises if the metrics cannot be read."""
         client, ref = self.app.client, self.ref
-        metrics = client.metric_keys(ref)  # also loads the run, so what follows is cheap...
-        values = _or_default(partial(client.metric_values, ref), {})
-        tables = _or_default(partial(client.run_tables, ref), [])
-        images = _or_default(partial(client.run_images, ref), [])
-        with ThreadPoolExecutor(max_workers=2) as pool:  # ...except these two network calls: run them together
+        with ThreadPoolExecutor(max_workers=3) as pool:  # the three requests this needs go out together
+            keys_job = pool.submit(client.metric_keys, ref)  # (loading the run is shared, once)
             rows_job = pool.submit(client.system_rows, ref)
             state_job = pool.submit(lambda: client.run_details(ref).state)
+            metrics = keys_job.result()  # raises if the metrics cannot be read
+            values = _or_default(partial(client.metric_values, ref), {})  # these read the loaded run: cheap
+            tables = _or_default(partial(client.run_tables, ref), [])
+            images = _or_default(partial(client.run_images, ref), [])
             note = ""
             try:
                 rows = rows_job.result()
@@ -254,8 +256,7 @@ class ChartsScreen(Screen):
         self._update_status()
         self._refresh_panel_list()
         if list(self.panels[self.selected].charts) == shown_before:
-            for view in self.query(f".{CHART_CLASS}"):  # same charts: just update their data
-                self._load_view(view, quiet=True)
+            self._load_views(list(self.query(f".{CHART_CLASS}")), quiet=True)  # same charts: just update their data
         else:  # a new metric/table appeared in this panel: rebuild it
             await self._show_panel(focus=focus_index)
 
@@ -274,6 +275,10 @@ class ChartsScreen(Screen):
     def _tick(self) -> None:
         if self.app.screen is self:  # not while a dialog is open on top
             self.refresh_now()
+
+    def key_label(self, action: str) -> str | None:
+        """The key shows the interval in use (it cycles through the choices)."""
+        return f"Auto-refresh: {interval_label(self.interval)}" if action == "cycle_refresh" else None
 
     def set_refresh_interval(self, seconds: float | None) -> None:
         self.interval = seconds or None
@@ -298,7 +303,7 @@ class ChartsScreen(Screen):
         if self._last_refresh:
             parts.append(f"updated {self._last_refresh:%H:%M:%S}")
         if self.live:
-            parts.append(f"auto-refresh {interval_label(self.interval)}" + ("" if self.interval else " (f to turn on)"))
+            parts.append(f"auto-refresh {interval_label(self.interval)}")
         elif self.state:
             parts.append(f"run {self.state}")
         if self._refresh_error:
@@ -307,35 +312,22 @@ class ChartsScreen(Screen):
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         """Only list the keys that do something right now (the key bar shows what is left)."""
-        if action in ("change_x", "delete_chart"):
-            return isinstance(self.focused, ChartBase)
-        if action == "chart_options":
-            return isinstance(self.focused, ChartBase) and self.focused.spec.kind == PLOT
+        if action in EDIT_ACTIONS:
+            return self.check_chart_action(action)
         if action == "cycle_focus":
             return bool(self.ready and self.panels and self.panels[self.selected].charts)
-        if action == "reset_layout":
-            return bool(self.chart_layout and self.chart_layout.is_customized)
         if action == "cycle_refresh":
             return self.live
         return True
 
+    def _focused_chart(self) -> tuple[ChartSpec, int] | None:
+        """The focused chart's spec and its position in the panel."""
+        view = self.focused
+        return (view.spec, view.index) if isinstance(view, ChartBase) else None
+
     def _update_status(self) -> None:
         self.refresh_bindings()  # the live/customized state may have changed what keys apply
-        custom = (
-            "custom layout shared by all runs in this project (d: back to default)"
-            if self.chart_layout and self.chart_layout.is_customized
-            else ""
-        )
-        self._status("  ·  ".join(p for p in (self._status_base, custom, self._refresh_status()) if p))
-
-    def _save_layout(self) -> None:
-        """Persist the customizations right away, so nothing is lost if the app is killed."""
-        if not self.app.layout_store.save(self._layout_key, self.chart_layout.custom):
-            self.notify("Could not save the chart layout (it still works for this session).", severity="warning")
-        elif not self._told_scope and self.chart_layout.is_customized:
-            self._told_scope = True  # say it once: this is easy to miss and surprising
-            self.notify(f"Chart changes apply to every run in “{self.ref.project}”.")
-        self._update_status()
+        self._status("  ·  ".join(p for p in (self._status_base, self._refresh_status()) if p))
 
     # ---- rendering -----------------------------------------------------
     def _refresh_panel_list(self) -> None:
@@ -349,18 +341,18 @@ class ChartsScreen(Screen):
 
     async def _show_panel(self, focus: int | None = None) -> None:
         async with self._render_lock:
+            self.workers.cancel_group(self, "series")  # nothing is fetched for a panel that is no longer shown
             self._shown_panel = self.selected
             container = self.query_one("#charts", VerticalScroll)
             await container.remove_children()
             panel = self.panels[self.selected]
             if not panel.charts:
-                hint = "No charts in this panel. Press 'a' to add one."
+                hint = "No charts in this panel."
                 await container.mount(Static(hint, markup=False))
                 return
             views = [make_chart_widget(spec, i) for i, spec in enumerate(panel.charts)]
             await container.mount_all(views)
-            for view in views:
-                self._load_view(view)
+            self._load_views(views)
             if focus is not None:
                 views[min(focus, len(views) - 1)].focus()
 
@@ -389,7 +381,7 @@ class ChartsScreen(Screen):
         elif kind == TABLE:
             self._load_table(view, quiet)
         else:
-            self._load_plot(view, quiet)
+            self._load_views([view], quiet)
 
     def _in_this_run(self, name: str, system: bool) -> bool:
         return name in (self._system_set if system else self._metric_set)
@@ -399,32 +391,55 @@ class ChartsScreen(Screen):
             return not (spec.system and spec.x == STEP)  # system readings have no steps
         return not spec.system and spec.x in self._metric_set  # another metric as the x-axis
 
-    def _load_plot(self, view: ChartView, quiet: bool = False) -> None:
-        """Layouts are shared by all runs of a project, so a plot may ask for metrics (or an
-        x-axis) this run never logged: draw what exists, and never request what cannot exist."""
+    def _plot_needs(self, view: ChartView) -> list[str] | None:
+        """What a plot still has to fetch (empty: it can be drawn now), or None when this run cannot
+        draw it at all (the chart then says so). Layouts are shared by all runs of a project, so a plot
+        may ask for metrics (or an x-axis) this run never logged: only what exists is ever requested."""
         spec = view.spec
         here = [n for n in spec.series if self._in_this_run(n, spec.system)]
         if not self._x_in_this_run(spec):
             view.show_unavailable(f"The x-axis “{axis_label(spec.x)}” was not logged in this run.")
-            return
+            return None
         if not here:
             view.show_unavailable("Not logged in this run: " + ", ".join(spec.series))
-            return
+            return None
         keys = [(spec.system, name, spec.x) for name in here]
         for key in keys:
             if key[0] and key not in self._cache:  # system series come from the rows already loaded
                 self._cache[key] = extract_points(self.system_rows, spec.x, key[1])
-        to_fetch = [name for (system, name, _x) in keys if (system, name, spec.x) not in self._cache]
-        if to_fetch:
-            self._fetch_series(view, to_fetch, quiet)
-        else:
-            self._show_plot(view)
+        return [name for (system, name, _x) in keys if (system, name, spec.x) not in self._cache]
+
+    def _load_views(self, views, quiet: bool = False) -> None:
+        """Fill charts with data. All the plots of the panel that need data share one request per
+        batch of metrics (not one request per metric), top chart first."""
+        waiting: list[ChartView] = []
+        needed: dict[str, list[str]] = {}  # x-axis -> metrics to fetch, in chart order
+        for view in views:
+            if view.spec.kind != PLOT:
+                self._load_view(view, quiet)
+                continue
+            missing = self._plot_needs(view)
+            if missing is None:
+                continue
+            if not missing:
+                self._show_plot(view)
+                continue
+            waiting.append(view)
+            for name in missing:
+                if name not in needed.setdefault(view.spec.x, []):
+                    needed[view.spec.x].append(name)
+        if waiting:
+            self._fetch_panel_series(waiting, needed, quiet)
 
     def _show_plot(self, view: ChartView) -> None:
         spec = view.spec
         here = [n for n in spec.series if (spec.system, n, spec.x) in self._cache and self._in_this_run(n, spec.system)]
         absent = tuple(n for n in spec.series if not self._in_this_run(n, spec.system))
         view.show({name: self._cache[(spec.system, name, spec.x)] for name in here}, absent)
+
+    def _plot_complete(self, view: ChartView) -> bool:
+        spec = view.spec
+        return all((spec.system, n, spec.x) in self._cache for n in spec.series if self._in_this_run(n, spec.system))
 
     def _deliver(self, view, quiet: bool, fetch: Callable[[], T], ready: Callable[[T], None]) -> None:
         """Run `fetch` (call this from a worker thread) and hand its result to `ready` on the UI
@@ -437,23 +452,48 @@ class ChartsScreen(Screen):
             return
         self.app.call_from_thread(ready, result)
 
-    def _series_batch(self, spec: ChartSpec, names: list[str]) -> dict[tuple[bool, str, str], list[Point]]:
-        def one(name: str):
-            return (spec.system, name, spec.x), self.app.client.metric_series(self.ref, name, spec.x)
+    @work(thread=True, group="series", exclusive=True)
+    def _fetch_panel_series(self, views: list[ChartView], needed: dict[str, list[str]], quiet: bool) -> None:
+        """Fetch what the shown plots need, a batch at a time, and draw each plot as soon as all of its
+        series are in. `exclusive`: showing another panel cancels this (batches not yet asked for are
+        skipped), so the panel being looked at is never queued behind one that was left."""
+        worker = get_current_worker()
+        stop = threading.Event()  # set on the first failure, so batches not yet started are skipped
+        tasks = [(x, chunk) for x, names in needed.items() for chunk in batches(names, SERIES_BATCH)]
 
-        if len(names) == 1:
-            return dict([one(names[0])])
-        with ThreadPoolExecutor(max_workers=min(len(names), SERIES_WORKERS)) as pool:  # independent requests
-            return dict(pool.map(one, names))
+        def one(x: str, chunk: list[str]):
+            if worker.is_cancelled or stop.is_set():
+                return None
+            return self.app.client.metric_series_many(self.ref, chunk, x)
 
-    @work(thread=True)
-    def _fetch_series(self, view: ChartView, names: list[str], quiet: bool = False) -> None:
-        self._deliver(view, quiet, partial(self._series_batch, view.spec, names), partial(self._series_ready, view))
+        with ThreadPoolExecutor(max_workers=min(len(tasks), SERIES_WORKERS)) as pool:  # batches go out together
+            futures = [pool.submit(one, x, chunk) for x, chunk in tasks]
+            for (x, chunk), future in zip(tasks, futures):  # drawn in chart order, as each one is in
+                try:
+                    fetched = future.result()
+                except Exception as exc:
+                    stop.set()
+                    self.app.call_from_thread(self._series_failed, views, str(exc), quiet)
+                    return
+                if fetched is None or worker.is_cancelled:
+                    return
+                self.app.call_from_thread(self._series_ready, views, {(False, n, x): fetched.get(n, []) for n in chunk})
 
-    def _series_ready(self, view: ChartView, fetched: dict[tuple[bool, str, str], list[Point]]) -> None:
+    def _series_ready(self, views: list[ChartView], fetched: dict[tuple[bool, str, str], list[Point]]) -> None:
         self._cache.update(fetched)
-        if view.is_attached:
-            self._show_plot(view)
+        for view in views:
+            if view.is_attached and self._plot_complete(view) and any(
+                (view.spec.system, n, view.spec.x) in fetched for n in view.spec.series
+            ):
+                self._show_plot(view)
+
+    def _series_failed(self, views: list[ChartView], message: str, quiet: bool) -> None:
+        if quiet:
+            self._refresh_failed(message)
+            return
+        for view in views:
+            if view.is_attached and not self._plot_complete(view):
+                view.fail(message)
 
     def _load_images(self, view: ImageChartView, quiet: bool = False) -> None:
         if view.spec.y not in {i.key for i in self.images}:
@@ -534,138 +574,3 @@ class ChartsScreen(Screen):
 
     def action_focus_panels(self) -> None:
         self.query_one("#panels", OptionList).focus()
-
-    def action_new_panel(self) -> None:
-        if self.ready:
-            self.app.push_screen(NewPanelDialog(), self._on_new_panel)
-
-    async def _on_new_panel(self, name: str | None) -> None:
-        if not name:
-            return
-        self.selected = self.chart_layout.add_panel(name)
-        self._save_layout()
-        self._refresh_panel_list()
-        await self._show_panel()
-
-    def action_add_chart(self) -> None:
-        """Step 1: what kind of chart? Step 2 (below) asks for that kind's details."""
-        if not self.ready:
-            return
-        values = len(self.metrics) + len(self.system_metrics)
-        if not (values or self.tables or self.images):
-            self.notify("This run has no metrics, tables or images to chart.", severity="warning")
-            return
-        self.app.push_screen(
-            ChartKindDialog(
-                plot_ok=values >= 1,
-                bar_ok=values >= 2,
-                table_ok=bool(self.tables),
-                image_ok=bool(self.images),
-            ),
-            self._on_kind,
-        )
-
-    def _on_kind(self, kind: str | None) -> None:
-        if kind == PLOT:
-            self.app.push_screen(PlotDialog(self.metrics, self.system_metrics), self._on_add_chart)
-        elif kind == BAR:
-            self.app.push_screen(BarDialog(self.metrics, self.system_metrics), self._on_add_chart)
-        elif kind == TABLE:
-            self.app.push_screen(TableDialog(self.tables), self._on_add_chart)
-        elif kind == IMAGE:
-            self.app.push_screen(ImageDialog(self.images), self._on_add_chart)
-
-    async def _on_add_chart(self, spec: ChartSpec | None) -> None:
-        if not spec:
-            return
-        index = self.chart_layout.add_chart(self.selected, spec)
-        self._save_layout()
-        self._refresh_panel_list()
-        await self._show_panel(focus=index)
-
-    def action_change_x(self) -> None:
-        view = self.focused
-        if not isinstance(view, ChartBase):
-            return
-        if view.spec.kind != PLOT:
-            self.notify("The x-axis only applies to plots.")
-            return
-        self.app.push_screen(
-            AxisDialog(self.metrics, view.spec),
-            lambda spec: self._on_change_x(view.index, spec),
-        )
-
-    def action_chart_options(self) -> None:
-        view = self.focused
-        if isinstance(view, ChartBase) and view.spec.kind == PLOT:
-            self.app.push_screen(
-                ChartOptionsDialog(view.spec),
-                lambda spec: self._on_change_x(view.index, spec),  # same edit: a changed spec for this chart
-            )
-
-    async def _on_change_x(self, index: int, spec: ChartSpec | None) -> None:
-        if not spec:
-            return
-        self.chart_layout.set_chart(self.selected, index, spec)
-        self._save_layout()
-        await self._show_panel(focus=index)
-
-    def action_delete_chart(self) -> None:
-        """Delete the focused chart or table from this panel (after confirming)."""
-        view = self.focused
-        if not self.ready:
-            return
-        if not isinstance(view, ChartBase):
-            self.notify("Focus a chart first (→ or Tab), then press Delete.")
-            return
-        self.app.push_screen(
-            ConfirmDialog(
-                "Delete this chart?",
-                f"“{view.spec.title}”\n\n"
-                f"It is removed from this panel in ALL runs of “{self.ref.project}”;\n"
-                "no run's data is touched.\n"
-                "(Press d to bring back all the default charts.)",
-                yes="Yes, delete", no="No",
-            ),
-            lambda yes: self._on_delete(view.index, yes),
-        )
-
-    async def _on_delete(self, index: int, yes: bool | None) -> None:
-        if not yes:
-            return
-        self.chart_layout.remove_chart(self.selected, index)
-        self._save_layout()
-        self._refresh_panel_list()
-        remaining = len(self.panels[self.selected].charts)
-        await self._show_panel(focus=min(index, remaining - 1) if remaining else None)
-        if not remaining:
-            self.action_focus_panels()  # nothing left to focus in this panel
-
-    def action_reset_layout(self) -> None:
-        """Forget all panels, charts and x-axis choices made for this run (after confirming)."""
-        if not self.ready:
-            return
-        if not self.chart_layout.is_customized:
-            self.notify("This run already uses the default layout.")
-            return
-        self.app.push_screen(
-            ConfirmDialog(
-                "Back to the default layout?",
-                "This removes the panels and charts you added, brings back charts\n"
-                "you deleted, and undoes x-axis changes, for ALL runs in\n"
-                f"“{self.ref.project}”. No run's data is touched.",
-                yes="Yes, reset", no="No",
-            ),
-            self._on_reset,
-        )
-
-    async def _on_reset(self, yes: bool | None) -> None:
-        if not yes:
-            return
-        self.chart_layout.reset()
-        self.app.layout_store.reset(self._layout_key)
-        self.selected = 0
-        self._update_status()
-        self._refresh_panel_list()
-        await self._show_panel()
-        self.notify("Charts reset to the default layout.")

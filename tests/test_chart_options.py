@@ -212,3 +212,73 @@ async def test_reset_button_goes_back_to_defaults(make_app):
 def replace_opts(spec, opts):
     from dataclasses import replace
     return replace(spec, opts=opts)
+
+
+# ---- bar charts: a fixed value range ------------------------------------------------------------
+from wandb_cli_tool.barchart import layout_bars
+from wandb_cli_tool.charts import BAR
+
+
+def bar_lengths(items, width, low=None, high=None):
+    layout = layout_bars(items, width, low, high)
+    return [(len(r.negative), len(r.positive.rstrip())) for r in layout.rows], layout
+
+
+def test_a_fixed_range_scales_the_bars_to_it_and_clips_outside_values():
+    items = [("a", 0.5), ("b", 1.0), ("c", 2.0), ("d", 0.0)]
+    auto, _ = bar_lengths(items, 40)
+    ranged, layout = bar_lengths(items, 40, 0.0, 1.0)
+    assert ranged[1][1] == ranged[2][1] == layout.positive_width  # 1.0 fills the axis and 2.0 is clipped to it
+    assert ranged[0][1] == round(layout.positive_width / 2) and ranged[3] == (0, 0)
+    assert auto[2][1] > auto[1][1]  # without the range 2.0 is twice as long as 1.0
+
+
+def test_a_range_that_does_not_include_zero_starts_the_bars_at_its_low_end():
+    items = [("low", 0.9), ("mid", 0.95), ("top", 1.0), ("below", 0.5)]
+    lengths, layout = bar_lengths(items, 40, 0.9, 1.0)
+    assert layout.negative_width == 0
+    assert lengths[0] == (0, 0)  # at the low end of the axis: no bar
+    assert lengths[1][1] == round(layout.positive_width / 2) and lengths[2][1] == layout.positive_width
+    assert lengths[3] == (0, 0)  # below the axis: clipped to nothing
+
+
+def test_one_end_can_stay_automatic_and_an_empty_range_is_ignored():
+    items = [("a", 3.0), ("b", 6.0)]
+    only_high, _ = bar_lengths(items, 40, None, 12.0)
+    auto, _ = bar_lengths(items, 40)
+    assert only_high[1][1] < auto[1][1]  # headroom up to 12 makes the 6.0 bar shorter than the full-width one
+    assert bar_lengths(items, 40, 5.0, 5.0)[0] == auto == bar_lengths(items, 40, 9.0, 1.0)[0]
+    negative, _ = bar_lengths([("n", -2.0), ("p", 2.0)], 40, -4.0, 4.0)
+    assert negative[0][0] == negative[1][1] > 0  # symmetric range around zero
+
+
+def test_the_figure_is_still_the_real_value_when_the_bar_is_clipped():
+    layout = layout_bars([("big", 7.5)], 30, 0.0, 1.0)
+    assert layout.rows[0].figure.strip() == "7.5"
+
+
+async def test_options_dialog_for_a_bar_chart_only_asks_for_the_axis(make_app):
+    from chart_helpers import add_bar
+    from wandb_cli_tool.screens.chart_widgets import BarView
+
+    config.save(Credentials("k", "me"))
+    app = make_app()
+    async with app.run_test(size=(130, 45)) as pilot:
+        screen = await open_charts(pilot)
+        await add_bar(pilot, (False, "acc"), (False, "trainer/loss"))
+        view = app.focused
+        assert isinstance(view, BarView) and screen.check_action("chart_options", ()) is True
+        await pilot.press("o")
+        await settle(pilot)
+        dialog = app.screen
+        assert isinstance(dialog, ChartOptionsDialog) and dialog.is_bar
+        assert not dialog.query("#smooth") and not dialog.query("#logy")  # nothing that does not apply to bars
+        dialog.query_one("#ymin", Input).value = "0"
+        dialog.query_one("#ymax", Input).value = "1"
+        await pilot.click("#ok")
+        await settle(pilot, 8)
+        shown = app.focused
+        assert isinstance(shown, BarView) and shown.spec.opts == ChartOptions(0.0, 1.0)
+        assert "axis 0…1" in str(shown.border_subtitle)
+    saved = LayoutStore().load(project_key("me", "alpha"))
+    assert any(s.kind == BAR and s.opts.ymax == 1.0 for specs in saved.added.values() for s in specs)

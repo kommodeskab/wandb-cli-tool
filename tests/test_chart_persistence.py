@@ -51,7 +51,7 @@ async def test_added_panels_and_charts_survive_closing_and_reopening_the_app(mak
         await settle(pilot, 5)
         (view,) = screen.query(ChartView)
         assert (view.spec.y, view.spec.x) == ("trainer/loss", "trainer/global_steps")
-        assert "custom layout shared by all runs in this project" in " ".join(screen.query_one("#status").render().plain.split())
+        assert "custom layout" not in " ".join(screen.query_one("#status").render().plain.split())  # layouts are always shared: no remark
 
 
 async def test_changes_are_written_immediately_not_only_on_exit(make_app):

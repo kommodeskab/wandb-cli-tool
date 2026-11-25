@@ -142,7 +142,7 @@ async def test_a_chart_added_in_one_run_appears_in_every_other_run_of_the_projec
         await select_panel(pilot, screen2, "mine")
         (view,) = screen2.query(ChartView)
         assert view.spec.series == ("trainer/loss", "val/loss")
-        assert "custom layout shared by all runs in this project" in screen_text(app)
+        assert "custom layout" not in screen_text(app) and "shared" not in screen_text(app)  # no remark about it
 
         await back_to_projects(pilot)
         screen3 = await open_run_charts(pilot, run=2)  # even the run that shares nothing gets the panel
@@ -183,7 +183,7 @@ async def test_deleting_a_default_chart_removes_it_in_every_run_that_has_that_me
         await select_panel(pilot, full, "trainer")
         await pilot.press("right", "down", "delete")  # trainer/loss, the second chart
         await settle(pilot)
-        assert "ALL runs of “alpha”" in " ".join(app.screen.query_one("#confirm-body").render().plain.split())
+        assert " ".join(app.screen.query_one("#confirm-body").render().plain.split()) == "“loss”"
         await pilot.press("y")
         await settle(pilot, 6)
         assert panel_labels(full)[panel_index(full, "trainer")] == "trainer (1)"
@@ -215,7 +215,7 @@ async def test_an_x_axis_choice_applies_to_every_run_that_has_the_metric():
         assert view.spec.y == "trainer/loss" and view.spec.x == "acc"
 
 
-async def test_reset_in_one_run_resets_every_run_of_the_project_and_says_so():
+async def test_reset_in_one_run_resets_every_run_of_the_project():
     app, ctx = await start()
     async with ctx as pilot:
         await open_run_charts(pilot, run=0)
@@ -225,7 +225,7 @@ async def test_reset_in_one_run_resets_every_run_of_the_project_and_says_so():
         await pilot.press("d")
         await settle(pilot)
         text = " ".join(app.screen.query_one("#confirm-body").render().plain.split())
-        assert "for ALL runs in “alpha”" in text
+        assert "alpha" not in text and "ALL" not in text  # no remarks about scope
         await pilot.press("y")
         await settle(pilot, 6)
         assert "mine" not in " ".join(panel_labels(partial)) and saved() == {}
@@ -234,17 +234,13 @@ async def test_reset_in_one_run_resets_every_run_of_the_project_and_says_so():
         assert "mine" not in " ".join(panel_labels(full))
 
 
-async def test_the_scope_is_announced_once_on_the_first_change():
+async def test_changing_the_layout_never_announces_its_scope():
     app, ctx = await start()
     async with ctx as pilot:
         await open_run_charts(pilot, run=0)
-        scope = lambda: [n for n in app._notifications if "apply to every run in “alpha”" in n.message]
-        assert not scope()
         await new_panel(pilot, "one")
-        assert len(scope()) == 1
-        await new_panel(pilot, "two")
         await add_bar(pilot, (False, "acc"), (False, "val/loss"))
-        assert len(scope()) == 1  # not repeated
+        assert not [n for n in app._notifications if "every run" in n.message]
 
 
 # ---- shared charts in runs that lack their data -------------------------------------------------

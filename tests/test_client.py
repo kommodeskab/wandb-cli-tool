@@ -147,3 +147,43 @@ def test_client_run_data_methods(monkeypatch):
     assert client.system_rows(ref) == [{"_runtime": 1, "system.cpu": 3.0}]
     assert run.history_calls[-1]["stream"] == "system"
     assert paths == ["me/proj/abc"]  # the run object is fetched once and cached
+
+
+class MemoizingApi(FakeApi):
+    """Like the real `Api.runs()`: the first listing for a path/order is kept, with the runs it
+    fetched, and handed back on every later call."""
+
+    available = [NS(id="id1", name="r1", state="finished", heartbeat_at="2024-01-02T00:00:00",
+                    created_at="2024-01-01T00:00:00", group=None)]
+
+    def __init__(self, api_key=None):
+        super().__init__(api_key)
+        self._runs = {}
+
+    def runs(self, path, order="+created_at", per_page=50):
+        key = path + str(None) + str(order)
+        if not self._runs.get(key):
+            self._runs[key] = list(type(self).available)  # the pages are fetched once, here
+        return self._runs[key]
+
+
+def test_a_run_started_after_the_first_listing_shows_up_in_the_next_one(monkeypatch):
+    monkeypatch.setattr(wandb, "Api", MemoizingApi)
+    MemoizingApi.available = [MemoizingApi.available[0]]
+    client = WandbApiClient("key")
+    assert [r.id for r in client.iter_runs("me", "p")] == ["id1"]
+    MemoizingApi.available = [
+        *MemoizingApi.available,
+        NS(id="id9", name="new", state="running", heartbeat_at="2024-01-05T00:00:00",
+           created_at="2024-01-05T00:00:00", group=None),
+    ]  # a run is started while the app is open
+    assert [r.id for r in client.iter_runs("me", "p")] == ["id1", "id9"]
+
+
+def test_only_the_listing_of_that_project_is_dropped(monkeypatch):
+    monkeypatch.setattr(wandb, "Api", MemoizingApi)
+    client = WandbApiClient("key")
+    list(client.iter_runs("me", "p"))
+    client._api._runs["me/other" + "None" + "-heartbeat_at"] = ["kept"]
+    list(client.iter_runs("me", "p"))
+    assert client._api._runs["me/other" + "None" + "-heartbeat_at"] == ["kept"]

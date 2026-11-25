@@ -33,11 +33,13 @@ from .chart_widgets import (
 Group = tuple[str, Sequence["float | None"]]  # a metric and its value in each run (None = no value)
 
 
-def render_grouped_bars(groups: Sequence[Group], colors: Sequence[str], width: int) -> Text:
+def render_grouped_bars(
+    groups: Sequence[Group], colors: Sequence[str], width: int, low: float | None = None, high: float | None = None
+) -> Text:
     """One bar per run for each group, all on one scale. Each bar wears its run's color; the group's
     name is written beside its first bar and groups are separated by a blank line."""
     items = [(name if i == 0 else "", value) for name, values in groups for i, value in enumerate(values)]
-    layout = layout_bars(items, width)
+    layout = layout_bars(items, width, low, high)
     lines: list[Text] = []
     row_index = 0
     for g, (_name, values) in enumerate(groups):
@@ -71,7 +73,9 @@ class CompareBase:
 
     def _init_compare(self, chart: CompareChart, index: int, run_labels: Sequence[str]) -> None:
         self.chart = chart
-        self.index = index
+        self.index = index  # position among the drawn charts (focus order)
+        self.spec = chart.source  # the layout chart this belongs to ...
+        self.layout_index = chart.index  # ... and its position in the layout's panel
         self.run_labels = list(run_labels)
         self.add_class(CHART_CLASS)  # type: ignore[attr-defined]
         self.border_title = plain_title(chart.title)  # type: ignore[attr-defined]
@@ -103,6 +107,7 @@ class CompareBarView(CompareBase, Widget):
     def show(self, groups: list[Group]) -> None:
         self.groups, self.note, self.error = groups, None, ""
         self.styles.height = grouped_bars_height(groups)
+        self.border_subtitle = plain_title(f"axis {self.chart.opts.range_text()}") if self.chart.opts.range_text() else ""
         self.refresh()
 
     def show_unavailable(self, message: str) -> None:
@@ -121,7 +126,8 @@ class CompareBarView(CompareBase, Widget):
             return Text(f"Error: {self.error}", style="red")
         if self.groups is None:
             return Text("loading…", style="dim")
-        return render_grouped_bars(self.groups, self._colors(), max(self.content_size.width, 20))
+        opts = self.chart.opts
+        return render_grouped_bars(self.groups, self._colors(), max(self.content_size.width, 20), opts.ymin, opts.ymax)
 
 
 class ComparePlotView(CompareBase, PlotextPlot):
@@ -199,7 +205,7 @@ class CompareTableView(CompareBase, DataTable):
     `v` switches between keeping each run's rows together and lining up rows with the same first column."""
 
     can_focus = True
-    BINDINGS = [Binding("v", "toggle_group", "Group rows by run / first column")]
+    BINDINGS = [Binding("v", "toggle_group", "Line up rows by first column")]
     DEFAULT_CSS = """
     CompareTableView { height: 8; border: round $primary; margin-bottom: 1; }
     CompareTableView:focus { border: round $accent; }
@@ -231,13 +237,17 @@ class CompareTableView(CompareBase, DataTable):
             notes.append(f"first {MAX_COMPARE_ROWS} of each run")
         if merged.missing:
             notes.append("not in: " + ", ".join(self.run_labels[i] for i in merged.missing))
-        notes.append("rows lined up by first column" if self.by_key else "rows grouped by run")
-        self.border_subtitle = plain_title(" · ".join(notes) + " · v: switch")
+        notes.append("lined up by first column" if self.by_key else "grouped by run")
+        self.border_subtitle = plain_title(" · ".join(notes))
         self.refresh()
+
+    def toggle_state(self, action: str) -> bool | None:
+        return self.by_key if action == "toggle_group" else None
 
     def action_toggle_group(self) -> None:
         self.by_key = not self.by_key
         self._render_table()
+        self.refresh_bindings()  # the key shows the new state
 
     def show_unavailable(self, message: str) -> None:
         self.tables = None
@@ -272,8 +282,8 @@ class CompareImageView(CompareBase, Vertical):
         Binding("shift+right", "step(10)", "10 steps on", show=False),
         Binding("home", "jump_to(0)", "First step", show=False),
         Binding("end", "jump_to(-1)", "Last step", show=False),
-        Binding("left_square_bracket", "sub(-1)", "Previous image", show=False),
-        Binding("right_square_bracket", "sub(1)", "Next image", show=False),
+        Binding("left_square_bracket", "sub(-1)", "Previous image", key_display="["),
+        Binding("right_square_bracket", "sub(1)", "Next image", key_display="]"),
         Binding("up", "screen.focus_chart(-1)", "Prev chart", show=False),
         Binding("down", "screen.focus_chart(1)", "Next chart", show=False),
     ]
@@ -318,6 +328,11 @@ class CompareImageView(CompareBase, Vertical):
                         yield image
         yield StepSlider(id="slider")
         yield Static("loading…", id="img-info")
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "sub":  # only offered when some run's step has several images
+            return any((s := self.step_for(r)) is not None and len(s.paths) > 1 for r in range(len(self.run_labels)))
+        return True
 
     # ---- state -----------------------------------------------------------------------------------
     @property
@@ -369,9 +384,9 @@ class CompareImageView(CompareBase, Vertical):
         self.query_one("#slider", StepSlider).set_position(self.cursor.index, len(self.steps))
         self.errors = {}
         self._labels()
+        self.refresh_bindings()
         info = f"step {self.target} · {self.cursor.index + 1}/{len(self.steps)}" if self.steps else "No images were logged."
         self.query_one("#img-info", Static).update(plain(info))
-        self.border_subtitle = plain_title("←/→ step · Shift ±10 · Home/End · [ ] image")
         if self.steps:
             if self._debounce is not None:
                 self._debounce.stop()

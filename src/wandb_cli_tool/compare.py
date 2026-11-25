@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Any, Collection, Iterable, Sequence
 
 from .api import RunInfo, RunMetadata
-from .charts import BAR, IMAGE, PLOT, TABLE, ChartOptions, Panel, display_names
+from .charts import BAR, IMAGE, PLOT, TABLE, ChartOptions, ChartSpec, Panel, display_names
 from .images import ImageSeries, ImageStep
 from .palette import MAX_SERIES
 from .runfacts import summary_fields
@@ -114,9 +114,12 @@ class ConfigDiff:
         return sum(1 for r in self.rows if r.only_some)
 
 
-def diff_config(configs: Sequence[dict[str, Any] | None], show_all: bool = False) -> ConfigDiff:
+def diff_config(
+    configs: Sequence[dict[str, Any] | None], show_all: bool = False, pinned: Collection[str] = ()
+) -> ConfigDiff:
     """What differs between the configs: entries with different values, and entries only some of the
-    runs have. Entries every run has with the same value are only counted (or listed with `show_all`)."""
+    runs have. Entries every run has with the same value are only counted (or listed with `show_all`,
+    or when pinned: a pinned entry is always listed)."""
     flat = [flatten_config(c or {}) for c in configs]
     paths = sorted({p for f in flat for p in f})
     rows, same = [], 0
@@ -125,7 +128,7 @@ def diff_config(configs: Sequence[dict[str, Any] | None], show_all: bool = False
         missing = any(v is None for v in values)
         if not missing and len(set(values)) == 1:
             same += 1
-            if not show_all:
+            if not show_all and path not in pinned:
                 continue
         rows.append(ConfigRow(path, values, missing))
     return ConfigDiff(rows, same)
@@ -147,6 +150,8 @@ class CompareChart:
     title: str = ""
     subtitle: str = ""  # the layout chart a split-up plot came from
     opts: ChartOptions = ChartOptions()  # y-range, smoothing, log axes: the same as in the run screens
+    source: ChartSpec | None = None  # the layout chart this was made from (editing acts on that one)
+    index: int = 0  # its position in the layout's panel; a split-up plot's charts all share it
 
     @property
     def metric(self) -> str:
@@ -156,18 +161,18 @@ class CompareChart:
 def compare_charts(panel: Panel) -> list[CompareChart]:
     """The comparable charts of a layout panel (every kind: tables and images are compared too)."""
     out: list[CompareChart] = []
-    for spec in panel.charts:
+    for index, spec in enumerate(panel.charts):
         if spec.kind == PLOT:
             labels = display_names(spec.series, spec.system)
             multi = len(spec.series) > 1
             out += [
-                CompareChart(PLOT, (m,), spec.x, spec.system, label, spec.title if multi else "", spec.opts)
+                CompareChart(PLOT, (m,), spec.x, spec.system, label, spec.title if multi else "", spec.opts, spec, index)
                 for m, label in zip(spec.series, labels)
             ]
         elif spec.kind == BAR:
-            out.append(CompareChart(BAR, spec.series, title=spec.title))
+            out.append(CompareChart(BAR, spec.series, title=spec.title, opts=spec.opts, source=spec, index=index))
         elif spec.kind in (TABLE, IMAGE):
-            out.append(CompareChart(spec.kind, (spec.y,), title=spec.title))
+            out.append(CompareChart(spec.kind, (spec.y,), title=spec.title, source=spec, index=index))
     return out
 
 

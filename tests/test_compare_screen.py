@@ -1,6 +1,6 @@
 """Selecting runs and comparing them: the runs list, the compare screen, the key bar."""
 
-from textual.widgets import DataTable, OptionList, TabbedContent
+from textual.widgets import DataTable, Input, OptionList, TabbedContent
 
 from conftest import FakeClient
 from wandb_cli_tool import config
@@ -151,7 +151,7 @@ async def test_overview_has_one_column_per_run_and_marks_differences():
         assert rows["Host"] == ["gpu-box-1", "gpu-box-1"] and rows["ID"] == ["id1", "id3"]
         labels = [str(table.get_row_at(i)[0]) for i in range(table.row_count)]
         assert any(l.startswith("≠ Status") for l in labels) and any(l.startswith("  Host") for l in labels)
-        await pilot.press("d")  # only the differences
+        await pilot.press("i")  # only the differences
         await settle(pilot)
         assert "Host" not in [str(table.get_row_at(i)[0]).strip(" ≠") for i in range(table.row_count)]
 
@@ -178,8 +178,8 @@ async def test_config_tab_lists_only_what_differs():
             "lr": ["0.1", "0.01", "0.1"],
             "model.name": ["resnet", "resnet", "vit"],
         }
-        assert "2 entries differ, 1 are only in some runs" in str(screen.query_one("#status").render())
-        await pilot.press("d")  # show the identical ones too
+        assert "2 differ  ·  1 only in some runs  ·  1 identical" in str(screen.query_one("#status").render())
+        await pilot.press("i")  # show the identical ones too
         await settle(pilot)
         assert "seed" in [str(table.get_row_at(i)[0]) for i in range(table.row_count)]
 
@@ -354,7 +354,7 @@ async def test_metrics_tab_marks_the_best_run_lower_is_better_until_flipped():
         rows = metric_cells(screen)
         assert rows["acc"] == ["0.9", "0.8", "0.7", "↓ lower", " ■ run-3"]  # the default for every metric
         assert rows["val/loss"] == ["0.4", "—", "0.2", "↓ lower", " ■ run-3"]
-        assert "b flips the one under the cursor" in str(screen.query_one("#status").render())
+        assert str(screen.query_one("#status").render()) == "2 of 2 metrics"
         await pilot.press("b")  # the cursor is on "acc": higher is better for it
         await settle(pilot)
         rows = metric_cells(screen)
@@ -483,3 +483,281 @@ async def test_a_selected_run_keeps_its_whole_name_visible():
         table = screen.query_one("#items", DataTable)
         column = next(iter(table.columns.values()))
         assert column.get_render_width(table) >= len("✓ run-1")  # the ✓ did not cut the name
+
+
+async def test_compare_bars_use_the_charts_axis_range():
+    from wandb_cli_tool.charts import BAR, ChartOptions
+
+    app = make()
+    custom = Customization(panels=["Summary"], added={"Summary": [
+        ChartSpec("acc", kind=BAR, more=("val/loss",), opts=ChartOptions(0.0, 1.0))]})
+    app.layout_store.save(project_key("me", "alpha"), custom)
+    async with app.run_test(size=(150, 50)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        await show_panel(pilot, screen, "Summary")
+        [view] = screen.query(CompareBarView)
+        assert "axis 0…1" in str(view.border_subtitle)
+        assert view.chart.opts == ChartOptions(0.0, 1.0)
+
+
+# ---- filter by key and pins in the metrics and config tables -----------------------------------------
+class ManyKeys(CompareClient):
+    CONFIGS = {
+        "id1": {"lr": 0.1, "seed": 1, "optim": {"name": "adam", "beta": 0.9}, "data": {"path": "/a"}},
+        "id2": {"lr": 0.01, "seed": 1, "optim": {"name": "sgd", "beta": 0.9}, "data": {"path": "/b"}},
+        "id3": {"lr": 0.1, "seed": 1, "optim": {"name": "adam", "beta": 0.99}, "data": {"path": "/a"}},
+    }
+    VALUES_BY_RUN = {
+        "id1": {"acc": 0.9, "val/loss": 0.4, "train/loss": 0.3, "f1": 0.5},
+        "id2": {"acc": 0.8, "val/loss": 0.5, "train/loss": 0.2, "f1": 0.6},
+        "id3": {"acc": 0.7, "val/loss": 0.2, "train/loss": 0.4, "f1": 0.7},
+    }
+
+
+def keys_in(table):
+    return [str(table.get_row_at(i)[0]).removeprefix("★ ") for i in range(table.row_count)]
+
+
+async def test_metrics_can_be_filtered_by_key():
+    app = make(ManyKeys)
+    async with app.run_test(size=(150, 40)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        await pilot.press("2")
+        await settle(pilot)
+        table = screen.query_one("#metrics", DataTable)
+        assert keys_in(table) == ["acc", "f1", "train/loss", "val/loss"]
+        box = screen.query_one("#compare-filter", Input)
+        assert not box.display  # nothing in the way until asked for
+        await pilot.press("slash", *"loss")
+        await settle(pilot)
+        assert box.display and keys_in(table) == ["train/loss", "val/loss"]
+        assert str(screen.query_one("#status").render()) == "2 of 4 metrics  ·  filter “loss”"
+        await pilot.press(*" val")  # every word must match
+        await settle(pilot)
+        assert keys_in(table) == ["val/loss"]
+        await pilot.press("enter")  # keep it and go back to the table
+        await settle(pilot)
+        assert app.focused is table and keys_in(table) == ["val/loss"]
+        await pilot.press("escape")  # first Esc clears the filter ...
+        await settle(pilot)
+        assert keys_in(table) == ["acc", "f1", "train/loss", "val/loss"] and not box.display and app.screen is screen
+        await pilot.press("escape")  # ... the next one leaves
+        await settle(pilot)
+        assert app.screen is not screen
+
+
+async def test_each_table_keeps_its_own_filter():
+    app = make(ManyKeys)
+    async with app.run_test(size=(150, 40)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        await pilot.press("2", "slash", *"acc", "enter")
+        await settle(pilot)
+        await pilot.press("3")  # the config tab starts unfiltered
+        await settle(pilot)
+        config_table = screen.query_one("#config-table", DataTable)
+        assert keys_in(config_table) == ["data.path", "lr", "optim.beta", "optim.name"]
+        assert not screen.query_one("#compare-filter", Input).display
+        await pilot.press("slash", *"optim", "enter")
+        await settle(pilot)
+        assert keys_in(config_table) == ["optim.beta", "optim.name"]
+        await pilot.press("2")  # back: the metrics filter is still there
+        await settle(pilot)
+        assert keys_in(screen.query_one("#metrics", DataTable)) == ["acc"]
+        assert screen.query_one("#compare-filter", Input).value == "acc"
+
+
+async def test_pinned_metrics_come_first_in_pin_order_and_are_remembered():
+    app = make(ManyKeys)
+    async with app.run_test(size=(150, 40)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        await pilot.press("2")
+        await settle(pilot)
+        table = screen.query_one("#metrics", DataTable)
+        await pilot.press("down", "down", "down", "p")  # val/loss (4th row)
+        await settle(pilot)
+        assert keys_in(table) == ["val/loss", "acc", "f1", "train/loss"]
+        assert str(table.get_row_at(0)[0]).startswith("★ ")
+        assert table.cursor_row == 3 and keys_in(table)[3] == "train/loss"  # the cursor stayed: on the row that was above
+        await pilot.press("up", "p")  # f1 is now just above the cursor: pin it too
+        await settle(pilot)
+        assert keys_in(table) == ["val/loss", "f1", "acc", "train/loss"]  # pin order, not alphabetical
+        assert table.cursor_row == 2
+        await pilot.press("up", "p")  # f1 sits in the second row: unpin it
+        await settle(pilot)
+        assert keys_in(table) == ["val/loss", "acc", "f1", "train/loss"]
+        assert app.preferences.get("pins")["metrics"] == {"me/alpha": ["val/loss"]}
+    app2 = make(ManyKeys)
+    async with app2.run_test(size=(150, 40)) as pilot:
+        screen = await compare(pilot, 0, 1)
+        await pilot.press("2")
+        await settle(pilot)
+        assert keys_in(screen.query_one("#metrics", DataTable))[0] == "val/loss"  # remembered for the project
+
+
+async def test_several_metrics_can_be_pinned_in_a_row_without_scrolling_back_down():
+    app = make(ManyKeys)
+    async with app.run_test(size=(150, 40)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        await pilot.press("2")
+        await settle(pilot)
+        table = screen.query_one("#metrics", DataTable)
+        await pilot.press("down", "down", "p")  # train/loss (3rd row) goes up; the cursor stays on row 3
+        await settle(pilot)
+        assert keys_in(table) == ["train/loss", "acc", "f1", "val/loss"] and table.cursor_row == 2
+        await pilot.press("down", "p")  # the next one is just one Down away
+        await settle(pilot)
+        assert keys_in(table) == ["train/loss", "val/loss", "acc", "f1"]
+        assert app.preferences.get("pins")["metrics"] == {"me/alpha": ["train/loss", "val/loss"]}
+
+
+async def test_a_filtered_table_can_be_entered_with_down_and_its_rows_pinned():
+    app = make(ManyKeys)
+    async with app.run_test(size=(150, 40)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        await pilot.press("2", "slash", *"loss")
+        await settle(pilot)
+        table = screen.query_one("#metrics", DataTable)
+        box = screen.query_one("#compare-filter", Input)
+        assert app.focused is box and keys_in(table) == ["train/loss", "val/loss"]
+        await pilot.press("down")  # from the filter box straight into the rows
+        await settle(pilot)
+        assert app.focused is table and box.display and box.value == "loss"  # the filter stays
+        await pilot.press("down", "p")  # val/loss
+        await settle(pilot)
+        assert keys_in(table) == ["val/loss", "train/loss"]
+        assert app.preferences.get("pins")["metrics"] == {"me/alpha": ["val/loss"]}
+        await pilot.press("escape")  # clears the filter: the pin is on top of everything
+        await settle(pilot)
+        assert keys_in(table) == ["val/loss", "acc", "f1", "train/loss"]
+
+
+async def test_a_filtered_config_table_works_the_same_way():
+    app = make(ManyKeys)
+    async with app.run_test(size=(150, 40)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        await pilot.press("3", "slash", *"optim", "down", "down", "p")  # optim.name
+        await settle(pilot)
+        table = screen.query_one("#config-table", DataTable)
+        assert keys_in(table) == ["optim.name", "optim.beta"] and app.focused is table
+        assert app.preferences.get("pins")["config"] == {"me/alpha": ["optim.name"]}
+
+
+async def test_pinned_config_keys_are_listed_first_even_when_identical():
+    app = make(ManyKeys)
+    async with app.run_test(size=(150, 40)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        await pilot.press("3")
+        await settle(pilot)
+        table = screen.query_one("#config-table", DataTable)
+        assert keys_in(table) == ["data.path", "lr", "optim.beta", "optim.name"]  # seed is the same everywhere: hidden
+        await pilot.press("i")  # show identical ones: seed appears (sorted among the rest)
+        await settle(pilot)
+        assert keys_in(table) == ["data.path", "lr", "optim.beta", "optim.name", "seed"]
+        await pilot.press("down", "down", "down", "down", "p")  # pin seed (the cursor stays on row 5)
+        await settle(pilot)
+        await pilot.press("i")  # hide identical ones again: a pinned key stays
+        await settle(pilot)
+        assert keys_in(table) == ["seed", "data.path", "lr", "optim.beta", "optim.name"]
+        assert str(table.get_row_at(0)[0]) == "★ seed"
+        assert app.preferences.get("pins")["config"] == {"me/alpha": ["seed"]}
+
+
+async def test_the_filter_and_pin_keys_belong_to_metrics_and_config_only():
+    app = make(ManyKeys)
+    async with app.run_test(size=(150, 40)) as pilot:
+        screen = await compare(pilot, 0, 1)
+        assert screen.check_action("filter", ()) is False and screen.check_action("pin", ()) is False  # overview
+        await pilot.press("2")
+        await settle(pilot)
+        assert screen.check_action("filter", ()) is True and screen.check_action("pin", ()) is True
+        await pilot.press("4")
+        await settle(pilot)
+        assert screen.check_action("pin", ()) is False
+
+
+# ---- loading the plots of a panel ------------------------------------------------------------------------
+class WideClient(CompareClient):
+    METRICS_BY_RUN = {k: ["acc", "trainer/global_steps", "trainer/loss", "val/loss"] for k in ("id1", "id2", "id3")}
+
+
+async def test_each_run_is_asked_once_for_all_the_plots_of_a_panel():
+    app = make(WideClient)
+    async with app.run_test(size=(150, 50)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        app.client.many_calls.clear()
+        await show_panel(pilot, screen, "trainer")
+        assert len(app.client.many_calls) == 3  # one request per run, not one per run and metric
+        assert all(names == ("trainer/global_steps", "trainer/loss") and x == "_step" for names, x in app.client.many_calls)
+        views = list(screen.query(ComparePlotView))
+        assert len(views) == 2 and all(v.border_subtitle != "loading…" for v in views)
+        app.client.many_calls.clear()
+        await show_panel(pilot, screen, "val")  # new metrics only; the trainer data stays cached
+        assert [names for names, _x in app.client.many_calls] == [("val/loss",)] * 3
+
+
+# ---- loading the runs of a comparison ---------------------------------------------------------------------
+import threading
+
+
+async def test_a_runs_requests_are_made_together_and_all_runs_load_at_once():
+    class Gated(CompareClient):
+        """The details and the metadata of every run wait for each other: this only finishes if all six
+        requests (3 runs x 2) are in flight at the same time, within the cap of LOAD_WORKERS."""
+        everything = None
+
+        def run_details(self, ref):
+            self.everything.wait()
+            return super().run_details(ref)
+
+        def run_metadata(self, ref):
+            self.everything.wait()
+            return super().run_metadata(ref)
+
+    Gated.everything = threading.Barrier(6, timeout=10)
+    app = make(Gated)
+    async with app.run_test(size=(150, 40)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        assert [d.error for d in screen.data] == ["", "", ""]  # nothing timed out waiting
+        assert [d.info.id for d in screen.data] == ["id1", "id2", "id3"]  # and the order of the runs is kept
+
+
+# ---- keys that switch something show what they are set to ----------------------------------------------
+async def test_the_identical_rows_key_shows_whether_it_is_on_for_the_table_being_looked_at():
+    app = make(ManyKeys)
+    async with app.run_test(size=(170, 40)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        assert "i ☐ Hide identical rows" in keys_of(screen)  # the overview shows everything to begin with
+        assert "identical rows hidden" not in str(screen.query_one("#status").render())
+        await pilot.press("i")
+        await settle(pilot)
+        assert "i ☑ Hide identical rows" in keys_of(screen)
+        hidden = str(screen.query_one("#status").render())
+        assert "identical rows hidden" in hidden and hidden.split("  ·  ")[1].split()[0].isdigit()  # says how many
+        await pilot.press("2")  # each table has its own setting: the metrics start unhidden ...
+        await settle(pilot)
+        assert "i ☐ Hide identical rows" in keys_of(screen)
+        await pilot.press("3")  # ... and the config starts hiding what is identical
+        await settle(pilot)
+        assert "i ☑ Hide identical rows" in keys_of(screen)
+        await pilot.press("i")
+        await settle(pilot)
+        assert "i ☐ Hide identical rows" in keys_of(screen)
+        assert "seed" in keys_in(screen.query_one("#config-table", DataTable))  # which is what the key now says
+        await pilot.press("1")
+        await settle(pilot)
+        assert "i ☑ Hide identical rows" in keys_of(screen)  # back to the overview: still on
+
+
+async def test_the_table_grouping_key_shows_its_state():
+    app = make(MediaClient)
+    media_layout(app)
+    async with app.run_test(size=(170, 50)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        await show_panel(pilot, screen, "Media")
+        [view] = screen.query(CompareTableView)
+        view.focus()
+        await settle(pilot)
+        assert "v ☐ Line up rows by first column" in keys_of(screen)
+        await pilot.press("v")
+        await settle(pilot)
+        assert "v ☑ Line up rows by first column" in keys_of(screen)

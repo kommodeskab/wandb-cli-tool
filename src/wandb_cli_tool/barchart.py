@@ -41,24 +41,35 @@ def _glyphs(eighths: int) -> str:
     return "█" * (eighths // 8) + PARTIAL[eighths % 8].strip()
 
 
-def layout_bars(items: list[tuple[str, float | None]], width: int) -> BarLayout:
-    """Lay out `items` (name, value) in `width` cells. Missing values get a figure of '—' and no bar."""
+def layout_bars(
+    items: list[tuple[str, float | None]], width: int, low: float | None = None, high: float | None = None
+) -> BarLayout:
+    """Lay out `items` (name, value) in `width` cells. Missing values get a figure of '—' and no bar.
+
+    `low`/`high` fix the ends of the axis (either may be left automatic). The baseline is zero when
+    zero is on the axis, otherwise the end nearest to zero; a value is drawn from the baseline and
+    clipped to the axis. An empty range (low >= high) is ignored."""
     values = [v for _, v in items if v is not None and math.isfinite(v)]
     name_w = min(max((len(n) for n, _ in items), default=1), MAX_NAME_WIDTH, max(width // 3, 8))
     figures = [format_figure(v) for _, v in items]
     fig_w = max((len(f) for f in figures), default=1)
     bar_total = max(width - name_w - fig_w - 2 * GAP, 8)
 
-    lo, hi = min([0.0, *values]), max([0.0, *values])
+    lo = low if low is not None else min([0.0, *values])
+    hi = high if high is not None else max([0.0, *values])
+    if lo >= hi:  # an empty range: fall back to the automatic one
+        lo, hi = min([0.0, *values]), max([0.0, *values])
+    base = min(max(0.0, lo), hi)  # where bars start
+    up, down = hi - base, base - lo  # how far the axis reaches above / below the baseline
     span = hi - lo
-    has_negative = lo < 0
+    has_negative = down > 0
     area = bar_total - (1 if has_negative else 0)  # the baseline takes one cell
     if span == 0:
         pos_w, neg_w = area, 0
     else:
-        pos_w = round(area * hi / span) if hi > 0 else 0
+        pos_w = round(area * up / span) if up > 0 else 0
         neg_w = area - pos_w if has_negative else 0
-        if hi > 0 and pos_w == 0:
+        if up > 0 and pos_w == 0:
             pos_w, neg_w = 1, neg_w - 1
         if has_negative and neg_w == 0:
             neg_w, pos_w = 1, pos_w - 1
@@ -66,10 +77,10 @@ def layout_bars(items: list[tuple[str, float | None]], width: int) -> BarLayout:
     rows = []
     for (name, value), figure in zip(items, figures):
         pos = neg = ""
-        if value is not None and math.isfinite(value) and value != 0 and span:
-            if value > 0:
-                pos = _glyphs(max(1, round(value / hi * pos_w * 8)))
-            else:
-                neg = "█" * max(1, round(-value / -lo * neg_w))  # whole cells: no left-growing partial glyphs
+        if value is not None and math.isfinite(value) and span:
+            if value > base and up > 0:
+                pos = _glyphs(max(1, round((min(value, hi) - base) / up * pos_w * 8)))
+            elif value < base and down > 0:
+                neg = "█" * max(1, round((base - max(value, lo)) / down * neg_w))  # whole cells: no left-growing partial glyphs
         rows.append(BarRow(clip(name, name_w).ljust(name_w), figure.rjust(fig_w), neg, pos))
     return BarLayout(rows, neg_w, pos_w)

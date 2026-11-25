@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Iterator
 
 from rich.console import RenderableType
@@ -11,13 +12,18 @@ from textual.widgets import DataTable, Input
 
 from ..api import RunRef
 from ..formatting import fmt_duration, fmt_time
+from ..layout_store import project_key
+from ..pins import Pins, pinned_first
 from ..plain import plain
 from ..runsort import (
     HEADER_TO_COLUMN, SORT_FIELDS, SortState, sort_items, status_rank,
 )
-from .browse import BrowseScreen, Item, items_from_cache
+from textual.widgets.data_table import RowDoesNotExist
+
+from .browse import CACHE_LIMIT, BrowseScreen, Item, items_from_cache
 from ..compare import MAX_RUNS
 from .compare import CompareScreen
+from .filterinput import FilterInput
 from .dialogs import ConfirmDialog, DeleteRunsDialog, GroupDialog, RunActionsDialog, SortDialog, TagsDialog
 from .run import RunScreen
 
@@ -33,6 +39,7 @@ STATE_STYLES = {
 }
 
 
+BULK_WORKERS = 4  # writes in flight at once when an action covers several runs
 WATCH_SECONDS = 30  # how often a list with running runs checks for changes
 
 
@@ -43,11 +50,12 @@ class RunsScreen(BrowseScreen):
         Binding("r", "reload", "Refresh"),
         Binding("s", "sort", "Sort"),
         Binding("space", "toggle_select", "Select run"),
-        Binding("ctrl+a", "select_shown", "Select all shown"),
+        Binding("ctrl+a", "select_shown", "Select all shown", key_display="Ctrl+A"),
         Binding("c", "compare", "Compare selected"),
         Binding("u", "clear_selection", "Clear selection"),
+        Binding("p", "pin", "Pin"),
         Binding("a", "actions", "Actions"),
-        Binding("y", "copy_link", "Copy link"),
+        Binding("o", "open_in_browser", "Open in browser"),
     ]
     DEFAULT_CSS = "#filter { display: none; margin: 0 1; }"
     columns = ("Run", "Status", "Started", "Run time", "Group", "Tags", "ID")
@@ -62,22 +70,25 @@ class RunsScreen(BrowseScreen):
         self.sort_state = SortState()
         self.selected: list[str] = []  # run ids marked for comparison, in the order they were marked
         self.filter_text = ""
+        self.pinned: list[str] = []  # run ids shown first, in the order they were pinned
         self._watching = False  # a refresh started by the timer (not by the user) is under way
 
     def compose_before_table(self) -> ComposeResult:
-        yield Input(placeholder="Filter runs: name, group, tag, status or id (Enter keeps it, Esc clears it)", id="filter")
+        yield FilterInput(placeholder="Filter: name, group, tag, status or id", id="filter")
 
     def prepare(self) -> None:
         self.sort_state = SortState.from_json(self.app.preferences.get("runs_sort"))
+        self.pins = Pins(self.app.preferences, project_key(self.entity, self.project))
+        self.pinned = self.pins.get("runs")
         self._mark_headers()
         self.set_interval(WATCH_SECONDS, self._watch_tick)
 
     # ---- sorting ----------------------------------------------------------------------
     def display_order(self, items: list[Item]) -> list[Item]:
-        return sort_items(items, self.sort_state, self._sort_value)
+        return pinned_first(sort_items(items, self.sort_state, self._sort_value), self.pinned, lambda i: i.key)
 
     def has_custom_order(self) -> bool:
-        return not self.sort_state.is_server_order or bool(self.filter_text)
+        return not self.sort_state.is_server_order or bool(self.filter_text) or bool(self.pinned)
 
     def status_suffix(self) -> str:
         sort = "" if self.sort_state.is_server_order else f"  ·  sorted by {self.sort_state.label}"
@@ -87,7 +98,7 @@ class RunsScreen(BrowseScreen):
         )
         running = sum(i.cells[1] == "running" for i in self._items.values())
         watching = f"  ·  watching {running} running" if running else ""
-        return sort + filtered + watching + (f"  ·  {len(self.selected)} selected (c: compare)" if self.selected else "")
+        return sort + filtered + watching + (f"  ·  {len(self.selected)} selected" if self.selected else "")
 
     # ---- filtering ----------------------------------------------------------------------
     def _matches(self, item: Item) -> bool:
@@ -116,6 +127,9 @@ class RunsScreen(BrowseScreen):
             event.stop()
             self.query_one("#items", DataTable).focus()  # the filter stays; Esc clears it
 
+    def action_focus_results(self) -> None:
+        self.query_one("#items", DataTable).focus()
+
     def action_back(self) -> None:
         box = self.query_one("#filter", Input)
         if box.display:  # first Esc closes the filter, the next one goes back
@@ -132,6 +146,19 @@ class RunsScreen(BrowseScreen):
         if action == "clear_selection":
             return bool(self.selected)
         return True
+
+    def action_pin(self) -> None:
+        """Pin the selected runs (or the run under the cursor) to the top of the list; again unpins."""
+        targets = [i.key for i in self._targets()]
+        if targets:
+            table = self.query_one("#items", DataTable)
+            row = table.cursor_row
+            self.pins.toggle("runs", *targets)
+            self.pinned = self.pins.get("runs")
+            self.resort()
+            if table.row_count:  # the pinned run jumps up; the cursor stays on its row number, so the
+                table.move_cursor(row=min(row, table.row_count - 1), animate=False)  # next run is one Down away
+            self._status_done()
 
     def action_toggle_select(self) -> None:
         key = self._cursor_key()
@@ -188,8 +215,7 @@ class RunsScreen(BrowseScreen):
             self.app.push_screen(
                 ConfirmDialog(
                     f"Stop {len(running)} run{'s' * (len(running) != 1)}?",
-                    self._names(running) + "\n\nEach run is asked to stop gracefully (like the Stop button in W&B);\n"
-                    "its own process shuts down on its next heartbeat. Nothing is deleted.",
+                    self._names(running) + "\n\nEach run is asked to stop gracefully. Nothing is deleted.",
                     yes="Yes, stop", no="No",
                 ),
                 lambda yes: self._maybe(yes, "Stop", client.stop_run, running),
@@ -225,21 +251,30 @@ class RunsScreen(BrowseScreen):
 
     @work(thread=True, group="bulk")
     def _apply(self, label: str, write, items: list[Item]) -> None:
-        """Run one write per run, one after the other; report how many worked and why the rest did not."""
-        done: list[str] = []
-        failures: list[str] = []
-        for n, item in enumerate(items, 1):
-            self.app.call_from_thread(self._status, f"{label}: {n}/{len(items)}…")
+        """Run one write per run, a few at a time, and report how many worked and why the rest did not."""
+
+        def one(item: Item) -> tuple[str, str | None]:
             try:
                 write(self._ref(item))
-                done.append(item.key)
+                return item.key, None
             except Exception as exc:
-                failures.append(f"{item.label}: {exc}")
+                return item.key, f"{item.label}: {exc}"
+
+        done: list[str] = []
+        failures: list[str] = []
+        with ThreadPoolExecutor(max_workers=min(len(items), BULK_WORKERS)) as pool:
+            for n, (key, error) in enumerate(pool.map(one, items), 1):
+                self.app.call_from_thread(self._status, f"{label}: {n}/{len(items)}…")
+                if error is None:
+                    done.append(key)
+                else:
+                    failures.append(error)
         self.app.call_from_thread(self._applied, label, len(items), done, failures)
 
     def _applied(self, label: str, total: int, done: list[str], failures: list[str]) -> None:
         if label.startswith("Delete"):
-            self.selected = [k for k in self.selected if k not in done]
+            self.app.deleted_runs.update((self.entity, self.project, k) for k in done)
+            self._drop_deleted()
         if failures:
             more = f" (+{len(failures) - 1} more)" if len(failures) > 1 else ""
             self.notify(f"{label}: {len(done)} of {total} done. Failed — {failures[0]}{more}", severity="error")
@@ -280,19 +315,19 @@ class RunsScreen(BrowseScreen):
             return
         super()._fail(message)
 
-    def action_copy_link(self) -> None:
+    def action_open_in_browser(self) -> None:
         key = self._cursor_key()
         if key in self._items:
-            self._copy_link(self._ref(self._items[key]))
+            self._open_link(self._ref(self._items[key]))
 
     @work(thread=True, group="link", exclusive=True)
-    def _copy_link(self, ref: RunRef) -> None:
+    def _open_link(self, ref: RunRef) -> None:
         try:
             url = self.app.client.run_url(ref)
         except Exception as exc:
             self.app.call_from_thread(self.notify, f"Could not get the link: {exc}", severity="error")
             return
-        self.app.call_from_thread(self.app.copy_link, url)
+        self.app.call_from_thread(self.app.open_link, url)
 
     def _prune_selection(self) -> None:
         """A run that is gone from the list (deleted here or elsewhere) cannot stay selected."""
@@ -376,8 +411,13 @@ class RunsScreen(BrowseScreen):
                 table.columns[next(k for k in table.columns if str(k.value) == label)].label = plain(label + arrow)
         table.refresh(layout=True)
 
+    def _is_deleted(self, run_id: str) -> bool:
+        return (self.entity, self.project, run_id) in self.app.deleted_runs
+
     def fetch(self) -> Iterator[Item]:
         for r in self.app.client.iter_runs(self.entity, self.project):
+            if self._is_deleted(r.id):  # the server may still list a run that was just deleted
+                continue
             cells = (
                 r.name,
                 r.state or "—",
@@ -395,8 +435,12 @@ class RunsScreen(BrowseScreen):
 
     def render_cells(self, item: Item) -> tuple[RenderableType, ...]:
         name, state, started, runtime, group, tags, run_id = item.cells
-        if item.key in self.selected:
-            name = Text.assemble(("✓ ", "bold green"), name)
+        if item.key in self.pinned or item.key in self.selected:
+            name = Text.assemble(
+                *([("★ ", "bold yellow")] if item.key in self.pinned else []),
+                *([("✓ ", "bold green")] if item.key in self.selected else []),
+                name,
+            )
         status = Text("● " + state if state == "running" else state, style=STATE_STYLES.get(state, ""))
         return (name, status, started, Text(runtime, justify="right"), group, tags, run_id)
 
@@ -405,9 +449,8 @@ class RunsScreen(BrowseScreen):
         return f"runs:{self.entity}/{self.project}"
 
     def cached_items(self) -> list[Item] | None:
-        return items_from_cache(
-            self.app.cache.get("list", self._cache_key), len(self.columns)
-        )
+        items = items_from_cache(self.app.cache.get("list", self._cache_key), len(self.columns))
+        return [i for i in items if not self._is_deleted(i.key)] if items else items
 
     def store_items(self, items: list[Item]) -> None:
         self.app.cache.set("list", self._cache_key, [i.to_json() for i in items])
@@ -427,8 +470,27 @@ class RunsScreen(BrowseScreen):
             tags.update(t for t in tag_text.split(", ") if t and t != "—")
         return sorted(groups), sorted(tags)
 
+    def _drop_deleted(self) -> None:
+        """Take the runs deleted in this session off the screen at once (and out of the cached list),
+        rather than when the next refresh has finished."""
+        gone = [k for k in self._items if self._is_deleted(k)]
+        if not gone:
+            return
+        table = self.query_one("#items", DataTable)
+        for key in gone:
+            del self._items[key]
+            try:
+                table.remove_row(key)
+            except RowDoesNotExist:  # not shown (the filter hides it)
+                pass
+        self._count = len(self._items)
+        self.store_items(list(self._items.values())[:CACHE_LIMIT])
+        self._prune_selection()
+        self._status_done()
+
     def on_screen_resume(self) -> None:
-        """Back from a run whose group/tags changed: refresh the list in place."""
+        """Back from a run that was edited or deleted: refresh the list in place."""
+        self._drop_deleted()
         key = (self.entity, self.project)
         if key in self.app.touched_projects:
             self.app.touched_projects.discard(key)

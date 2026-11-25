@@ -20,6 +20,15 @@ from .models import (  # noqa: F401  (safe_relative_path is re-exported)
 from .copy_run import SKIP_FILES, CopyJob, is_system_artifact
 
 SAMPLES = 1000  # max points fetched per series
+# The SDK's own query for a run's sampled history (Run._sampled_history), but with any number of
+# specs: one request can carry one spec per metric, which is how a whole panel loads in one round trip.
+SAMPLED_HISTORY_GQL = """
+query RunSampledHistory($project: String!, $entity: String!, $name: String!, $specs: [JSONString!]!) {
+    project(name: $project, entityName: $entity) {
+        run(name: $name) { sampledHistory(specs: $specs) }
+    }
+}
+"""
 RUNS_PER_PAGE = 100
 PROJECTS_PER_PAGE = 100
 
@@ -97,6 +106,11 @@ class WandbClient(Protocol):
         ...
 
     def metric_series(self, ref: RunRef, y: str, x: str) -> list[Point]: ...
+
+    def metric_series_many(self, ref: RunRef, names: list[str], x: str) -> dict[str, list[Point]]:
+        """Several metrics against one x-axis in a single request (the same points as `metric_series`
+        for each). Callers keep `names` to a few dozen."""
+        ...
 
     def metric_values(self, ref: RunRef) -> dict[str, float]:
         """The latest value of each numeric metric (the run summary)."""
@@ -178,13 +192,26 @@ class WandbApiClient:
         self._api_key = api_key
         self._runs: dict[RunRef, Any] = {}
         self._details_seen: set[RunRef] = set()
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # guards the dicts only: never held during a network call
+        self._ref_locks: dict[RunRef, threading.Lock] = {}
 
     def _run(self, ref: RunRef):
+        """The run, loaded once. Different runs load at the same time (the network call is outside the
+        shared lock: it used to hold it, which made loading several runs take turns); two threads
+        asking for the same run share one load."""
         with self._lock:
-            if ref not in self._runs:
-                self._runs[ref] = self._api.run(ref.path)
-            return self._runs[ref]
+            run = self._runs.get(ref)
+            if run is not None:
+                return run
+            gate = self._ref_locks.setdefault(ref, threading.Lock())
+        with gate:
+            with self._lock:
+                run = self._runs.get(ref)
+            if run is None:
+                run = self._api.run(ref.path)
+                with self._lock:
+                    self._runs[ref] = run
+        return run
 
     def list_entities(self) -> list[str]:
         viewer = self._api.viewer  # raises ValueError on an invalid key
@@ -226,6 +253,7 @@ class WandbApiClient:
 
     def iter_runs(self, entity: str, project: str) -> Iterator[RunInfo]:
         """Most recently active first (sorted by the server, so pages stream in order)."""
+        self._forget_run_listings(f"{entity}/{project}")
         runs = self._api.runs(
             f"{entity}/{project}", order="-heartbeat_at", per_page=RUNS_PER_PAGE
         )
@@ -240,6 +268,15 @@ class WandbApiClient:
                 tuple(getattr(run, "tags", None) or ()),
             )
 
+    def _forget_run_listings(self, path: str) -> None:
+        """`Api.runs()` memoizes each listing, with the pages it has already fetched, by path, filters
+        and order. Asking again would hand back that same stale listing, so a run started after the
+        first load would never show up until the app restarted. Drop it so every listing is fresh."""
+        listings = getattr(self._api, "_runs", None)
+        if isinstance(listings, dict):
+            for key in [k for k in listings if str(k).startswith(path)]:
+                listings.pop(key, None)
+
     def console_lines(self, ref: RunRef) -> Iterator[str]:
         for line in self._run(ref).console_logs():
             yield line.content
@@ -250,6 +287,21 @@ class WandbApiClient:
     def metric_series(self, ref: RunRef, y: str, x: str) -> list[Point]:
         rows = self._run(ref).history(keys=[y], x_axis=x, samples=SAMPLES, pandas=False)
         return extract_points(rows, x, y)
+
+    def metric_series_many(self, ref: RunRef, names: list[str], x: str) -> dict[str, list[Point]]:
+        names = list(dict.fromkeys(names))
+        if len(names) <= 1:
+            return {n: self.metric_series(ref, n, x) for n in names}
+        try:
+            specs = [json.dumps({"keys": [x, n], "samples": SAMPLES}) for n in names]
+            per_spec = self._run(ref)._exec(SAMPLED_HISTORY_GQL, specs=specs)["project"]["run"]["sampledHistory"]
+            if len(per_spec) != len(names):
+                raise ValueError("unexpected sampledHistory answer")
+            return {n: extract_points(rows, x, n) for n, rows in zip(names, per_spec)}
+        except Exception:
+            # the private query is unavailable or answered differently: ask for each metric by itself
+            # through the public call (slower, same data); a real network error then surfaces from it
+            return {n: self.metric_series(ref, n, x) for n in names}
 
     def metric_values(self, ref: RunRef) -> dict[str, float]:
         return numeric_values(self._run(ref).summary_metrics)
@@ -393,3 +445,4 @@ class WandbApiClient:
         run.delete(delete_artifacts=delete_artifacts)
         with self._lock:
             self._runs.pop(ref, None)
+            self._ref_locks.pop(ref, None)

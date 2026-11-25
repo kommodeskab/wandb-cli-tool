@@ -133,7 +133,7 @@ async def test_several_images_in_one_step_are_browsed_with_brackets(make_app):
     async with ctx as pilot:
         screen, view = await with_images(pilot, "grid")
         assert view.current_step.step == 15 and "step 15 · 2/2 · image 1/3 · a" in info(view)
-        assert "[ ] image" in str(view.border_subtitle)
+        assert str(view.border_subtitle) == ""  # no key hints in the frame: the key bar has the keys
         await move(pilot, "right_square_bracket")
         assert "image 2/3 · b" in info(view) and app.client.downloads[-1] == path_of("grid", 15, 1)
         await move(pilot, "right_square_bracket", "right_square_bracket")  # the last image: no further
@@ -379,3 +379,14 @@ async def test_the_image_chart_takes_focus_when_added_and_never_shows_textuals_l
         await pilot.press("left")  # and the keys work straight away
         await pilot.pause(0.4)
         assert view.cursor.index == 2
+
+
+async def test_the_image_keys_are_in_the_key_bar_only_for_steps_with_several_images(make_app):
+    from wandb_cli_tool.screens.keybar import KeyBar
+
+    app, ctx = await start(make_app)
+    async with ctx as pilot:
+        screen, view = await with_images(pilot, "grid")  # 3 images per step
+        assert view.check_action("sub", ()) is True
+        bar = screen.query_one(KeyBar).query_one("KeyLine").render().plain.replace("\xa0", " ")
+        assert "[ Previous image" in bar and "] Next image" in bar

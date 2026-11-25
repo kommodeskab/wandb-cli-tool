@@ -160,7 +160,7 @@ class FileScreen(Screen):
 
     BINDINGS = [
         Binding("escape", "app.pop_screen", "Back"),
-        Binding("space", "toggle_play", "Play / stop"),
+        Binding("space", "toggle_play", "Play"),
         Binding("plus,equals_sign", "zoom(1)", "Zoom in"),
         Binding("minus", "zoom(-1)", "Zoom out"),
         Binding("0", "zoom_fit", "Fit"),
@@ -194,6 +194,9 @@ class FileScreen(Screen):
     def on_mount(self) -> None:
         self.title = self.info.name
         self.sub_title = fmt_size(self.info.size)
+        self._was_playing = False
+        if self.kind == "audio":
+            self.set_interval(0.5, self._watch_playback)
         limit = {
             "image": MAX_IMAGE_BYTES, "audio": MAX_AUDIO_BYTES, "text": MAX_TEXT_BYTES
         }.get(self.kind)
@@ -209,6 +212,23 @@ class FileScreen(Screen):
 
     def on_unmount(self) -> None:
         self.app.audio_player.stop()
+
+    def key_label(self, action: str) -> str | None:
+        """What the key will do / is set to, shown in the key bar."""
+        if action == "toggle_play":
+            return "Stop" if self.app.audio_player.playing else "Play"
+        if action == "next_mode":
+            return f"Render mode: {self.mode_name}"
+        return None
+
+    def _watch_playback(self) -> None:
+        """A clip ends by itself: keep the key saying "Stop" only while something plays."""
+        playing = self.app.audio_player.playing
+        if playing != self._was_playing:
+            self._was_playing = playing
+            self.refresh_bindings()
+            if not playing:
+                self._status("")
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         # False hides the key from the footer (None would only dim it)
@@ -276,9 +296,9 @@ class FileScreen(Screen):
         elif self.kind == "text":
             await self._show_text(preview, path, text, note)
         else:
-            hint = "Press Space to play / stop." if self.app.audio_player.available else INSTALL_HINT
+            hint = "" if self.app.audio_player.available else INSTALL_HINT
             self._status("")
-            await preview.mount(Static(Text(f"♪  {self.info.name}\n\n{hint}"), id="audio-info"))
+            await preview.mount(Static(Text(f"♪  {self.info.name}" + (f"\n\n{hint}" if hint else "")), id="audio-info"))
         self.refresh_bindings()
 
     # ---- text ----------------------------------------------------------
@@ -375,6 +395,7 @@ class FileScreen(Screen):
         await self._mount_image()
         self._fit_cells = keep  # same image, same fit size: keep the current zoom
         self._apply_zoom()
+        self.refresh_bindings()  # the key shows the mode now in use
 
     # ---- audio ---------------------------------------------------------
     def action_toggle_play(self) -> None:
@@ -383,6 +404,8 @@ class FileScreen(Screen):
             player.stop()
             self._status("Stopped.")
         elif self.path is not None and player.play(self.path):
-            self._status("Playing… (Space to stop)")
+            self._status("Playing…")
         else:
             self._status(INSTALL_HINT)
+        self._was_playing = player.playing
+        self.refresh_bindings()  # the key now says Play or Stop

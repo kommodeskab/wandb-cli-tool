@@ -51,13 +51,19 @@ class ChartOptions:
     def is_default(self) -> bool:
         return self == ChartOptions()
 
+    def range_text(self) -> str:
+        """The fixed value range, e.g. "0…1" or "auto…5" ("" if it is automatic)."""
+        if self.ymin is None and self.ymax is None:
+            return ""
+        lo = "auto" if self.ymin is None else f"{self.ymin:g}"
+        hi = "auto" if self.ymax is None else f"{self.ymax:g}"
+        return f"{lo}…{hi}"
+
     def describe(self) -> str:
         """The non-default settings in a few words, for a chart's subtitle."""
         parts = []
-        if self.ymin is not None or self.ymax is not None:
-            lo = "auto" if self.ymin is None else f"{self.ymin:g}"
-            hi = "auto" if self.ymax is None else f"{self.ymax:g}"
-            parts.append(f"y {lo}…{hi}")
+        if self.range_text():
+            parts.append(f"y {self.range_text()}")
         if self.smooth:
             parts.append(f"smoothed {self.smooth:g}")
         if self.logy or self.logx:
@@ -116,7 +122,8 @@ class ChartSpec:
     """One chart. `kind` decides what the other fields mean:
     plot:  y + more are the series (at most MAX_SERIES, all run metrics or all system metrics),
            plotted against `x`.
-    bar:   y + more are the metrics shown as bars, in the order given (latest value of each).
+    bar:   y + more are the metrics shown as bars, in the order given (latest value of each);
+           `opts.ymin`/`ymax` fix the ends of the value axis.
     table: y is the key of a wandb.Table the run logged.
     image: y is a key under which the run logged wandb.Images (browsed with a step slider).
     `opts` (plots only) are the y-range, smoothing and log axes."""

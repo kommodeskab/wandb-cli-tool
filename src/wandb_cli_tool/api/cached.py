@@ -101,6 +101,25 @@ class CachedClient:
         )
         return [(p[0], p[1]) for p in rows]  # JSON turns tuples into lists
 
+    def metric_series_many(self, ref: RunRef, names: list[str], x: str) -> dict[str, list[Point]]:
+        """Whatever is already cached is used; only the missing metrics are requested (in one request)."""
+        names = list(dict.fromkeys(names))
+        out: dict[str, list[Point]] = {}
+        missing = []
+        for name in names:
+            hit = None if ref.version is None else self._cache.get(NAMESPACE, f"{ref.path}@{ref.version}:series:{x}:{name}")
+            if hit is None:
+                missing.append(name)
+            else:
+                out[name] = [(p[0], p[1]) for p in hit]
+        if missing:
+            fetched = self._inner.metric_series_many(ref, missing, x)
+            for name, points in fetched.items():
+                out[name] = points
+                if ref.version is not None:
+                    self._cache.set(NAMESPACE, f"{ref.path}@{ref.version}:series:{x}:{name}", points)
+        return {n: out[n] for n in names if n in out}
+
     def metric_values(self, ref: RunRef) -> dict[str, float]:
         return self._memo(ref, "values", lambda: self._inner.metric_values(ref))
 

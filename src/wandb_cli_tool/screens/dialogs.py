@@ -42,7 +42,7 @@ class NewPanelDialog(CancellableDialog):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("New panel name (Enter to create, Esc to cancel)")
+            yield Label("New panel name")
             yield Input(id="panel-name")
 
     def on_mount(self) -> None:
@@ -75,7 +75,7 @@ class SortDialog(CancellableDialog):
             return Text(name + arrow, style="bold" if arrow else "")
 
         with Vertical():
-            yield Label("Sort runs by  (Enter to choose; again on the same column to reverse)")
+            yield Label("Sort runs by")
             yield OptionList(*[Option(label(c, n), id=c) for c, n in SORT_COLUMNS], id="sort-columns")
 
     def on_mount(self) -> None:
@@ -105,7 +105,7 @@ class GroupDialog(CancellableDialog):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("Set group (a run can only be in one group)")
+            yield Label("Set group")
             yield Label(f"Current group: {self.current or 'none'}", markup=False)
             if self.groups:
                 yield Label("Pick an existing group:")
@@ -160,10 +160,10 @@ class TagsDialog(CancellableDialog):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("Add tags (existing tags are kept)")
+            yield Label("Add tags")
             yield Label(f"Current tags: {', '.join(self.current) or 'none'}", markup=False)
             if self.available:
-                yield Label("Existing tags (↑/↓, Space to tick):")
+                yield Label("Existing tags:")
                 yield SelectionList[str](*[(plain(t), t) for t in self.available], id="tags")
             yield Label("New tags (comma-separated):")
             yield Input(placeholder="e.g. baseline, v2", id="new-tags")
@@ -204,7 +204,7 @@ class RenameDialog(CancellableDialog):
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label("Rename run (Enter to save, Esc to cancel)")
+            yield Label("Rename run")
             yield Input(value=self.current, id="new-name")
             yield Static("", id="rename-error")
             with Horizontal():

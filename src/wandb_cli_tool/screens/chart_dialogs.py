@@ -47,7 +47,7 @@ class ChartKindDialog(CancellableDialog):
             return Option(text if ok else f"{text}  (not available: {why_not})", id=kind, disabled=not ok)
 
         with Vertical():
-            yield Label("What kind of chart? (↑/↓, Enter to choose, Esc to cancel)")
+            yield Label("What kind of chart?")
             yield OptionList(
                 option(PLOT, "Plot — one or more values against an x-axis", "this run has no metrics"),
                 option(BAR, "Bar chart — the latest value of several metrics, in the order you choose", "needs two or more metrics"),
@@ -151,9 +151,9 @@ class PlotDialog(CancellableDialog):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            yield Label(f"Add a plot: tick one or more values (at most {MAX_SERIES})", markup=False)
+            yield Label(f"Add a plot (at most {MAX_SERIES} values)", markup=False)
             yield MetricPicker(metric_options(self.metrics, self.system_metrics), limit=MAX_SERIES, id="picker")
-            yield Label("X-axis (shared by all the values):")
+            yield Label("X-axis:")
             yield Select(_x_choices(self.metrics, False), allow_blank=False, id="x")
             yield Static("", id="plot-error")
             with Horizontal():
@@ -216,9 +216,9 @@ class BarDialog(CancellableDialog):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            yield Label("Add a bar chart: tick the metrics (each bar is its latest value)")
+            yield Label("Add a bar chart")
             yield MetricPicker(self.options, limit=MAX_BAR_VALUES, id="picker")
-            yield Label("Bars appear top to bottom in this order  (focus the list, then Ctrl+↑ / Ctrl+↓ to move):")
+            yield Label("Bar order (Ctrl+↑ / Ctrl+↓ moves the highlighted one):")
             yield OptionList(id="order")
             yield Static("", id="bar-error")
             with Horizontal():
@@ -343,7 +343,8 @@ class AxisDialog(CancellableDialog):
 
 
 class ChartOptionsDialog(CancellableDialog):
-    """Y-range, smoothing and log axes of a plot. Empty = automatic / off."""
+    """Value range, smoothing and log axes of a plot; only the value range of a bar chart.
+    Empty = automatic / off."""
 
     DEFAULT_CSS = """
     ChartOptionsDialog > Vertical { width: 70; height: auto; border: round $accent; padding: 1 2; background: $surface; }
@@ -354,23 +355,26 @@ class ChartOptionsDialog(CancellableDialog):
     def __init__(self, spec: ChartSpec) -> None:
         super().__init__()
         self.spec = spec
+        self.is_bar = spec.kind == BAR
 
     def compose(self) -> ComposeResult:
         o = self.spec.opts
 
         def text(v: float | None) -> str:
-            return "" if v is None else f"{v:g}"
+            return "" if v is None else f"{v:.10g}"
 
+        what = "Axis" if self.is_bar else "Y"
         with Vertical():
-            yield Label("Plot options: " + ", ".join(self.spec.series), markup=False)
-            yield Label("Y min (empty = automatic)")
+            yield Label(("Bar chart options: " if self.is_bar else "Plot options: ") + ", ".join(self.spec.series), markup=False)
+            yield Label(f"{what} min (empty = automatic)", markup=False)
             yield Input(text(o.ymin), id="ymin")
-            yield Label("Y max (empty = automatic)")
+            yield Label(f"{what} max (empty = automatic)", markup=False)
             yield Input(text(o.ymax), id="ymax")
-            yield Label("Smoothing, 0 to 0.99 (empty = off; 0.9 is heavy)")
-            yield Input(text(o.smooth or None), id="smooth")
-            yield Checkbox("Logarithmic y-axis", o.logy, id="logy")
-            yield Checkbox("Logarithmic x-axis", o.logx, id="logx")
+            if not self.is_bar:
+                yield Label("Smoothing, 0 to 0.99 (empty = off; 0.9 is heavy)")
+                yield Input(text(o.smooth or None), id="smooth")
+                yield Checkbox("Logarithmic y-axis", o.logy, id="logy")
+                yield Checkbox("Logarithmic x-axis", o.logx, id="logx")
             yield Static("", id="options-error")
             with Horizontal():
                 yield Button("Apply", variant="primary", id="ok")
@@ -393,11 +397,12 @@ class ChartOptionsDialog(CancellableDialog):
         self._submit()
 
     def _submit(self) -> None:
-        result = parse_options(
-            self.query_one("#ymin", Input).value, self.query_one("#ymax", Input).value,
-            self.query_one("#smooth", Input).value,
-            self.query_one("#logy", Checkbox).value, self.query_one("#logx", Checkbox).value,
-        )
+        if self.is_bar:
+            smooth, logy, logx = "", False, False
+        else:
+            smooth = self.query_one("#smooth", Input).value
+            logy, logx = self.query_one("#logy", Checkbox).value, self.query_one("#logx", Checkbox).value
+        result = parse_options(self.query_one("#ymin", Input).value, self.query_one("#ymax", Input).value, smooth, logy, logx)
         if isinstance(result, str):
             self.query_one("#options-error", Static).update(plain(result))
         else:

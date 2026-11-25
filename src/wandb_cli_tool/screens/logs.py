@@ -63,8 +63,12 @@ class LogsScreen(Screen):
         if self.follow and not self._loading and self.app.screen is self:
             self.load()  # only the lines after the ones already shown are added
 
+    def toggle_state(self, action: str) -> bool | None:
+        return self.follow if action == "toggle_follow" else None
+
     def action_toggle_follow(self) -> None:
         self.follow = not self.follow
+        self.refresh_bindings()  # the key shows the new state
         self._finish()
         if self.follow:
             self.load()

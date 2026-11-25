@@ -1,5 +1,5 @@
 """A key binding whose action method does not exist does nothing, silently (it once happened when
-an edit removed `action_copy_link` but left its `y` binding). Check every binding of every screen
+an edit removed `action_open_in_browser` but left its `o` binding). Check every binding of every screen
 and widget of the app."""
 
 import importlib

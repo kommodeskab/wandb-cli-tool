@@ -78,7 +78,7 @@ async def test_run_without_tags_or_metadata_shows_placeholders(make_app):
     async with app.run_test(size=SIZE) as pilot:
         await to_run(pilot, 1)  # run-2 has no tags and no group
         text = screen_text(app)
-        assert "none  (press t to add)" in text
+        assert "none" in text and "press t" not in text
         assert "finished" in text and "gpu-box-1" not in text
         assert "…" not in text  # nothing stuck on "loading"
 
@@ -538,14 +538,15 @@ async def test_audio_file_can_be_played_and_stopped(make_app):
     async with app.run_test(size=SIZE) as pilot:
         await to_files(pilot)
         await open_file(pilot, "sample.wav")
-        assert "sample.wav" in screen_text(app) and "Space to play" in screen_text(app)
+        assert "sample.wav" in screen_text(app) and "space Play" in screen_text(app)  # the key bar says what it will do
         await pilot.press("space")
         await settle(pilot)
         assert [p.name for p in player.played] == ["sample.wav"] and player.playing
-        assert "Playing" in screen_text(app)
+        assert "Playing" in screen_text(app) and "space Stop" in screen_text(app)  # the key now offers to stop
+        assert "Space to stop" not in screen_text(app)
         await pilot.press("space")
         await settle(pilot)
-        assert not player.playing
+        assert not player.playing and "space Play" in screen_text(app)
         await pilot.press("space")
         await settle(pilot)
         assert player.playing
@@ -656,3 +657,31 @@ def test_in_a_sixel_terminal_auto_mode_is_the_dedicated_sixel_widget():
     _, module, detected = line.split()[-3:]
     assert detected == "sixel"
     assert module == "textual_image.widget.sixel"  # AutoImage would be textual_image.widget (blank area)
+
+
+async def test_a_clip_that_ends_by_itself_turns_the_key_back_to_play(make_app):
+    player = FakePlayer()
+    app = make(player)
+    async with app.run_test(size=SIZE) as pilot:
+        await to_files(pilot)
+        await open_file(pilot, "sample.wav")
+        await pilot.press("space")
+        await settle(pilot)
+        assert "space Stop" in screen_text(app)
+        player.playing = False  # the clip finished on its own
+        for _ in range(20):
+            await pilot.pause(0.1)
+            if "space Play" in screen_text(app):
+                break
+        assert "space Play" in screen_text(app)
+
+
+async def test_the_render_mode_key_shows_the_mode_in_use(make_app):
+    app = make()
+    async with app.run_test(size=SIZE) as pilot:
+        await to_files(pilot)
+        await open_file(pilot, "pred_0.png")
+        assert "m Render mode: auto" in screen_text(app)
+        await pilot.press("m")
+        await settle(pilot, 6)
+        assert "m Render mode: half-cell" in screen_text(app)

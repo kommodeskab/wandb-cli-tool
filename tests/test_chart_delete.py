@@ -167,7 +167,7 @@ async def test_deleting_asks_first_and_no_changes_nothing(make_app):
         await settle(pilot)
         assert isinstance(app.screen, ConfirmDialog)
         text = " ".join(app.screen.query_one("#confirm-body").render().plain.split())
-        assert "“global_steps”" in text and "no run's data is touched" in text and "ALL runs of “alpha”" in text
+        assert text == "“global_steps”"  # just what is about to be deleted
         await pilot.press("enter")  # focus starts on "No"
         await settle(pilot)
         for key in ("n", "escape"):
@@ -292,7 +292,7 @@ async def test_reset_brings_deleted_charts_back_and_clears_the_saved_record(make
         assert panel_labels(screen)[1] == "trainer (1)"
         await pilot.press("d")
         await settle(pilot)
-        assert "brings back charts you deleted" in " ".join(app.screen.query_one("#confirm-body").render().plain.split())
+        assert "brings back the charts you deleted" in " ".join(app.screen.query_one("#confirm-body").render().plain.split())
         await pilot.press("y")
         await settle(pilot, 6)
         assert panel_labels(screen)[1] == "trainer (2)" and saved() is None

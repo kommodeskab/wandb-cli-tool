@@ -1,6 +1,6 @@
 # wandb-cli-tool
 
-A keyboard-driven terminal UI for browsing [Weights & Biases](https://wandb.ai): projects, runs, logs, charts, config, and logged files (images, audio, text). Almost everything is read-only; the only edits are setting a run's group and adding tags to a run.
+A keyboard-driven terminal UI for browsing [Weights & Biases](https://wandb.ai): projects, runs, logs, charts, config, and logged files (images, audio, text). Almost everything is read-only; the only edits are to runs: group, tags, name, copy, stop and delete.
 
 ## Install and run
 
@@ -9,7 +9,7 @@ uv sync
 uv run wandb-cli-tool          # or: uv tool install .   and then just: wandb-cli-tool
 ```
 
-On first launch you are asked for your API key and then pick an entity. Navigate with the arrow keys, `Enter` to open, `Esc` to go back, `q` to quit. The key bar at the bottom shows the keys that apply right now (it wraps onto more lines on a narrow terminal). Logout (`l`), change entity (`e`) and quit (`q`) are listed on the projects page only, but work everywhere.
+On first launch you are asked for your API key and then pick an entity. Navigate with the arrow keys, `Enter` to open, `Esc` to go back, `q` to quit. The key bar at the bottom shows the keys that apply right now (a key that switches something shows its state: ☑ on, ☐ off, or the value in use, e.g. `Auto-refresh: 30 s`) (it wraps onto more lines on a narrow terminal). Logout (`l`), change entity (`e`) and quit (`q`) are listed on the projects page only, but work everywhere.
 
 ## Sorting runs
 
@@ -19,18 +19,22 @@ In a project's run list, `s` opens a sort menu: last activity (the default, newe
 
 In a project's run list, press `Space` to select the run under the cursor (a ✓ appears; `Space` again unselects, `Ctrl+A` selects all runs the filter shows, `u` clears the selection). Select 2 to 8 runs of the same project and press `c` to compare them. Each run gets a color that follows it everywhere (shown in the legend at the top).
 
-- **Overview** (`1`): the facts from the top of a run screen (status, start, run time, group, tags, host, GPU, git, command, ID), one column per run. Rows where the runs differ are marked `≠`; `d` hides the identical rows.
+- **Overview** (`1`): the facts from the top of a run screen (status, start, run time, group, tags, host, GPU, git, command, ID), one column per run. Rows where the runs differ are marked `≠`; `i` hides the identical rows.
 - **Config** (`3`): only what differs. A row is an entry (nested keys are written `model.name`, list items `layers[0]`) with each run's value; `—` means that run's config lacks the entry, and entries only some runs have are yellow. Entries that are the same in every run are hidden (`d` shows them), and the status line says how many there are.
-- **Metrics** (`2`): the latest value of every metric, one column per run, with a **Best** column naming the best run of each metric (green). Lower is better by default; press `b` to flip the metric under the cursor to "higher is better" (and back), or `B` to flip all. The **Better** column shows the direction, and your choices are remembered for the project. `d` hides rows where all runs agree.
-- **Charts** (`4`): the project's chart layout (the panels and charts you set up in the run screens) over all the selected runs. A plot overlays one curve per run. A plot with several metrics is split into one plot per metric, so the lines stay readable. A bar chart draws, for each metric, one bar per run side by side. A plot where every run logged a single value is drawn as bars instead. Runs that did not log a metric are named in the chart and never queried. A table is shown as one table with a colored Run column (`v` lines up rows with the same first column), and images are shown side by side at the same step with one slider for all runs.
+- **Metrics** (`2`): the latest value of every metric, one column per run, with a **Best** column naming the best run of each metric (green). Lower is better by default; press `b` to flip the metric under the cursor to "higher is better" (and back), or `B` to flip all. The **Better** column shows the direction, and your choices are remembered for the project. `i` hides rows where all runs agree.
+- **Charts** (`4`): the project's chart layout over all the selected runs. Charts are added, changed and deleted here with the same keys as in a single run (`n` new panel, `a` add chart, `x` x-axis, `o` options, `Delete`, `d` back to the default layout), and the layout is the project's one layout, so every change shows in the single-run screens too (and the other way round). The metrics, tables and images you can choose from are those of all the selected runs. A plot overlays one curve per run. A plot with several metrics is split into one plot per metric, so the lines stay readable. A bar chart draws, for each metric, one bar per run side by side. A plot where every run logged a single value is drawn as bars instead. Runs that did not log a metric are named in the chart and never queried. A table is shown as one table with a colored Run column (`v` lines up rows with the same first column), and images are shown side by side at the same step with one slider for all runs.
 
-Logs and files are not compared. Comparing only reads data; it changes nothing in W&B and does not edit the chart layout.
+In the Metrics and Config tabs, `/` filters the rows by key as you type (every word must occur in the key; `Enter` keeps the filter, `Esc` clears it; each tab keeps its own), and `p` pins the metric or config key under the cursor to the top (marked ★; a pinned key is always listed, even when its values are identical). Pins are remembered per project.
+
+Logs and files are not compared. Comparing only reads data; it changes nothing in W&B.
 
 ## Finding and watching runs
 
+- `p` pins the selected runs (or the run under the cursor) to the top of the list, in the order you pinned them, whatever the sort; `p` again unpins. Pins are remembered per project.
+- `Ctrl+A` (hold the Control key and press A; it is written `^a` in some terminals) selects every run the filter currently shows. If your terminal multiplexer uses Ctrl+A as its prefix (tmux/screen), press it twice or use Space on each run.
 - `/` filters the run list as you type: every word must occur in the run's name, status, group, tags or id (case does not matter). `Enter` keeps the filter and returns to the list, `Esc` clears it.
 - While the list is open and some run is running, it checks for changes every 30 seconds and tells you when a run finishes, fails or a new one starts (a terminal beep for runs that did not finish well). The status line says how many it is watching.
-- `y` copies the link of the run under the cursor (or of the open run) to the clipboard, through the terminal, so it also works over SSH. The link is also shown in a notification.
+- `o` opens the run under the cursor (or the open run) in your browser. It uses `$BROWSER` if set (VS Code's remote terminals set it, so the link opens in the browser on your own machine), and otherwise the system's default on macOS/Windows, or `xdg-open` when there is a display. Where no browser can be opened (a bare SSH session), the link is copied to the clipboard through the terminal and shown instead.
 - The log of a running run is followed: new lines appear every 5 seconds (`f` stops/starts it, `r` reloads everything).
 
 ## Managing runs
@@ -73,7 +77,7 @@ Series colors come from a fixed palette in a fixed order. The kind and its setti
 
 When a run later logs the missing data, a refresh brings the chart to life. The first time you change something, the app tells you the change applies to all runs in the project, and deleting a chart or resetting (below) says so too. While the tool is under development, saved layouts may occasionally be discarded after an update (layouts saved per run in earlier versions were dropped when this changed).
 
-To change how a plot is drawn, focus it and press `o`: a fixed y-range (min and/or max), smoothing (0 to 0.99, an exponential moving average as in W&B: 0.9 is heavy), and a logarithmic y and/or x axis. Points a log axis cannot show (zero or negative) are left out, and the chart says how many. The settings are saved with the chart and shared by all runs of the project, like everything else about the layout (also in the compare screen).
+To change how a plot is drawn, focus it and press `o`: a fixed y-range (min and/or max), smoothing (0 to 0.99, an exponential moving average as in W&B: 0.9 is heavy), and a logarithmic y and/or x axis. Points a log axis cannot show (zero or negative) are left out, and the chart says how many. A bar chart can have a fixed value axis (`o` on it asks for a min and a max; a bar is clipped to the axis, and the figure beside it is still the real value). The settings are saved with the chart and shared by all runs of the project, like everything else about the layout (also in the compare screen).
 
 To delete a chart or table, focus it (`→` or `Tab`), press `Delete` (or `Backspace`), and confirm. It is removed from that panel in every run of the project (no run's data is touched), and a deleted default chart stays deleted next time (even when new metrics appear). `d` brings everything back. Tables are as tall as their rows need (up to 20 lines, then they scroll). These customizations are saved per run (in `chart_layouts.json` in the config directory, `~/.config/wandb-cli-tool/` on Linux) as soon as you make them, and are restored next time. Press `d` to go back to the default layout for that run (after a yes/no confirmation): this removes the panels and charts you added and any x-axis changes. While the tool is under development, saved layouts may occasionally be discarded after an update.
 

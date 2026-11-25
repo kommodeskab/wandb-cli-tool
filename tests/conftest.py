@@ -44,6 +44,7 @@ class FakeClient:
         self.job_gate.set()  # tests clear it to hold a copy 'in progress'
         self.groups, self.tags, self.names = {}, {}, {}
         self.deleted = set()
+        self.many_calls = []
         if api_key == "bad":
             self.bad = True
         else:
@@ -136,6 +137,10 @@ class FakeClient:
             return [(3.0, 0.25)]
         scale = 1 + sum(map(ord, y)) % 5  # a different line for each metric
         return [(float(i), float(i * scale)) for i in range(5)]
+
+    def metric_series_many(self, ref, names, x):
+        self.many_calls.append((tuple(names), x))
+        return {n: self.metric_series(ref, n, x) for n in names}  # each metric still recorded in series_calls
 
     def system_rows(self, ref):
         return list(self.SYSTEM_ROWS)

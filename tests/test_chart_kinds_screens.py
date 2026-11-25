@@ -464,3 +464,104 @@ async def test_chart_kinds_and_their_settings_survive_restarting_the_app(make_ap
         assert (plot.spec.series, plot.spec.x) == (("trainer/loss", "val/loss"), "acc")
         assert bar.spec.series == ("val/loss", "acc") and bar.items == [("val/loss", 0.4), ("acc", 0.9)]
         assert table.spec.y == "results" and table.row_count == 2
+
+
+# ---- plots load together and the panel being looked at comes first -------------------------------------
+import threading
+
+from wandb_cli_tool.screens import charts as charts_module
+
+
+async def show(pilot, screen, name):
+    """Show the panel called `name`, as if picked in the list."""
+    screen.selected = next(i for i, l in enumerate(panel_labels(screen)) if l.startswith(name + " ("))
+    await screen._show_panel()
+    await settle(pilot, 8)
+
+
+def asked(app):
+    return [names for names, _x in app.client.many_calls]
+
+
+async def test_a_panels_plots_are_fetched_in_one_request(make_app):
+    app, ctx = await start(make_app)
+    async with ctx as pilot:
+        screen = await open_charts(pilot)
+        app.client.many_calls.clear()
+        await show(pilot, screen, "trainer")  # two plots: global_steps and loss
+        assert asked(app) == [("trainer/global_steps", "trainer/loss")]
+        views = list(screen.query(ChartView))
+        assert len(views) == 2 and all(v.border_subtitle != "loading…" for v in views)
+
+
+async def test_what_is_already_loaded_is_not_asked_for_again(make_app):
+    app, ctx = await start(make_app)
+    async with ctx as pilot:
+        screen = await open_charts(pilot)
+        await show(pilot, screen, "trainer")
+        app.client.many_calls.clear()
+        await show(pilot, screen, "val")
+        await show(pilot, screen, "trainer")  # back: everything is cached on the screen
+        assert asked(app) == [("val/loss",)]
+
+
+async def test_large_panels_are_fetched_in_batches_top_chart_first(make_app, monkeypatch):
+    monkeypatch.setattr(charts_module, "SERIES_BATCH", 1)
+    app, ctx = await start(make_app)
+    async with ctx as pilot:
+        screen = await open_charts(pilot)
+        app.client.many_calls.clear()
+        await show(pilot, screen, "trainer")
+        assert asked(app) == [("trainer/global_steps",), ("trainer/loss",)]  # in chart order
+        assert all(v.border_subtitle != "loading…" for v in screen.query(ChartView))
+
+
+async def test_leaving_a_panel_skips_its_queued_batches_and_does_not_hold_up_the_new_one(make_app, monkeypatch):
+    monkeypatch.setattr(charts_module, "SERIES_BATCH", 1)
+    monkeypatch.setattr(charts_module, "SERIES_WORKERS", 1)  # one request at a time, so the second batch is still queued
+    gate, started = threading.Event(), threading.Event()
+    app, ctx = await start(make_app)
+    async with ctx as pilot:
+        client = app.client
+
+        def slow(ref, names, x):
+            client.many_calls.append((tuple(names), x))
+            if names == ["trainer/global_steps"]:  # the first request of the first panel hangs
+                started.set()
+                gate.wait(10)
+            return {n: client.metric_series(ref, n, x) for n in names}
+
+        client.metric_series_many = slow
+        screen = await open_charts(pilot)
+        client.many_calls.clear()
+        screen.selected = next(i for i, l in enumerate(panel_labels(screen)) if l.startswith("trainer ("))
+        await screen._show_panel()  # its first batch blocks ...
+        for _ in range(40):
+            await pilot.pause(0.05)
+            if started.is_set():
+                break
+        assert started.is_set()
+        await show(pilot, screen, "val")  # ... but another panel can be looked at at once
+        assert ("val/loss",) in asked(app)
+        assert all(v.border_subtitle != "loading…" for v in screen.query(ChartView))
+        gate.set()  # the stuck request finishes ...
+        await settle(pilot, 10)
+        assert ("trainer/loss",) not in asked(app)  # ... and the panel that was left never asks for its second batch
+
+
+async def test_batches_of_one_panel_are_fetched_at_the_same_time(make_app, monkeypatch):
+    monkeypatch.setattr(charts_module, "SERIES_BATCH", 1)
+    both_in_flight = threading.Barrier(2, timeout=5)  # only passes if two requests are running together
+    app, ctx = await start(make_app)
+    async with ctx as pilot:
+        client = app.client
+
+        def together(ref, names, x):
+            both_in_flight.wait()
+            return {n: client.metric_series(ref, n, x) for n in names}
+
+        client.metric_series_many = together
+        screen = await open_charts(pilot)
+        await show(pilot, screen, "trainer")  # two batches of one metric
+        views = list(screen.query(ChartView))
+        assert len(views) == 2 and all(v.border_subtitle != "loading…" for v in views)  # a broken barrier would show errors
