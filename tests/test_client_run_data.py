@@ -51,6 +51,16 @@ class FakeRun:
     def update(self):  # must never be used: it rewrites config/summary/etc.
         self.updated = True
 
+    stopped = 0
+    deleted = None
+    url = "https://example.wandb/e/p/runs/r"
+
+    def stop(self):
+        self.stopped += 1
+
+    def delete(self, delete_artifacts=False):
+        self.deleted = delete_artifacts
+
     def files(self, names=None, per_page=50):
         if names == ["diff.patch"]:
             return [FakeFile("diff.patch")] if self.diff_patch else []
@@ -198,6 +208,15 @@ class Counting:
     def set_group(self, ref, group):
         self.calls.append(("group", group))
 
+    def stop_run(self, ref):
+        self.calls.append("stop")
+
+    def delete_run(self, ref, delete_artifacts=False):
+        self.calls.append(("delete", delete_artifacts))
+
+    def start_copy(self, ref):
+        self.calls.append("copy")
+
 
 def test_cached_client_caches_metadata_and_config_of_finished_runs_only(tmp_path):
     inner, cache = Counting(), DiskCache(tmp_path)
@@ -218,6 +237,8 @@ def test_cached_client_never_caches_details_or_writes(tmp_path):
     c.run_details(ref), c.run_details(ref)
     c.add_tags(ref, ["t"]), c.set_group(ref, "g"), c.rename_run(ref, "n")
     assert inner.calls == ["details", "details", ("tags", ["t"]), ("group", "g"), ("rename", "n")]
+    c.stop_run(ref), c.delete_run(ref), c.delete_run(ref, True), c.start_copy(ref)
+    assert inner.calls[5:] == ["stop", ("delete", False), ("delete", True), "copy"]
 
 
 # ---- tables and bar values ----------------------------------------------------------------
@@ -320,3 +341,24 @@ def test_cached_client_caches_tables_and_values_for_finished_runs_only(tmp_path)
     assert inner.calls == ["values", "tables", ("data", "p.table.json")]
     c.run_tables(live), c.run_tables(live)
     assert inner.calls[3:] == ["tables", "tables"]
+
+
+def test_stop_uses_the_sdks_stop_request_and_nothing_else(client_and_run):
+    client, run, service = client_and_run
+    client.stop_run(REF)
+    assert run.stopped == 1 and service.calls == [] and not run.updated
+
+
+def test_delete_keeps_the_runs_artifacts_unless_asked_and_forgets_the_run(client_and_run):
+    client, run, service = client_and_run
+    client.run_details(REF)  # the run is now remembered by the client
+    client.delete_run(REF)
+    assert run.deleted is False  # artifacts may be used by other runs: kept by default
+    assert REF not in client._runs and not run.updated
+    client.delete_run(REF, delete_artifacts=True)
+    assert run.deleted is True
+
+
+def test_run_url_comes_from_the_sdk_not_from_a_hard_coded_host(client_and_run):
+    client, run, _ = client_and_run
+    assert client.run_url(REF) == "https://example.wandb/e/p/runs/r"

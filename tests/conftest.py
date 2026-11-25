@@ -43,6 +43,7 @@ class FakeClient:
         self.job_gate = threading.Event()
         self.job_gate.set()  # tests clear it to hold a copy 'in progress'
         self.groups, self.tags, self.names = {}, {}, {}
+        self.deleted = set()
         if api_key == "bad":
             self.bad = True
         else:
@@ -66,6 +67,8 @@ class FakeClient:
         from dataclasses import replace
 
         for r in self.RUNS.get((entity, project), []):  # reflects edits made via the app
+            if r.id in self.deleted:
+                continue
             yield replace(
                 r,
                 name=self.names.get(r.id, r.name),
@@ -218,6 +221,20 @@ class FakeClient:
         if getattr(self, "estimate_fails", False):
             raise RuntimeError("cannot list artifacts")
         return self.ESTIMATE
+
+    def run_url(self, ref):
+        return f"https://wandb.example/{ref.entity}/{ref.project}/runs/{ref.id}"
+
+    def stop_run(self, ref):
+        if self.fail_writes:
+            raise RuntimeError("permission denied")
+        self.writes.append(("stop", ref.id))
+
+    def delete_run(self, ref, delete_artifacts=False):
+        if self.fail_writes:
+            raise RuntimeError("permission denied")
+        self.writes.append(("delete+artifacts" if delete_artifacts else "delete", ref.id))
+        self.deleted.add(ref.id)
 
     def start_copy(self, ref):
         self.copies_started.append(ref)

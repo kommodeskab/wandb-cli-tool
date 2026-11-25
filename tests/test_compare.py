@@ -70,9 +70,10 @@ def test_multi_metric_plots_are_split_into_one_chart_per_metric():
                         ChartSpec("t", kind="table"), ChartSpec("i", kind="image"), ChartSpec("a/solo")])
     charts = compare_charts(panel)
     assert [(c.kind, c.metrics) for c in charts] == [
-        (PLOT, ("a/x",)), (PLOT, ("a/y",)), (PLOT, ("a/z",)), (BAR, ("a/q", "a/r")), (PLOT, ("a/solo",)),
+        (PLOT, ("a/x",)), (PLOT, ("a/y",)), (PLOT, ("a/z",)), (BAR, ("a/q", "a/r")),
+        (TABLE, ("t",)), (IMAGE, ("i",)), (PLOT, ("a/solo",)),
     ]
-    assert charts[0].subtitle == ChartSpec("a/x", more=("a/y", "a/z")).title and charts[4].subtitle == ""
+    assert charts[0].subtitle == ChartSpec("a/x", more=("a/y", "a/z")).title and charts[-1].subtitle == ""
 
 
 def test_single_value_means_every_run_with_data_has_exactly_one_point():
@@ -91,3 +92,66 @@ def test_grouped_bars_give_each_run_its_own_color_and_separate_groups():
     styles = {str(span.style) for span in text.spans}
     assert {"#111111", "#222222"} <= styles
     assert grouped_bars_height(groups) == 4 + 1 + 2
+
+
+# ---- metrics, tables, images ------------------------------------------------------------------
+from wandb_cli_tool.charts import IMAGE, TABLE
+from wandb_cli_tool.compare import merge_tables, metric_rows, nearest_step, union_steps
+from wandb_cli_tool.images import ImageSeries, ImageStep
+from wandb_cli_tool.tables import TableData
+
+
+def test_lower_is_better_unless_the_user_says_a_metric_is_higher():
+    values = [{"acc": 0.9, "loss": 0.5}, {"acc": 0.8, "loss": 0.2}]
+    plain = {r.name: r for r in metric_rows(values)}
+    assert plain["acc"].best == 1 and plain["loss"].best == 1 and not plain["acc"].higher  # no guessing by name
+    flipped = {r.name: r for r in metric_rows(values, higher={"acc"})}
+    assert flipped["acc"].best == 0 and flipped["acc"].higher and flipped["loss"].best == 1 and not flipped["loss"].higher
+
+
+def test_metric_rows_mark_the_best_run_and_whether_the_runs_differ():
+    rows = {r.name: r for r in metric_rows([{"acc": 0.9, "loss": 0.5, "same": 1.0, "solo": 2.0},
+                                             {"acc": 0.8, "loss": 0.2, "same": 1.0}], higher={"acc"})}
+    assert rows["acc"].best == 0 and rows["loss"].best == 1  # high acc (flipped), low loss (default)
+    assert rows["same"].best is None and not rows["same"].differs  # nothing to choose between
+    assert rows["solo"].best is None and rows["solo"].differs and rows["solo"].values == (2.0, None)
+    assert list(rows) == sorted(rows)
+
+
+def table(columns, *rows, total=None):
+    return TableData(tuple(columns), tuple(tuple(r) for r in rows), total or len(rows), len(columns))
+
+
+def test_merge_tables_unites_columns_and_keeps_each_runs_rows_together():
+    merged = merge_tables([table("ab", ("1", "x"), ("2", "y")), table("bc", ("z", "w")), None])
+    assert merged.columns == ("a", "b", "c") and merged.missing == (2,) and not merged.truncated
+    assert merged.rows == ((0, ("1", "x", "")), (0, ("2", "y", "")), (1, ("", "z", "w")))
+
+
+def test_merge_tables_can_line_up_rows_by_their_first_column():
+    merged = merge_tables([table("ka", ("b", "1"), ("a", "2")), table("ka", ("a", "3"), ("b", "4"))], by_key=True)
+    assert [(i, r[0]) for i, r in merged.rows] == [(0, "a"), (1, "a"), (0, "b"), (1, "b")]
+
+
+def test_merge_tables_limits_rows_per_run_and_says_so():
+    big = table("a", *[(str(i),) for i in range(50)])
+    merged = merge_tables([big, big], per_run=10)
+    assert len(merged.rows) == 20 and merged.truncated
+    assert merge_tables([table("a", ("1",), total=5)]).truncated  # the table itself was cut when downloaded
+
+
+def steps(*numbers):
+    return ImageSeries(tuple(ImageStep(n, (f"p{n}.png",)) for n in numbers), len(numbers))
+
+
+def test_the_slider_covers_every_step_any_run_has_and_runs_show_their_nearest():
+    assert union_steps([steps(10, 20), None, steps(20, 25)]) == [10, 20, 25] and union_steps([None]) == []
+    s = steps(10, 20, 30).steps
+    assert nearest_step(s, 24).step == 20 and nearest_step(s, 26).step == 30
+    assert nearest_step(s, 15).step == 10  # a tie goes to the earlier step
+    assert nearest_step(s, 99).step == 30 and nearest_step((), 5) is None
+
+
+def test_tables_and_images_of_a_layout_are_compared_too():
+    panel = Panel("p", [ChartSpec("preds", kind=TABLE), ChartSpec("grid", kind=IMAGE)])
+    assert [(c.kind, c.metrics) for c in compare_charts(panel)] == [(TABLE, ("preds",)), (IMAGE, ("grid",))]

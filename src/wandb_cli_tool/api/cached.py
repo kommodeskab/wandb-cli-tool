@@ -65,6 +65,15 @@ class CachedClient:
     def start_copy(self, ref: RunRef) -> CopyJob:
         return self._inner.start_copy(ref)
 
+    def run_url(self, ref: RunRef) -> str:
+        return self._inner.run_url(ref)
+
+    def stop_run(self, ref: RunRef) -> None:
+        self._inner.stop_run(ref)
+
+    def delete_run(self, ref: RunRef, delete_artifacts: bool = False) -> None:
+        self._inner.delete_run(ref, delete_artifacts)
+
     def run_metadata(self, ref: RunRef) -> RunMetadata:
         data = self._memo(ref, "metadata", lambda: asdict(self._inner.run_metadata(ref)))
         return RunMetadata(**data)

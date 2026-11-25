@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -33,6 +34,83 @@ def display_names(names: tuple[str, ...] | list[str], system: bool = False) -> l
     return shorts if len(set(shorts)) == len(shorts) else list(names)
 
 
+MAX_SMOOTHING = 0.99
+
+
+@dataclass(frozen=True)
+class ChartOptions:
+    """How a plot is drawn. All off by default (auto y-range, raw data, linear axes)."""
+
+    ymin: float | None = None  # fixed y-range ends (None: automatic)
+    ymax: float | None = None
+    smooth: float = 0.0  # exponential moving average weight, 0 = off (as in W&B: 0.9 is heavy smoothing)
+    logy: bool = False
+    logx: bool = False
+
+    @property
+    def is_default(self) -> bool:
+        return self == ChartOptions()
+
+    def describe(self) -> str:
+        """The non-default settings in a few words, for a chart's subtitle."""
+        parts = []
+        if self.ymin is not None or self.ymax is not None:
+            lo = "auto" if self.ymin is None else f"{self.ymin:g}"
+            hi = "auto" if self.ymax is None else f"{self.ymax:g}"
+            parts.append(f"y {lo}…{hi}")
+        if self.smooth:
+            parts.append(f"smoothed {self.smooth:g}")
+        if self.logy or self.logx:
+            parts.append("log " + " & ".join(a for a, on in (("x", self.logx), ("y", self.logy)) if on))
+        return ", ".join(parts)
+
+    def to_json(self) -> dict[str, Any]:
+        return {"ymin": self.ymin, "ymax": self.ymax, "smooth": self.smooth, "logy": self.logy, "logx": self.logx}
+
+    @staticmethod
+    def from_json(data: Any) -> "ChartOptions":
+        """Tolerant reader: anything malformed falls back to the default for that field."""
+        if not isinstance(data, dict):
+            return ChartOptions()
+
+        def number(key: str) -> float | None:
+            v = data.get(key)
+            return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+
+        smooth = number("smooth") or 0.0
+        out = ChartOptions(
+            number("ymin"), number("ymax"), min(max(smooth, 0.0), MAX_SMOOTHING),
+            data.get("logy") is True, data.get("logx") is True,
+        )
+        if out.ymin is not None and out.ymax is not None and out.ymin >= out.ymax:
+            out = replace(out, ymin=None, ymax=None)
+        return out
+
+
+def parse_options(ymin: str, ymax: str, smooth: str, logy: bool, logx: bool) -> ChartOptions | str:
+    """Options from what the user typed, or a message saying what is wrong. Blank = off/automatic."""
+
+    def number(text: str, what: str) -> float | None | str:
+        text = text.strip()
+        if not text:
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            return f"{what} must be a number (or empty)."
+        return value if math.isfinite(value) else f"{what} must be a finite number."
+
+    lo, hi, weight = number(ymin, "Y min"), number(ymax, "Y max"), number(smooth, "Smoothing")
+    for v in (lo, hi, weight):
+        if isinstance(v, str):
+            return v
+    if lo is not None and hi is not None and lo >= hi:
+        return "Y min must be smaller than Y max."
+    if weight is not None and not 0 <= weight <= MAX_SMOOTHING:
+        return f"Smoothing must be between 0 (off) and {MAX_SMOOTHING}."
+    return ChartOptions(lo, hi, weight or 0.0, logy, logx)  # type: ignore[arg-type]
+
+
 @dataclass(frozen=True)
 class ChartSpec:
     """One chart. `kind` decides what the other fields mean:
@@ -40,13 +118,15 @@ class ChartSpec:
            plotted against `x`.
     bar:   y + more are the metrics shown as bars, in the order given (latest value of each).
     table: y is the key of a wandb.Table the run logged.
-    image: y is a key under which the run logged wandb.Images (browsed with a step slider)."""
+    image: y is a key under which the run logged wandb.Images (browsed with a step slider).
+    `opts` (plots only) are the y-range, smoothing and log axes."""
 
     y: str
     x: str = STEP  # plots only
     system: bool = False  # plots only: the series come from the system-metrics stream
     kind: str = PLOT
     more: tuple[str, ...] = ()
+    opts: ChartOptions = ChartOptions()  # plots only
 
     @property
     def series(self) -> tuple[str, ...]:
@@ -128,7 +208,7 @@ def _spec_from_json(c: Any) -> ChartSpec | None:
     limit = {PLOT: MAX_SERIES, BAR: MAX_BAR_VALUES, TABLE: 1, IMAGE: 1}[kind]
     if 1 + len(more) > limit:
         return None
-    return ChartSpec(c["y"], c["x"], c["system"], kind, tuple(more))
+    return ChartSpec(c["y"], c["x"], c["system"], kind, tuple(more), ChartOptions.from_json(c.get("opts")))
 
 
 @dataclass
@@ -137,23 +217,26 @@ class Customization:
     added: dict[str, list[ChartSpec]] = field(default_factory=dict)  # charts added, per panel
     x: dict[str, dict[str, str]] = field(default_factory=dict)  # panel -> chart_key -> x-axis
     removed: dict[str, list[str]] = field(default_factory=dict)  # panel -> chart_keys of deleted generated charts
+    opts: dict[str, dict[str, ChartOptions]] = field(default_factory=dict)  # panel -> chart_key -> options
 
     @property
     def is_empty(self) -> bool:
-        return not (self.panels or self.added or self.x or self.removed)
+        return not (self.panels or self.added or self.x or self.removed or self.opts)
 
     def to_json(self) -> dict[str, Any]:
         return {
             "panels": list(self.panels),
             "added": {
                 p: [
-                    {"y": c.y, "x": c.x, "system": c.system, "kind": c.kind, "more": list(c.more)}
+                    {"y": c.y, "x": c.x, "system": c.system, "kind": c.kind, "more": list(c.more),
+                     **({} if c.opts.is_default else {"opts": c.opts.to_json()})}
                     for c in specs
                 ]
                 for p, specs in self.added.items()
             },
             "x": {p: dict(m) for p, m in self.x.items()},
             "removed": {p: list(keys) for p, keys in self.removed.items()},
+            "opts": {p: {k: o.to_json() for k, o in m.items()} for p, m in self.opts.items()},
         }
 
     @staticmethod
@@ -182,6 +265,14 @@ class Customization:
                     good_x = {k: v for k, v in overrides.items() if isinstance(k, str) and isinstance(v, str)}
                     if good_x:
                         out.x[panel] = good_x
+        stored = data.get("opts")  # absent in files saved before chart options existed
+        if isinstance(stored, dict):
+            for panel, overrides in stored.items():
+                if isinstance(panel, str) and isinstance(overrides, dict):
+                    good_opts = {k: ChartOptions.from_json(v) for k, v in overrides.items() if isinstance(k, str)}
+                    good_opts = {k: o for k, o in good_opts.items() if not o.is_default}
+                    if good_opts:
+                        out.opts[panel] = good_opts
         removed = data.get("removed")  # absent in files saved before deleting existed
         if isinstance(removed, dict):
             for panel, keys in removed.items():
@@ -198,7 +289,11 @@ def apply_customization(default: list[Panel], custom: Customization) -> list[Pan
         Panel(
             p.name,
             [
-                replace(c, x=custom.x.get(p.name, {}).get(chart_key(c), c.x))
+                replace(
+                    c,
+                    x=custom.x.get(p.name, {}).get(chart_key(c), c.x),
+                    opts=custom.opts.get(p.name, {}).get(chart_key(c), c.opts),
+                )
                 for c in p.charts
                 if chart_key(c) not in custom.removed.get(p.name, ())
             ],
@@ -263,22 +358,29 @@ class ChartLayout:
         return [c for c in generated if chart_key(c) not in removed]
 
     def set_chart(self, panel_index: int, chart_index: int, spec: ChartSpec) -> None:
-        """Change a chart (only its x-axis can change). Generated charts record an override,
-        added charts are edited in place."""
+        """Change a chart (its x-axis and options). Generated charts record overrides, added
+        charts are edited in place."""
         name = self.panels[panel_index].name
         generated = self._visible_generated(name)
         if chart_index < len(generated):
             original = generated[chart_index]
-            overrides = self.custom.x.setdefault(name, {})
-            if spec.x == original.x:  # back to the default: forget the override
-                overrides.pop(chart_key(original), None)
-                if not overrides:
-                    del self.custom.x[name]
-            else:
-                overrides[chart_key(original)] = spec.x
+            key = chart_key(original)
+            self._override(self.custom.x, name, key, spec.x, original.x)
+            self._override(self.custom.opts, name, key, spec.opts, original.opts)
         else:
             self.custom.added[name][chart_index - len(generated)] = spec
         self._rebuild()
+
+    @staticmethod
+    def _override(store: dict, panel: str, key: str, value, default) -> None:
+        """Record `value` as the override for a generated chart, or forget it if it is the default."""
+        overrides = store.setdefault(panel, {})
+        if value == default:
+            overrides.pop(key, None)
+        else:
+            overrides[key] = value
+        if not overrides:
+            del store[panel]
 
     def remove_chart(self, panel_index: int, chart_index: int) -> None:
         """Delete a chart from a panel. A generated chart is remembered as removed (it would
@@ -288,11 +390,12 @@ class ChartLayout:
         if chart_index < len(generated):
             key = chart_key(generated[chart_index])
             self.custom.removed.setdefault(name, []).append(key)
-            overrides = self.custom.x.get(name)
-            if overrides is not None:  # an x-axis choice for a deleted chart is moot
-                overrides.pop(key, None)
-                if not overrides:
-                    del self.custom.x[name]
+            for store in (self.custom.x, self.custom.opts):  # settings of a deleted chart are moot
+                overrides = store.get(name)
+                if overrides is not None:
+                    overrides.pop(key, None)
+                    if not overrides:
+                        del store[name]
         else:
             added = self.custom.added[name]
             del added[chart_index - len(generated)]

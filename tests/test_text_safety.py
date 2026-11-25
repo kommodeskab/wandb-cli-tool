@@ -82,3 +82,16 @@ def test_the_scanner_actually_catches_the_unsafe_patterns(tmp_path, monkeypatch)
     monkeypatch.setitem(globals(), "SCREENS", [bad])
     found = violations()
     assert [v.split(":")[1] for v in found] == ["3", "4", "5"]  # exactly the three unsafe lines
+
+
+def test_no_screen_calls_the_super_class_handler_of_a_message():
+    """Textual runs a message handler of EVERY class in the hierarchy, so `super().on_button_pressed(...)`
+    runs the base handler twice (a dialog then dismissed two screens). Use `event.prevent_default()`
+    to stop the base class from handling an event instead."""
+    bad = []
+    for path in SCREENS:
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr.startswith("on_"):
+                if isinstance(node.func.value, ast.Call) and call_name(node.func.value) == "super":
+                    bad.append(f"{path.name}:{node.lineno}")
+    assert bad == []

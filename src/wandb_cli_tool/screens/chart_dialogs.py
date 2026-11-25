@@ -7,11 +7,11 @@ from dataclasses import replace
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.widgets import Button, Input, Label, OptionList, Select, SelectionList, Static
+from textual.widgets import Button, Checkbox, Input, Label, OptionList, Select, SelectionList, Static
 from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
 
-from ..charts import BAR, IMAGE, MAX_BAR_VALUES, PLOT, TABLE, ChartSpec, x_options
+from ..charts import BAR, IMAGE, MAX_BAR_VALUES, PLOT, TABLE, ChartOptions, ChartSpec, parse_options, x_options
 from ..images import ImageInfo
 from ..palette import MAX_SERIES
 from ..plain import plain
@@ -340,3 +340,65 @@ class AxisDialog(CancellableDialog):
 
     def _submit(self) -> None:
         self.dismiss(replace(self.spec, x=str(self.query_one("#x", Select).value)))
+
+
+class ChartOptionsDialog(CancellableDialog):
+    """Y-range, smoothing and log axes of a plot. Empty = automatic / off."""
+
+    DEFAULT_CSS = """
+    ChartOptionsDialog > Vertical { width: 70; height: auto; border: round $accent; padding: 1 2; background: $surface; }
+    ChartOptionsDialog Input { margin-bottom: 1; }
+    #options-error { color: $error; }
+    """
+
+    def __init__(self, spec: ChartSpec) -> None:
+        super().__init__()
+        self.spec = spec
+
+    def compose(self) -> ComposeResult:
+        o = self.spec.opts
+
+        def text(v: float | None) -> str:
+            return "" if v is None else f"{v:g}"
+
+        with Vertical():
+            yield Label("Plot options: " + ", ".join(self.spec.series), markup=False)
+            yield Label("Y min (empty = automatic)")
+            yield Input(text(o.ymin), id="ymin")
+            yield Label("Y max (empty = automatic)")
+            yield Input(text(o.ymax), id="ymax")
+            yield Label("Smoothing, 0 to 0.99 (empty = off; 0.9 is heavy)")
+            yield Input(text(o.smooth or None), id="smooth")
+            yield Checkbox("Logarithmic y-axis", o.logy, id="logy")
+            yield Checkbox("Logarithmic x-axis", o.logx, id="logx")
+            yield Static("", id="options-error")
+            with Horizontal():
+                yield Button("Apply", variant="primary", id="ok")
+                yield Button("Back to defaults", id="reset")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#ymin", Input).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        # Textual also runs CancellableDialog's handler (OK / cancel); only Reset is ours, so it
+        # must keep that one from running (and from dismissing the screen twice).
+        if event.button.id == "reset":
+            event.prevent_default()
+            event.stop()
+            self.dismiss(replace(self.spec, opts=ChartOptions()))
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self._submit()
+
+    def _submit(self) -> None:
+        result = parse_options(
+            self.query_one("#ymin", Input).value, self.query_one("#ymax", Input).value,
+            self.query_one("#smooth", Input).value,
+            self.query_one("#logy", Checkbox).value, self.query_one("#logx", Checkbox).value,
+        )
+        if isinstance(result, str):
+            self.query_one("#options-error", Static).update(plain(result))
+        else:
+            self.dismiss(replace(self.spec, opts=result))

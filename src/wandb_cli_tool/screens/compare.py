@@ -21,17 +21,22 @@ from textual.widgets import DataTable, Header, OptionList, Static, TabbedContent
 from textual.widgets.option_list import Option
 
 from ..api import RunInfo, RunMetadata, RunRef
-from ..charts import BAR, RUNTIME, STEP, WALL_TIME, apply_customization, build_panels, display_names
+from ..charts import BAR, IMAGE, RUNTIME, STEP, TABLE, WALL_TIME, apply_customization, build_panels, display_names
 from ..compare import (
-    CompareChart, ConfigDiff, compare_charts, diff_config, is_single_value, overview_rows, run_labels,
+    CompareChart, ConfigDiff, compare_charts, diff_config, is_single_value, metric_rows, overview_rows, run_labels,
 )
+from ..images import ImageInfo, ImageSeries, ImageStep
+from ..tables import TableData, TableInfo
 from ..layout_store import project_key
 from ..palette import series_color
 from ..plain import plain
 from ..series import Point, extract_points, is_number, last_values
 from .chart_widgets import CHART_CLASS, is_dark
 from .charts import SERIES_WORKERS, _or_default
-from .compare_widgets import CompareBarView, CompareBase, ComparePlotView
+from .compare_widgets import (
+    CompareBarView, CompareBase, CompareImageView, ComparePlotView, CompareTableView,
+)
+from .imagefetch import fetch_thumbnail
 from .keybar import KeyBar
 
 if TYPE_CHECKING:
@@ -54,6 +59,8 @@ class RunData:
     metrics: list[str] = field(default_factory=list)
     values: dict[str, float] = field(default_factory=dict)
     system_rows: list[dict] = field(default_factory=list)
+    tables: list[TableInfo] = field(default_factory=list)
+    images: list[ImageInfo] = field(default_factory=list)
     error: str = ""
 
     def __post_init__(self) -> None:
@@ -90,16 +97,21 @@ def fetch_run(client, ref: RunRef, name: str) -> RunData:
     metrics = part(partial(client.metric_keys, ref), [])
     values = _or_default(partial(client.metric_values, ref), {})
     rows = _or_default(partial(client.system_rows, ref), [])
-    return RunData(info, meta, config, metrics, values, rows, "; ".join(errors))
+    tables = _or_default(partial(client.run_tables, ref), [])
+    images = _or_default(partial(client.run_images, ref), [])
+    return RunData(info, meta, config, metrics, values, rows, tables, images, "; ".join(errors))
 
 
 class CompareScreen(Screen):
     BINDINGS = [
         Binding("escape", "app.pop_screen", "Back"),
         Binding("1", "tab('overview')", "Overview"),
-        Binding("2", "tab('config')", "Config"),
-        Binding("3", "tab('charts')", "Charts"),
+        Binding("2", "tab('metrics')", "Metrics"),
+        Binding("3", "tab('config')", "Config"),
+        Binding("4", "tab('charts')", "Charts"),
         Binding("d", "toggle_identical", "Toggle identical rows"),
+        Binding("b", "flip_best", "Flip lower/higher is better"),
+        Binding("B", "flip_all_best", "Flip all", show=False),
         Binding("r", "reload", "Refresh"),
         Binding("tab", "cycle_focus(1)", "Next chart"),
         Binding("shift+tab", "cycle_focus(-1)", "Previous", show=False),
@@ -108,8 +120,9 @@ class CompareScreen(Screen):
     DEFAULT_CSS = """
     #legend { padding: 0 1; height: auto; }
     #status { color: $text-muted; padding: 0 1; }
-    CompareScreen TabPane { padding: 0; }
-    #overview, #config-table { height: 1fr; }
+    #tabs { height: 1fr; }
+    CompareScreen TabPane { height: 1fr; padding: 0; }
+    #overview, #metrics, #config-table { height: 1fr; }
     #panels { width: 30; border: round $primary; }
     #panels:focus { border: round $accent; }
     #charts { width: 1fr; }
@@ -123,8 +136,9 @@ class CompareScreen(Screen):
         self.labels = run_labels([n for _, n in runs], [r.id for r, _ in runs])
         self.data: list[RunData] = []
         self.ready = False
-        self.overview_only_diff = False
+        self.only_diff = {"overview": False, "metrics": False}  # hide the rows that are the same in every run
         self.config_show_all = False
+        self.higher: set[str] = set()  # metrics where a higher value is better (the default: lower is)
         self.panels: list[tuple[str, list[CompareChart]]] = []
         self.selected = 0
         self._shown_panel: int | None = None
@@ -140,6 +154,8 @@ class CompareScreen(Screen):
         with TabbedContent(initial="overview-pane", id="tabs"):
             with TabPane("Overview", id="overview-pane"):
                 yield DataTable(id="overview", cursor_type="row", zebra_stripes=True)
+            with TabPane("Metrics", id="metrics-pane"):
+                yield DataTable(id="metrics", cursor_type="row", zebra_stripes=True)
             with TabPane("Config", id="config-pane"):
                 yield DataTable(id="config-table", cursor_type="row", zebra_stripes=True)
             with TabPane("Charts", id="charts-pane"):
@@ -158,6 +174,7 @@ class CompareScreen(Screen):
             legend.append("■ ", style=color)
             legend.append(label)
         self.query_one("#legend", Static).update(legend)
+        self._load_higher()
         self.query_one("#overview", DataTable).focus()
         self.load()
 
@@ -171,7 +188,7 @@ class CompareScreen(Screen):
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         event.stop()
-        target = {"overview": "#overview", "config": "#config-table", "charts": "#panels"}.get(self.active_tab)
+        target = {"overview": "#overview", "metrics": "#metrics", "config": "#config-table", "charts": "#panels"}.get(self.active_tab)
         if target:
             self.query_one(target).focus()
         self.refresh_bindings()
@@ -180,7 +197,9 @@ class CompareScreen(Screen):
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action == "toggle_identical":
-            return self.active_tab in ("overview", "config")
+            return self.active_tab in ("overview", "metrics", "config")
+        if action in ("flip_best", "flip_all_best"):
+            return self.active_tab == "metrics"
         if action in ("cycle_focus", "focus_chart", "focus_panels"):
             return self.active_tab == "charts"
         return True
@@ -225,6 +244,7 @@ class CompareScreen(Screen):
         self.data = data
         self.ready = True
         self._render_overview()
+        self._render_metrics()
         self._render_config()
         self._build_panels()
         self._refresh_panel_list()
@@ -238,10 +258,12 @@ class CompareScreen(Screen):
         tab = self.active_tab
         if tab == "config":
             self._status(self._config_summary)
+        elif tab == "metrics":
+            self._status(self._metrics_summary)
         elif tab == "charts":
             self._status(
                 f"{len(self.panels)} panels from this project's chart layout, one color per run  ·  "
-                "tables and images are not compared"
+                "v groups table rows"
             )
         else:
             self._status(f"{len(self.runs)} runs  ·  ≠ marks facts that differ")
@@ -258,10 +280,86 @@ class CompareScreen(Screen):
         self._fill(table, "")
         rows = overview_rows([d.info for d in self.data], [d.meta for d in self.data])
         for row in rows:
-            if self.overview_only_diff and not row.differs:
+            if self.only_diff["overview"] and not row.differs:
                 continue
             label = Text(("≠ " if row.differs else "  ") + row.label, style="bold" if row.differs else "dim")
             table.add_row(label, *(plain(_clip(v)) for v in row.values))
+
+    # ---- metrics -----------------------------------------------------------------------
+    _metrics_summary = ""
+    PREF_HIGHER = "compare_higher_is_better"  # per project: the metrics where higher is better
+
+    @property
+    def _higher_key(self) -> str:
+        return project_key(self.entity, self.project)
+
+    def _load_higher(self) -> None:
+        stored = self.app.preferences.get(self.PREF_HIGHER)
+        names = stored.get(self._higher_key) if isinstance(stored, dict) else None
+        self.higher = {n for n in names if isinstance(n, str)} if isinstance(names, list) else set()
+
+    def _save_higher(self) -> None:
+        stored = self.app.preferences.get(self.PREF_HIGHER)
+        stored = dict(stored) if isinstance(stored, dict) else {}
+        if self.higher:
+            stored[self._higher_key] = sorted(self.higher)
+        else:
+            stored.pop(self._higher_key, None)
+        self.app.preferences.set(self.PREF_HIGHER, stored)
+
+    def _render_metrics(self) -> None:
+        """The latest value of every metric, per run, with the best run of each marked."""
+        table = self.query_one("#metrics", DataTable)
+        cursor = table.cursor_row if table.row_count else 0
+        self._fill(table, "Metric")
+        table.add_column("Better", key="better")
+        table.add_column("Best", key="best")
+        colors = self._colors()
+        rows = metric_rows([d.values for d in self.data], self.higher)
+        shown = 0
+        for row in rows:
+            if self.only_diff["metrics"] and not row.differs:
+                continue
+            shown += 1
+            cells = [
+                Text("—", style="dim") if v is None
+                else Text(f"{v:.6g}", style="bold green" if i == row.best else "")
+                for i, v in enumerate(row.values)
+            ]
+            best = Text.assemble((" ■ ", colors[row.best]), self.labels[row.best]) if row.best is not None else Text("")
+            table.add_row(
+                Text(row.name, style="bold" if row.differs else "dim"), *cells,
+                Text("↑ higher" if row.higher else "↓ lower", style="dim"), best, key=row.name,
+            )
+        if shown:
+            table.move_cursor(row=min(cursor, shown - 1), animate=False)
+        self._metrics_summary = (
+            f"{shown} of {len(rows)} metrics  ·  latest values; best (green) = lowest unless you flip a metric: "
+            "b flips the one under the cursor, B flips all"
+            if rows else "None of the runs has numeric summary metrics."
+        )
+
+    def _metric_under_cursor(self) -> str | None:
+        table = self.query_one("#metrics", DataTable)
+        if not table.row_count:
+            return None
+        return str(table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value)
+
+    def action_flip_best(self) -> None:
+        """Lower <-> higher is better, for the metric under the cursor (remembered for the project)."""
+        name = self._metric_under_cursor()
+        if name is not None:
+            self.higher ^= {name}
+            self._save_higher()
+            self._render_metrics()
+            self._update_status()
+
+    def action_flip_all_best(self) -> None:
+        names = {r.name for r in metric_rows([d.values for d in self.data])}
+        self.higher = names - self.higher
+        self._save_higher()
+        self._render_metrics()
+        self._update_status()
 
     # ---- config ----------------------------------------------------------------------
     _config_summary = ""
@@ -291,8 +389,11 @@ class CompareScreen(Screen):
         if not self.ready:
             return
         if self.active_tab == "overview":
-            self.overview_only_diff = not self.overview_only_diff
+            self.only_diff["overview"] = not self.only_diff["overview"]
             self._render_overview()
+        elif self.active_tab == "metrics":
+            self.only_diff["metrics"] = not self.only_diff["metrics"]
+            self._render_metrics()
         elif self.active_tab == "config":
             self.config_show_all = not self.config_show_all
             self._render_config()
@@ -324,10 +425,7 @@ class CompareScreen(Screen):
             if not self.panels:
                 await container.mount(Static("None of the runs logged any metrics.", markup=False))
                 return
-            views = [
-                (CompareBarView if c.kind == BAR else ComparePlotView)(c, i, self.labels)
-                for i, c in enumerate(self.panels[self.selected][1])
-            ]
+            views = [self._make_view(c, i) for i, c in enumerate(self.panels[self.selected][1])]
             await container.mount_all(views)
             for view in views:
                 self._load_chart(view)
@@ -343,8 +441,18 @@ class CompareScreen(Screen):
         event.stop()
         self.action_focus_chart(0)
 
+    def _make_view(self, chart: CompareChart, index: int) -> CompareBase:
+        kinds = {BAR: CompareBarView, TABLE: CompareTableView, IMAGE: CompareImageView}
+        return kinds.get(chart.kind, ComparePlotView)(chart, index, self.labels)
+
     def _load_chart(self, view: CompareBase) -> None:
         chart = view.chart
+        if chart.kind == TABLE:
+            self._load_tables(view)
+            return
+        if chart.kind == IMAGE:
+            self._load_images(view)
+            return
         if chart.kind == BAR:
             names = display_names(chart.metrics, chart.system)
             groups = [
@@ -389,6 +497,77 @@ class CompareScreen(Screen):
             view.show_unavailable(f"No data for “{view.chart.metric}” in the compared runs.")
         else:
             view.show(series, single=is_single_value(series.values()))
+
+    # ---- tables and images ----------------------------------------------------------------
+    def _load_tables(self, view: CompareTableView) -> None:
+        key = view.chart.metric
+        infos = [next((t for t in d.tables if t.key == key), None) for d in self.data]
+        if not any(infos):
+            view.show_unavailable(f"No compared run logged a table called “{key}”.")
+        else:
+            self._fetch_tables(view, infos)
+
+    @work(thread=True)
+    def _fetch_tables(self, view: CompareTableView, infos: list[TableInfo | None]) -> None:
+        def one(i: int) -> TableData | None:
+            return self.app.client.table_data(self.runs[i][0], infos[i].path) if infos[i] else None
+
+        try:
+            with ThreadPoolExecutor(max_workers=min(len(infos), SERIES_WORKERS)) as pool:
+                tables = list(pool.map(one, range(len(infos))))
+        except Exception as exc:
+            self.app.call_from_thread(view.fail, str(exc))
+            return
+        self.app.call_from_thread(self._tables_ready, view, tables)
+
+    def _tables_ready(self, view: CompareTableView, tables: list[TableData | None]) -> None:
+        if view.is_attached:
+            view.show_tables(tables)
+
+    def _load_images(self, view: CompareImageView) -> None:
+        key = view.chart.metric
+        have = [i for i, d in enumerate(self.data) if any(img.key == key for img in d.images)]
+        if not have:
+            view.show_unavailable(f"No compared run logged images called “{key}”.")
+        else:
+            self._fetch_steps(view, key, have)
+
+    @work(thread=True)
+    def _fetch_steps(self, view: CompareImageView, key: str, have: list[int]) -> None:
+        def one(i: int) -> ImageSeries:
+            return self.app.client.image_steps(self.runs[i][0], key)
+
+        try:
+            with ThreadPoolExecutor(max_workers=min(len(have), SERIES_WORKERS)) as pool:
+                found = dict(zip(have, pool.map(one, have)))
+        except Exception as exc:
+            self.app.call_from_thread(view.show_unavailable, f"Could not read the images: {exc}")
+            return
+        series = [found.get(i) for i in range(len(self.runs))]
+        self.app.call_from_thread(self._steps_ready, view, series)
+
+    def _steps_ready(self, view: CompareImageView, series: list[ImageSeries | None]) -> None:
+        if view.is_attached:
+            view.set_series(series)
+
+    def on_compare_image_view_wanted(self, event: CompareImageView.Wanted) -> None:
+        view = event.view
+        if not view.is_attached:
+            return
+        token = view.token()
+        for run in range(len(self.runs)):
+            step = view.step_for(run)
+            if step is not None:
+                self._fetch_image(view, run, step, min(view.sub, len(step.paths) - 1), token)
+
+    @work(thread=True, group="images")
+    def _fetch_image(self, view: CompareImageView, run: int, step: ImageStep, sub: int, token: tuple[int, int]) -> None:
+        try:
+            shown = fetch_thumbnail(self.app, self.runs[run][0], step, sub)
+        except Exception as exc:
+            self.app.call_from_thread(view.fail, run, str(exc), token)
+            return
+        self.app.call_from_thread(view.show_image, run, shown, token)
 
     # ---- focus -----------------------------------------------------------------------
     def action_focus_chart(self, delta: int) -> None:

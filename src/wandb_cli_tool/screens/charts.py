@@ -19,20 +19,18 @@ from ..api import RunRef
 from ..charts import (
     BAR, IMAGE, PLOT, RUNTIME, STEP, TABLE, WALL_TIME, ChartLayout, ChartSpec, Panel, axis_label, build_panels,
 )
-from ..images import ImageInfo, ImageSeries, ImageStep, make_thumbnail
-from ..media import MAX_IMAGE_BYTES
-from ..api import FileInfo
+from ..images import ImageInfo, ImageSeries, ImageStep
 from ..layout_store import project_key
 from .keybar import KeyBar
 from ..plain import plain
 from ..refresh import PREF_KEY, interval_from_pref, label as interval_label, next_choice, to_pref
 from ..series import Point, extract_points, is_number, last_values
 from ..tables import TableData, TableInfo
-from .chart_dialogs import AxisDialog, BarDialog, ChartKindDialog, ImageDialog, PlotDialog, TableDialog
+from .chart_dialogs import AxisDialog, BarDialog, ChartOptionsDialog, ChartKindDialog, ImageDialog, PlotDialog, TableDialog
 from .chart_widgets import (  # noqa: F401
     CHART_CLASS, BarView, ChartBase, ChartView, ImageChartView, TableView, make_chart_widget,
 )
-from .files import DOWNLOAD_CACHE_BYTES, DOWNLOAD_NAMESPACE, download_dir
+from .imagefetch import fetch_thumbnail
 from .dialogs import ConfirmDialog, NewPanelDialog
 
 if TYPE_CHECKING:
@@ -71,6 +69,7 @@ class ChartsScreen(Screen):
         Binding("n", "new_panel", "New panel"),
         Binding("a", "add_chart", "Add chart"),
         Binding("x", "change_x", "X-axis"),
+        Binding("o", "chart_options", "Plot options"),
         Binding("delete", "delete_chart", "Delete chart"),
         Binding("backspace", "delete_chart", "Delete chart", show=False),  # laptops without a Delete key
         Binding("d", "reset_layout", "Default layout"),
@@ -310,6 +309,8 @@ class ChartsScreen(Screen):
         """Only list the keys that do something right now (the key bar shows what is left)."""
         if action in ("change_x", "delete_chart"):
             return isinstance(self.focused, ChartBase)
+        if action == "chart_options":
+            return isinstance(self.focused, ChartBase) and self.focused.spec.kind == PLOT
         if action == "cycle_focus":
             return bool(self.ready and self.panels and self.panels[self.selected].charts)
         if action == "reset_layout":
@@ -480,17 +481,8 @@ class ChartsScreen(Screen):
 
     @work(thread=True, group="images")
     def _fetch_image(self, view: ImageChartView, step: ImageStep, sub: int, token: tuple[int, int]) -> None:
-        path = step.paths[sub]
-        size = step.size(sub)
         try:
-            if size is not None and size > MAX_IMAGE_BYTES:
-                raise ValueError(f"The image is too large to display ({size // 1024 // 1024} MB).")
-            folder = download_dir(self.app.cache.root, self.ref, FileInfo(path, size, step.identity(sub)))
-            target = folder / path
-            if not (target.is_file() and (size is None or target.stat().st_size == size)):
-                self.app.cache.prune_dir_sometimes(DOWNLOAD_NAMESPACE, DOWNLOAD_CACHE_BYTES)
-                self.app.client.download_file(self.ref, path, folder)
-            shown = make_thumbnail(target)  # a screen-sized copy: huge images are slow to decode
+            shown = fetch_thumbnail(self.app, self.ref, step, sub)
         except Exception as exc:
             self.app.call_from_thread(view.fail, str(exc), token)
             return
@@ -602,6 +594,14 @@ class ChartsScreen(Screen):
             AxisDialog(self.metrics, view.spec),
             lambda spec: self._on_change_x(view.index, spec),
         )
+
+    def action_chart_options(self) -> None:
+        view = self.focused
+        if isinstance(view, ChartBase) and view.spec.kind == PLOT:
+            self.app.push_screen(
+                ChartOptionsDialog(view.spec),
+                lambda spec: self._on_change_x(view.index, spec),  # same edit: a changed spec for this chart
+            )
 
     async def _on_change_x(self, index: int, spec: ChartSpec | None) -> None:
         if not spec:

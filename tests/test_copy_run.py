@@ -243,3 +243,4 @@ def test_progress_events_report_stages_and_the_row_total():
     assert history[0]["done"] == 0 and history[0]["total"] == 450
     assert [e["done"] for e in history if e["done"]][:2] == [200, 400] and history[-1]["done"] == 450
     assert {e.get("stage") for e in events if e["event"] == "progress"} >= {"history", "files", "artifacts", "finish"}
+

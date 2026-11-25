@@ -22,7 +22,7 @@ from ..charts import ChartSpec, axis_label, display_names
 from ..images import ImageSeries, StepCursor, index_at, slider_geometry
 from ..palette import hex_to_rgb, series_color
 from ..plain import plain, plain_title
-from ..series import Point
+from ..series import Point, prepare_points
 from ..tables import TableData
 
 PLOT_HEIGHT = 20
@@ -49,6 +49,28 @@ def is_dark(widget: Widget) -> bool:
         return bool(widget.app.current_theme.dark)
     except Exception:
         return True
+
+
+def apply_axis_options(plt, opts, ys: list[float]) -> None:
+    """Log axes and a fixed y-range on a plotext figure. `ys` are the values drawn, used to fill in
+    the end of the range the user left automatic."""
+    if opts.logx:
+        plt.xscale("log")
+    if opts.logy:
+        plt.yscale("log")
+    if (opts.ymin is not None or opts.ymax is not None) and ys:
+        lo = opts.ymin if opts.ymin is not None else min(ys)
+        hi = opts.ymax if opts.ymax is not None else max(ys)
+        if lo < hi:
+            plt.ylim(lo, hi)
+
+
+def plot_note(opts, dropped: int) -> str:
+    """What was changed in how the data is drawn, for a chart's subtitle."""
+    parts = [opts.describe()] if not opts.is_default else []
+    if dropped:
+        parts.append(f"{dropped} point{'s' * (dropped != 1)} not shown on a log axis")
+    return "  ·  " + "  ·  ".join(parts) if parts else ""
 
 
 class ChartBase:
@@ -110,9 +132,16 @@ class ChartView(ChartBase, PlotextPlot):
         """`series` maps each series name of the spec to its points. `absent` names are series
         this run never logged (they keep their color slot but are not drawn)."""
         plt, spec = self.plt, self.spec
+        opts = spec.opts
         names = list(spec.series)
         self.note = None
         plt.clear_figure()
+        dropped = 0
+        prepared: dict[str, list[Point]] = {}
+        for name, points in series.items():  # smoothing and log axes change what is drawn
+            prepared[name], gone = prepare_points(points, opts)
+            dropped += gone
+        series = prepared
         first = series.get(names[0], []) if names else []
         self.single = first[0] if len(names) == 1 and len(first) == 1 else None
         self.styles.height = SINGLE_HEIGHT if self.single else PLOT_HEIGHT
@@ -136,12 +165,13 @@ class ChartView(ChartBase, PlotextPlot):
                     options["label"] = label
                 plt.plot([p[0] for p in points], [p[1] for p in points], **options)
             plt.xlabel(axis_label(spec.x))
+            apply_axis_options(plt, opts, [p[1] for n in drawn for p in series[n]])
             no_data = [lab for n, lab in zip(names, labels) if n not in absent and not series.get(n)]
             not_here = [lab for n, lab in zip(names, labels) if n in absent]
             note = (f"  ·  no data: {', '.join(no_data)}" if no_data else "") + (
                 f"  ·  not logged in this run: {', '.join(not_here)}" if not_here else ""
             )
-            self.border_subtitle = plain_title(f"x: {axis_label(spec.x)}{note}")
+            self.border_subtitle = plain_title(f"x: {axis_label(spec.x)}{plot_note(opts, dropped)}{note}")
         self.refresh()
 
     def fail(self, message: str) -> None:

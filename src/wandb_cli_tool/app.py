@@ -58,6 +58,12 @@ class WandbCliApp(App):
         """Notifications often carry names and server errors: never parse them as markup."""
         return super().notify(message, title=title, severity=severity, timeout=timeout, markup=False)
 
+    def copy_link(self, url: str) -> None:
+        """Put a URL on the clipboard (through the terminal, so it also works over SSH) and show it,
+        in case the terminal does not support that."""
+        self.copy_to_clipboard(url)
+        self.notify(f"Link copied: {url}")
+
     def _default_client(self, api_key: str) -> WandbClient:
         return CachedClient(WandbApiClient(api_key), self.cache)
 

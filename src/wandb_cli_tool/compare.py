@@ -10,13 +10,16 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Iterable, Sequence
+from typing import Any, Collection, Iterable, Sequence
 
 from .api import RunInfo, RunMetadata
-from .charts import BAR, PLOT, Panel, display_names
+from .charts import BAR, IMAGE, PLOT, TABLE, ChartOptions, Panel, display_names
+from .images import ImageSeries, ImageStep
 from .palette import MAX_SERIES
 from .runfacts import summary_fields
+from .runsort import natural_key
 from .series import Point
+from .tables import TableData
 
 MAX_RUNS = MAX_SERIES  # one palette color per run, never cycled
 MAX_LIST_ITEMS = 20  # a longer list in a config is shown as one value instead of one row per item
@@ -137,12 +140,13 @@ class CompareChart:
     A multi-metric plot of the project's layout becomes one plot per metric (small multiples)
     rather than runs x metrics lines in one chart."""
 
-    kind: str  # PLOT or BAR
-    metrics: tuple[str, ...]
+    kind: str  # PLOT, BAR, TABLE or IMAGE
+    metrics: tuple[str, ...]  # (the key of the table / images for those kinds)
     x: str = "_step"
     system: bool = False
     title: str = ""
     subtitle: str = ""  # the layout chart a split-up plot came from
+    opts: ChartOptions = ChartOptions()  # y-range, smoothing, log axes: the same as in the run screens
 
     @property
     def metric(self) -> str:
@@ -150,18 +154,20 @@ class CompareChart:
 
 
 def compare_charts(panel: Panel) -> list[CompareChart]:
-    """The comparable charts of a layout panel. Tables and images are not compared."""
+    """The comparable charts of a layout panel (every kind: tables and images are compared too)."""
     out: list[CompareChart] = []
     for spec in panel.charts:
         if spec.kind == PLOT:
             labels = display_names(spec.series, spec.system)
             multi = len(spec.series) > 1
             out += [
-                CompareChart(PLOT, (m,), spec.x, spec.system, label, spec.title if multi else "")
+                CompareChart(PLOT, (m,), spec.x, spec.system, label, spec.title if multi else "", spec.opts)
                 for m, label in zip(spec.series, labels)
             ]
         elif spec.kind == BAR:
             out.append(CompareChart(BAR, spec.series, title=spec.title))
+        elif spec.kind in (TABLE, IMAGE):
+            out.append(CompareChart(spec.kind, (spec.y,), title=spec.title))
     return out
 
 
@@ -173,3 +179,75 @@ def is_single_value(per_run: Iterable[list[Point]]) -> bool:
 
 def latest(points: list[Point]) -> float | None:
     return points[-1][1] if points and math.isfinite(points[-1][1]) else None
+
+
+# ---- metrics: the latest value of each metric, per run -----------------------------------------
+@dataclass(frozen=True)
+class MetricRow:
+    name: str
+    values: tuple[float | None, ...]  # per run
+    higher: bool  # a higher value is better (otherwise a lower one is)
+    best: int | None  # which run has the best value (None: fewer than two runs have one, or all equal)
+    differs: bool
+
+
+def metric_rows(values: Sequence[dict[str, float]], higher: Collection[str] = ()) -> list[MetricRow]:
+    """One row per metric any run has (sorted by name) with the run that is best at it. Lower is
+    better unless the metric's name is in `higher`: what "better" means is for the user to say."""
+    rows = []
+    for name in sorted({k for v in values for k in v}):
+        per_run = tuple(v.get(name) for v in values)
+        have = [(x, i) for i, x in enumerate(per_run) if x is not None]
+        differs = len({x for x, _ in have}) > 1 or len(have) < len(per_run)
+        best = None
+        if len(have) > 1 and len({x for x, _ in have}) > 1:
+            pick = max if name in higher else min
+            best = pick(have, key=lambda t: t[0])[1]
+        rows.append(MetricRow(name, per_run, name in higher, best, differs))
+    return rows
+
+
+# ---- tables: every run's table in one ---------------------------------------------------------
+MAX_COMPARE_ROWS = 300  # rows shown per run
+
+
+@dataclass(frozen=True)
+class StackedTable:
+    columns: tuple[str, ...]  # the union of the runs' columns (first table's order first)
+    rows: tuple[tuple[int, tuple[str, ...]], ...]  # (run position, cells in `columns`)
+    missing: tuple[int, ...]  # runs that have no such table
+    truncated: bool  # some run has more rows than are shown
+
+
+def merge_tables(tables: Sequence[TableData | None], by_key: bool = False, per_run: int = MAX_COMPARE_ROWS) -> StackedTable:
+    """The runs' tables as one: columns are united (a run without a column shows blanks) and each
+    row says which run it came from. By default the rows of each run stay together; `by_key` puts
+    rows with the same first-column value next to each other instead, so they can be compared."""
+    columns: list[str] = []
+    for table in tables:
+        for column in (table.columns if table else ()):
+            if column not in columns:
+                columns.append(column)
+    rows: list[tuple[int, tuple[str, ...]]] = []
+    truncated = False
+    for i, table in enumerate(tables):
+        if table is None:
+            continue
+        where = {c: j for j, c in enumerate(table.columns)}
+        truncated = truncated or len(table.rows) > per_run or table.total_rows > len(table.rows)
+        for row in table.rows[:per_run]:
+            rows.append((i, tuple(row[where[c]] if c in where and where[c] < len(row) else "" for c in columns)))
+    if by_key and columns:
+        rows.sort(key=lambda r: (natural_key(r[1][0]), r[0]))
+    return StackedTable(tuple(columns), tuple(rows), tuple(i for i, t in enumerate(tables) if t is None), truncated)
+
+
+# ---- images: the same step in every run -------------------------------------------------------
+def union_steps(series: Sequence[ImageSeries | None]) -> list[int]:
+    """Every step at which any run logged an image, ascending: the positions of a shared slider."""
+    return sorted({step.step for s in series if s for step in s.steps})
+
+
+def nearest_step(steps: Sequence[ImageStep], target: int) -> ImageStep | None:
+    """The run's step closest to `target` (the earlier one on a tie), None if it has no images."""
+    return min(steps, key=lambda s: (abs(s.step - target), s.step), default=None)

@@ -19,7 +19,9 @@ from ..runfacts import summary_fields
 from .charts import ChartsScreen
 from .config import ConfigScreen
 from .copy import CopyOutcome, CopyProgressScreen, describe_copy
-from .dialogs import ConfirmDialog, GroupDialog, RenameDialog, TagsDialog
+from .dialogs import (
+    ConfirmDialog, DeleteChoice, DeleteRunsDialog, GroupDialog, RenameDialog, TagsDialog,
+)
 from .files import FilesScreen
 from .logs import LogsScreen
 
@@ -35,6 +37,9 @@ class RunScreen(Screen):
         Binding("t", "add_tags", "Add tags"),
         Binding("r", "rename", "Rename"),
         Binding("c", "copy_run", "Copy run"),
+        Binding("s", "stop_run", "Stop run"),
+        Binding("delete", "delete_run", "Delete run"),
+        Binding("y", "copy_link", "Copy link"),
     ]
     DEFAULT_CSS = """
     #tags { padding: 1 1 0 1; }
@@ -104,6 +109,7 @@ class RunScreen(Screen):
     def _set_info(self, info: RunInfo) -> None:
         self.info = info
         self._render_info()
+        self.refresh_bindings()  # "Stop run" only applies while the run is running
 
     def _set_meta(self, meta: RunMetadata) -> None:
         self.meta = meta
@@ -143,6 +149,11 @@ class RunScreen(Screen):
             wide_grid.add_row(Text(label, style="dim"), Text(value))
         self.query_one("#info-wide", Static).update(wide_grid)
 
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "stop_run":
+            return self.info is not None and self.info.state == "running"
+        return True
+
     # ---- navigation ----------------------------------------------------
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         event.stop()
@@ -152,6 +163,10 @@ class RunScreen(Screen):
             "config": ConfigScreen,
             "files": FilesScreen,
         }
+        if event.option.id == "logs":  # a running run's log is followed
+            live = self.info is not None and self.info.state == "running"
+            self.app.push_screen(LogsScreen(self.ref, self.run_name, live))
+            return
         self.app.push_screen(screens[str(event.option.id)](self.ref, self.run_name))
 
     def _mark_project_edited(self) -> None:
@@ -245,6 +260,82 @@ class RunScreen(Screen):
     def _on_copy_finished(self, outcome: CopyOutcome | None) -> None:
         if outcome is not None and outcome.run_id:  # a partial run also shows up in the list
             self._mark_project_edited()
+
+    @work(thread=True, group="link", exclusive=True)
+    def action_copy_link(self) -> None:
+        try:
+            url = self.app.client.run_url(self.ref)
+        except Exception as exc:
+            self.app.call_from_thread(self.notify, f"Could not get the link: {exc}", severity="error")
+            return
+        self.app.call_from_thread(self.app.copy_link, url)
+
+    # ---- stop and delete -------------------------------------------------------------
+    def action_stop_run(self) -> None:
+        if self.info is None or self.info.state != "running":
+            return
+        self.app.push_screen(
+            ConfirmDialog(
+                "Stop this run?",
+                f"“{self.info.name}”\n\n"
+                "This asks the run to stop, like the Stop button in W&B: its own process shuts\n"
+                "down gracefully on its next heartbeat (a few seconds to a minute). Nothing is\n"
+                "deleted. A run that is not listening (e.g. its machine is gone) will not react.",
+                yes="Yes, stop it", no="No",
+            ),
+            self._on_stop_confirmed,
+        )
+
+    def _on_stop_confirmed(self, yes: bool | None) -> None:
+        if yes:
+            self.write_stop()
+
+    @work(thread=True, group="write")
+    def write_stop(self) -> None:
+        try:
+            self.app.client.stop_run(self.ref)
+        except Exception as exc:
+            self.app.call_from_thread(self.notify, f"Could not stop the run: {exc}", severity="error")
+            return
+        self.app.call_from_thread(self._stop_requested)
+
+    def _stop_requested(self) -> None:
+        self._mark_project_edited()
+        self.notify("Stop requested. The run shuts down on its next heartbeat (r in the list refreshes it).")
+
+    def action_delete_run(self) -> None:
+        if self.info is None:
+            self.notify("Run details are still loading.", severity="warning")
+            return
+        live = "\n⚠ This run is still running; deleting it does not stop its process.\n" if self.info.state == "running" else ""
+        self.app.push_screen(
+            DeleteRunsDialog(
+                "Delete this run for good?",
+                f"“{self.info.name}” ({self.info.id})\n\n"
+                "Its metrics, logs, config and files are deleted from W&B and cannot be\n"
+                "brought back. Artifacts it logged are kept unless you tick the box below."
+                + live,
+            ),
+            self._on_delete_confirmed,
+        )
+
+    def _on_delete_confirmed(self, choice: DeleteChoice | None) -> None:
+        if choice is not None:
+            self.write_delete(choice.artifacts)
+
+    @work(thread=True, group="write")
+    def write_delete(self, artifacts: bool) -> None:
+        try:
+            self.app.client.delete_run(self.ref, artifacts)
+        except Exception as exc:
+            self.app.call_from_thread(self.notify, f"Could not delete the run: {exc}", severity="error")
+            return
+        self.app.call_from_thread(self._deleted, artifacts)
+
+    def _deleted(self, artifacts: bool) -> None:
+        self._mark_project_edited()
+        self.notify(f"Run “{self.run_name}” deleted" + (" together with its artifacts." if artifacts else "."))
+        self.app.pop_screen()  # nothing left to show: back to the list
 
     def action_add_tags(self) -> None:
         if self.info is None:

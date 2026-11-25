@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from ..plain import plain
 from rich.text import Text
 from textual.widgets.option_list import Option
-from textual.widgets import Button, Input, Label, OptionList, Select, SelectionList, Static
+from textual.widgets import Button, Checkbox, Input, Label, OptionList, Select, SelectionList, Static
 
 
 
@@ -227,6 +229,127 @@ class RenameDialog(CancellableDialog):
         event.stop()
         self._submit()
 
+
+
+class TypeToConfirmDialog(CancellableDialog):
+    """For what cannot be undone: the confirm button only works once `phrase` has been typed, so a
+    stray Enter or a habit of pressing "y" can never delete anything. Dismisses with True."""
+
+    DEFAULT_CSS = """
+    TypeToConfirmDialog > Vertical { width: 76; height: auto; max-height: 90%; border: round $error; padding: 1 2; background: $surface; }
+    TypeToConfirmDialog Input { margin-top: 1; }
+    """
+
+    def __init__(self, title: str, body: str, phrase: str = "delete", ok: str = "Delete") -> None:
+        super().__init__()
+        self.title_text, self.body_text, self.phrase, self.ok_label = title, body, phrase, ok
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(self.title_text, markup=False)
+            yield Static(plain(self.body_text), id="confirm-body")
+            yield from self.compose_extra()
+            yield Label(f"Type “{self.phrase}” to confirm:", markup=False, id="phrase-label")
+            yield Input(id="phrase")
+            with Horizontal():
+                yield Button(self.ok_label, variant="error", id="ok", disabled=True)
+                yield Button("Cancel", id="cancel")
+
+    def compose_extra(self) -> ComposeResult:
+        """Hook: more widgets between the text and the typing field."""
+        yield from ()
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def _typed(self) -> bool:
+        return self.query_one("#phrase", Input).value.strip().lower() == self.phrase.lower()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        self.query_one("#ok", Button).disabled = not self._typed()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self._submit()
+
+    def _submit(self) -> None:
+        if self._typed():
+            self.dismiss(True)
+
+
+@dataclass(frozen=True)
+class DeleteChoice:
+    """What the user agreed to when deleting runs."""
+
+    artifacts: bool  # also delete the artifacts the runs logged
+
+
+class DeleteRunsDialog(TypeToConfirmDialog):
+    """Delete runs for good. The runs' artifacts are kept unless the box is ticked, which is a
+    second, separate agreement: the word to type then becomes "delete artifacts". Dismisses with a
+    `DeleteChoice`."""
+
+    ARTIFACTS_PHRASE = "delete artifacts"
+
+    def __init__(self, title: str, body: str, ok: str = "Delete") -> None:
+        super().__init__(title, body, phrase="delete", ok=ok)
+
+    def compose_extra(self) -> ComposeResult:
+        yield Checkbox("Also delete the artifacts these runs logged (models, datasets, …)", id="artifacts")
+        yield Static("", id="artifact-warning")
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        event.stop()
+        with_artifacts = event.value
+        self.phrase = self.ARTIFACTS_PHRASE if with_artifacts else "delete"
+        self.query_one("#phrase-label", Label).update(f"Type “{self.phrase}” to confirm:")
+        warning = Text("")
+        if with_artifacts:
+            warning = Text(
+                "⚠ The artifacts are removed from W&B too, for good, even if other runs or\n"
+                "  collections use them.",
+                style="bold red",
+            )
+        self.query_one("#artifact-warning", Static).update(warning)
+        self.query_one("#ok", Button).disabled = not self._typed()
+
+    def _submit(self) -> None:
+        if self._typed():
+            self.dismiss(DeleteChoice(self.query_one("#artifacts", Checkbox).value))
+
+
+class RunActionsDialog(CancellableDialog):
+    """What to do with the selected runs. Dismisses with "stop", "group", "tags" or "delete"."""
+
+    DEFAULT_CSS = """
+    RunActionsDialog > Vertical { width: 60; height: auto; border: round $accent; padding: 1 2; background: $surface; }
+    RunActionsDialog OptionList { height: auto; margin-top: 1; }
+    """
+
+    def __init__(self, count: int, running: int) -> None:
+        super().__init__()
+        self.count, self.running = count, running
+
+    def compose(self) -> ComposeResult:
+        runs = f"{self.count} run{'s' * (self.count != 1)}"
+        with Vertical():
+            yield Label(f"Actions on {runs}", markup=False)
+            yield OptionList(
+                Option(f"Stop the running ones ({self.running})", id="stop", disabled=self.running == 0),
+                Option("Set group…", id="group"),
+                Option("Add tags…", id="tags"),
+                Option("Delete…", id="delete"),
+                id="actions",
+            )
+
+    def on_mount(self) -> None:
+        options = self.query_one("#actions", OptionList)
+        options.focus()
+        options.highlighted = 0 if self.running else 1
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self.dismiss(str(event.option.id))
 
 
 class ConfirmDialog(ModalScreen[bool]):

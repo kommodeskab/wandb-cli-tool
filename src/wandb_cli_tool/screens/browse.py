@@ -99,8 +99,13 @@ class BrowseScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("Loading…", id="status")
+        yield from self.compose_before_table()
         yield DataTable(id="items", cursor_type="row", zebra_stripes=True)
         yield KeyBar()
+
+    def compose_before_table(self) -> ComposeResult:
+        """Hook: extra widgets between the status line and the table."""
+        yield from ()
 
     def on_mount(self) -> None:
         self.title = self.title_text

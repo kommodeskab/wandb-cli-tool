@@ -155,6 +155,20 @@ class WandbClient(Protocol):
         """Prepare a copy of the run into a NEW run of the same project (not started yet)."""
         ...
 
+    def run_url(self, ref: RunRef) -> str:
+        """The run's page in the W&B app (the host depends on the account: it is not always wandb.ai)."""
+        ...
+
+    def stop_run(self, ref: RunRef) -> None:
+        """Ask a running run to stop gracefully (the "Stop run" button of the W&B app). Asynchronous:
+        the run's own process shuts down on its next heartbeat."""
+        ...
+
+    def delete_run(self, ref: RunRef, delete_artifacts: bool = False) -> None:
+        """Delete the run for good. The artifacts the run logged are kept unless `delete_artifacts`
+        (which removes them from W&B too, even if other runs use them)."""
+        ...
+
 
 class WandbApiClient:
     def __init__(self, api_key: str) -> None:
@@ -367,3 +381,15 @@ class WandbApiClient:
 
     def start_copy(self, ref: RunRef) -> CopyJob:
         return CopyJob(ref, self._api_key)
+
+    def run_url(self, ref: RunRef) -> str:
+        return str(self._run(ref).url)
+
+    def stop_run(self, ref: RunRef) -> None:
+        self._run(ref).stop()
+
+    def delete_run(self, ref: RunRef, delete_artifacts: bool = False) -> None:
+        run = self._run(ref)
+        run.delete(delete_artifacts=delete_artifacts)
+        with self._lock:
+            self._runs.pop(ref, None)

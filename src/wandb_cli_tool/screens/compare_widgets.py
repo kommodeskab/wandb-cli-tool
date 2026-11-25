@@ -4,22 +4,30 @@ bars (one per run) for each metric. A plot whose runs all logged a single value 
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Mapping, Sequence
 
 from rich.align import Align
 from rich.console import RenderableType
 from rich.text import Text
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.message import Message
 from textual.widget import Widget
+from textual.widgets import DataTable, Static
+from textual_image.widget import Image as BestImage
 from textual_plotext import PlotextPlot
 
 from ..barchart import layout_bars
 from ..charts import axis_label
-from ..compare import CompareChart, latest
+from ..compare import MAX_COMPARE_ROWS, CompareChart, latest, merge_tables, nearest_step, union_steps
+from ..images import ImageSeries, ImageStep, StepCursor
 from ..palette import hex_to_rgb, series_color
-from ..plain import plain_title
-from ..series import Point
+from ..plain import plain, plain_title
+from ..series import Point, prepare_points
+from ..tables import TableData
 from .chart_widgets import (
-    CHART_CLASS, NOTE_HEIGHT, PLOT_HEIGHT, _NAV_BINDINGS, is_dark, note_renderable,
+    CHART_CLASS, DEBOUNCE, NOTE_HEIGHT, StepSlider, table_height, PLOT_HEIGHT, _NAV_BINDINGS, apply_axis_options, is_dark, note_renderable, plot_note,
 )
 
 Group = tuple[str, Sequence["float | None"]]  # a metric and its value in each run (None = no value)
@@ -162,14 +170,19 @@ class ComparePlotView(CompareBase, PlotextPlot):
         self.bars = None
         self.styles.height = PLOT_HEIGHT
         colors = self._colors()
+        dropped, drawn = 0, []
         for i, points in sorted(series.items()):
+            points, gone = prepare_points(points, chart.opts)  # smoothing / log axes, per run
+            dropped += gone
             if points:
+                drawn += [p[1] for p in points]
                 plt.plot(
                     [p[0] for p in points], [p[1] for p in points],
                     marker="braille", color=hex_to_rgb(colors[i]), label=self.run_labels[i],
                 )
         plt.xlabel(axis_label(chart.x))
-        self.border_subtitle = plain_title(f"x: {axis_label(chart.x)}{note}")
+        apply_axis_options(plt, chart.opts, drawn)
+        self.border_subtitle = plain_title(f"x: {axis_label(chart.x)}{plot_note(chart.opts, dropped)}{note}")
         self.refresh()
 
     def fail(self, message: str) -> None:
@@ -178,3 +191,226 @@ class ComparePlotView(CompareBase, PlotextPlot):
         self.plt.title(f"Error: {message}")
         self.border_subtitle = ""
         self.refresh()
+
+
+# ---- tables --------------------------------------------------------------------------------------
+class CompareTableView(CompareBase, DataTable):
+    """The runs' versions of one wandb.Table in one table, each row marked with its run's color.
+    `v` switches between keeping each run's rows together and lining up rows with the same first column."""
+
+    can_focus = True
+    BINDINGS = [Binding("v", "toggle_group", "Group rows by run / first column")]
+    DEFAULT_CSS = """
+    CompareTableView { height: 8; border: round $primary; margin-bottom: 1; }
+    CompareTableView:focus { border: round $accent; }
+    """
+
+    def __init__(self, chart: CompareChart, index: int, run_labels: Sequence[str]) -> None:
+        DataTable.__init__(self, cursor_type="cell", zebra_stripes=True)
+        self._init_compare(chart, index, run_labels)
+        self.border_subtitle = "loading…"
+        self.tables: list[TableData | None] | None = None
+        self.by_key = False
+
+    def show_tables(self, tables: list[TableData | None]) -> None:
+        self.tables = tables
+        self._render_table()
+
+    def _render_table(self) -> None:
+        if self.tables is None:
+            return
+        merged = merge_tables(self.tables, self.by_key)
+        colors = self._colors()
+        self.clear(columns=True)
+        self.add_columns("Run", *[plain(c) for c in merged.columns])
+        for run, cells in merged.rows:
+            self.add_row(Text.assemble(("■ ", colors[run]), self.run_labels[run]), *[plain(c) for c in cells])
+        self.styles.height = table_height(len(merged.rows))
+        notes = [f"{len(merged.rows):,} rows"]
+        if merged.truncated:
+            notes.append(f"first {MAX_COMPARE_ROWS} of each run")
+        if merged.missing:
+            notes.append("not in: " + ", ".join(self.run_labels[i] for i in merged.missing))
+        notes.append("rows lined up by first column" if self.by_key else "rows grouped by run")
+        self.border_subtitle = plain_title(" · ".join(notes) + " · v: switch")
+        self.refresh()
+
+    def action_toggle_group(self) -> None:
+        self.by_key = not self.by_key
+        self._render_table()
+
+    def show_unavailable(self, message: str) -> None:
+        self.tables = None
+        self.clear(columns=True)
+        self.add_column("Not in the compared runs")
+        self.add_row(plain(message))
+        self.styles.height = table_height(1)
+        self.border_subtitle = ""
+
+    def fail(self, message: str) -> None:
+        self.tables = None
+        self.clear(columns=True)
+        self.add_column("Error")
+        self.add_row(plain(message))
+        self.styles.height = table_height(1)
+        self.border_subtitle = ""
+
+
+# ---- images --------------------------------------------------------------------------------------
+IMAGE_COMPARE_HEIGHT = 26
+
+
+class CompareImageView(CompareBase, Vertical):
+    """The images logged under one key by every run, side by side at the same step. One slider
+    moves all runs together; a run without an image at that exact step shows its nearest one."""
+
+    can_focus = True
+    BINDINGS = [
+        Binding("left", "step(-1)", "Previous step"),
+        Binding("right", "step(1)", "Next step"),
+        Binding("shift+left", "step(-10)", "10 steps back", show=False),
+        Binding("shift+right", "step(10)", "10 steps on", show=False),
+        Binding("home", "jump_to(0)", "First step", show=False),
+        Binding("end", "jump_to(-1)", "Last step", show=False),
+        Binding("left_square_bracket", "sub(-1)", "Previous image", show=False),
+        Binding("right_square_bracket", "sub(1)", "Next image", show=False),
+        Binding("up", "screen.focus_chart(-1)", "Prev chart", show=False),
+        Binding("down", "screen.focus_chart(1)", "Next chart", show=False),
+    ]
+    DEFAULT_CSS = """
+    CompareImageView { height: 26; border: round $primary; margin-bottom: 1; }
+    CompareImageView:focus { border: round $accent; }
+    CompareImageView #cells { height: 1fr; }
+    CompareImageView .cell { width: 1fr; height: 1fr; }
+    CompareImageView .cell-label { height: 1; padding: 0 1; }
+    CompareImageView .cell-img { height: 1fr; align: center middle; }
+    CompareImageView #img-info { height: 1; color: $text-muted; padding: 0 1; }
+    """
+
+    class Wanted(Message):
+        """The images for the current step should be fetched and shown."""
+
+        def __init__(self, view: "CompareImageView") -> None:
+            super().__init__()
+            self.view = view
+
+    def __init__(self, chart: CompareChart, index: int, run_labels: Sequence[str]) -> None:
+        super().__init__()
+        self._init_compare(chart, index, run_labels)
+        self.series: list[ImageSeries | None] = []
+        self.steps: list[int] = []  # every step any run has, ascending: the slider's positions
+        self.cursor = StepCursor(0)
+        self.sub = 0
+        self.unavailable: str | None = None
+        self.errors: dict[int, str] = {}
+        self._debounce = None
+        self._shown: dict[int, Path] = {}
+
+    def compose(self):
+        with Horizontal(id="cells"):
+            for _ in self.run_labels:
+                with Vertical(classes="cell"):
+                    yield Static("", classes="cell-label")
+                    with Vertical(classes="cell-img"):
+                        image = BestImage(None)
+                        image.styles.width = "auto"
+                        image.styles.height = "auto"
+                        yield image
+        yield StepSlider(id="slider")
+        yield Static("loading…", id="img-info")
+
+    # ---- state -----------------------------------------------------------------------------------
+    @property
+    def target(self) -> int | None:
+        return self.steps[self.cursor.index] if self.steps else None
+
+    def step_for(self, run: int) -> ImageStep | None:
+        """The run's image step shown at the current slider position."""
+        series = self.series[run] if run < len(self.series) else None
+        return nearest_step(series.steps, self.target) if series and self.target is not None else None
+
+    def token(self) -> tuple[int, int]:
+        return (self.target if self.target is not None else -1, self.sub)
+
+    def set_series(self, series: list[ImageSeries | None], keep_position: bool = False) -> None:
+        """The runs' image steps. First time the newest step is shown; on a refresh the slider stays."""
+        previous = self.target
+        was_end = self.cursor.at_end
+        self.series, self.steps = series, union_steps(series)
+        n = len(self.steps)
+        if not keep_position or was_end or previous is None:
+            self.cursor = StepCursor(n, n - 1)
+        else:
+            self.cursor = StepCursor(n, min(range(n), key=lambda i: abs(self.steps[i] - previous)))
+        self._sync(immediate=True)
+
+    def show_unavailable(self, message: str) -> None:
+        self.unavailable = message
+        self.query_one("#cells").display = False
+        self.query_one("#slider").display = False
+        self.styles.height = NOTE_HEIGHT
+        self.query_one("#img-info", Static).update(plain(message))
+
+    # ---- showing -----------------------------------------------------------------------------------
+    def _labels(self) -> None:
+        colors = self._colors()
+        for run, cell in enumerate(self.query(".cell-label")):
+            step = self.step_for(run)
+            text = Text.assemble(("■ ", colors[run]), self.run_labels[run])
+            if step is None:
+                text.append("  not logged", style="dim")
+            else:
+                text.append(f"  step {step.step}", style="dim" if step.step == self.target else "yellow")
+            if run in self.errors:
+                text.append(f"  {self.errors[run]}", style="red")
+            cell.update(text)
+
+    def _sync(self, immediate: bool = False) -> None:
+        self.query_one("#slider", StepSlider).set_position(self.cursor.index, len(self.steps))
+        self.errors = {}
+        self._labels()
+        info = f"step {self.target} · {self.cursor.index + 1}/{len(self.steps)}" if self.steps else "No images were logged."
+        self.query_one("#img-info", Static).update(plain(info))
+        self.border_subtitle = plain_title("←/→ step · Shift ±10 · Home/End · [ ] image")
+        if self.steps:
+            if self._debounce is not None:
+                self._debounce.stop()
+                self._debounce = None
+            if immediate:
+                self.post_message(self.Wanted(self))
+            else:
+                self._debounce = self.set_timer(DEBOUNCE, lambda: self.post_message(self.Wanted(self)))
+
+    def show_image(self, run: int, path: Path, token: tuple[int, int]) -> None:
+        if token != self.token():  # the slider has moved on since this was requested
+            return
+        self._shown[run] = path
+        self.query(BestImage)[run].image = path
+
+    def fail(self, run: int, message: str, token: tuple[int, int]) -> None:
+        if token == self.token():
+            self.errors[run] = message
+            self._labels()
+
+    # ---- keys ----------------------------------------------------------------------------------------
+    def action_step(self, delta: int) -> None:
+        if self.cursor.move(delta):
+            self.sub = 0
+            self._sync()
+
+    def action_jump_to(self, index: int) -> None:
+        if self.cursor.jump(self.cursor.n - 1 if index < 0 else index):
+            self.sub = 0
+            self._sync()
+
+    def action_sub(self, delta: int) -> None:
+        most = max((len(s.paths) for r in range(len(self.run_labels)) if (s := self.step_for(r))), default=1)
+        if 0 <= self.sub + delta < most:
+            self.sub += delta
+            self._sync()
+
+    def on_step_slider_jumped(self, event: StepSlider.Jumped) -> None:
+        event.stop()
+        if self.cursor.jump(event.index):
+            self.sub = 0
+            self._sync()

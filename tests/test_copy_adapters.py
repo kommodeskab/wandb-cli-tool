@@ -305,3 +305,4 @@ def test_job_passes_the_api_key_by_environment_only(monkeypatch):
     assert captured["kw"]["env"]["WANDB_SILENT"] == "true" and captured["kw"]["stdin"] == subprocess.DEVNULL
     assert json.loads(captured["args"][-1]) == {"entity": "me", "project": "proj", "run_id": "srcid"}
     assert captured["args"][0] == sys.executable and "child_main" in captured["args"][2]
+

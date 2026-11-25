@@ -208,12 +208,12 @@ async def test_comparing_runs_with_bracketed_text(make_app):
         assert [str(c.label) for c in table.columns.values()] == ["", f"■ {RUN}", "■ [bold]other [/x]"]
         cells = {str(table.get_row_at(i)[0]).strip(" ≠"): [str(c) for c in table.get_row_at(i)[1:]] for i in range(table.row_count)}
         assert cells["Group"] == [GROUP, "[/g2]"] and cells["Tags"] == [f"{TAG1}, {TAG2}", "—"]
-        await pilot.press("2")
+        await pilot.press("3")
         await settle(pilot)
         config_table = screen.query_one("#config-table", DataTable)
         rows = {str(config_table.get_row_at(i)[0]): [str(c) for c in config_table.get_row_at(i)[1:]] for i in range(config_table.row_count)}
         assert rows["lr [/o]"] == ["0.1", "[/v] 0.2"] and rows["only[0].k [/k]"] == ["[bold]x", "—"]
-        await pilot.press("3")
+        await pilot.press("4")
         await settle(pilot, 6)
         panels = screen.query_one("#panels", OptionList)
         assert panels.option_count >= 1
@@ -223,3 +223,32 @@ async def test_comparing_runs_with_bracketed_text(make_app):
             await screen._show_panel()
             await settle(pilot, 4)
         assert list(screen.query(ComparePlotView))
+
+
+async def test_new_run_management_screens_show_bracketed_names_literally(make_app):
+    from wandb_cli_tool.screens.dialogs import RunActionsDialog, TypeToConfirmDialog
+    from wandb_cli_tool.screens.runs import RunsScreen
+
+    app, ctx = await hostile_app(HostilePair)
+    async with ctx as pilot:
+        await settle(pilot, 5)
+        await pilot.press("enter")  # alpha
+        await settle(pilot, 5)
+        screen = app.screen
+        assert isinstance(screen, RunsScreen)
+        await pilot.press("slash", *"[/g2]")  # a filter that is itself markup-like text
+        await settle(pilot)
+        assert "filter “[/g2]”" in str(screen.query_one("#status").render())
+        shown = [str(screen.query_one("#items", DataTable).get_row_at(i)[0]) for i in range(screen.query_one("#items", DataTable).row_count)]
+        assert shown == ["[bold]other [/x]"]  # only the run whose name contains it, typed literally
+        await pilot.press("enter")
+        await pilot.press("ctrl+a", "a")
+        await settle(pilot)
+        assert isinstance(app.screen, RunActionsDialog)
+        options = app.screen.query_one("#actions", OptionList)
+        options.highlighted = options.get_option_index("delete")
+        await pilot.press("enter")
+        await settle(pilot)
+        dialog = app.screen
+        assert isinstance(dialog, TypeToConfirmDialog)
+        assert "[bold]other [/x] (id2)" in str(dialog.query_one("#confirm-body").render())

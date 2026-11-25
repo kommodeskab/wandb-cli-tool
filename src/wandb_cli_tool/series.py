@@ -43,3 +43,28 @@ def last_values(rows: Iterable[Mapping[str, Any]]) -> dict[str, float]:
             if not k.startswith("_") and is_number(v):
                 out[k] = float(v)
     return out
+
+
+def smooth_ema(points: list[Point], weight: float) -> list[Point]:
+    """Exponential moving average of the y values, the way W&B draws "smoothing": each value is
+    mixed with the running average (weight 0.9 = 90% old), corrected for the start-up bias so the
+    first points are not dragged towards zero. `weight` 0 returns the points unchanged."""
+    if weight <= 0:
+        return list(points)
+    out: list[Point] = []
+    average, steps = 0.0, 0
+    for x, y in points:
+        if not math.isfinite(y):
+            continue
+        steps += 1
+        average = average * weight + (1 - weight) * y
+        out.append((x, average / (1 - weight**steps)))
+    return out
+
+
+def prepare_points(points: list[Point], opts) -> tuple[list[Point], int]:
+    """The points as a plot with `opts` draws them, and how many had to be dropped because a log
+    axis cannot show zero or negative values."""
+    shown = smooth_ema(points, opts.smooth)
+    kept = [p for p in shown if (not opts.logx or p[0] > 0) and (not opts.logy or p[1] > 0)]
+    return kept, len(shown) - len(kept)
