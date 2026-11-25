@@ -1,0 +1,314 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import datetime
+from typing import TYPE_CHECKING
+
+from rich.table import Table
+from rich.text import Text
+from textual import work
+from textual.app import ComposeResult
+from textual.binding import Binding
+from textual.screen import Screen
+from textual.widgets import Footer, Header, OptionList, Static
+from textual.widgets.option_list import Option
+
+from ..api import CopyEstimate, RunInfo, RunMetadata, RunRef
+from ..formatting import fmt_duration, fmt_time
+from ..plain import plain
+from .charts import ChartsScreen
+from .config import ConfigScreen
+from .copy import CopyOutcome, CopyProgressScreen, describe_copy
+from .dialogs import ConfirmDialog, GroupDialog, RenameDialog, TagsDialog
+from .files import FilesScreen
+from .logs import LogsScreen
+
+if TYPE_CHECKING:
+    from ..app import WandbCliApp
+
+Fields = list[tuple[str, str]]
+
+
+def git_state(meta: RunMetadata) -> str:
+    if not meta.git_commit:
+        return "—"
+    state = {True: " (uncommitted changes)", False: " (clean)", None: ""}[meta.git_dirty]
+    return meta.git_commit[:10] + state
+
+
+def summary_fields(
+    info: RunInfo | None, meta: RunMetadata | None, now: datetime | None = None
+) -> tuple[Fields, Fields]:
+    """(short, wide) label/value pairs. None for info/meta means 'still loading'."""
+
+    def v(value: str | None, loading: bool) -> str:
+        return "…" if loading else (value or "—")
+
+    li, lm = info is None, meta is None
+    status = ("● " if info and info.state == "running" else "") + (info.state if info else "")
+    short: Fields = [
+        ("Status", v(status, li)),
+        ("Started", v(info and fmt_time(info.created_at), li)),
+        ("Run time", v(info and fmt_duration(info.runtime_seconds(now)), li)),
+        ("Group", v(info and info.group, li)),
+        ("Host", v(meta and meta.host, lm)),
+        ("GPU", v(meta and meta.gpu, lm)),
+        ("CPU cores", v(meta and meta.cpu_cores, lm)),
+        ("Python", v(meta and meta.python, lm)),
+    ]
+    wide: Fields = [
+        ("Git repo", v(meta and meta.git_remote, lm)),
+        ("Git state", "…" if lm else git_state(meta)),
+        ("Command", v(meta and meta.command, lm)),
+    ]
+    return short, wide
+
+
+class RunScreen(Screen):
+    """A run: tags and key facts at the top, then a menu (Logs, Charts, Config, Files)."""
+
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "Back"),
+        Binding("g", "set_group", "Set group"),
+        Binding("t", "add_tags", "Add tags"),
+        Binding("r", "rename", "Rename"),
+        Binding("c", "copy_run", "Copy run"),
+    ]
+    DEFAULT_CSS = """
+    #tags { padding: 1 1 0 1; }
+    #info { padding: 0 1; }
+    #info-wide { padding: 0 1 1 1; }
+    #menu { height: auto; margin: 0 1; }
+    """
+    app: "WandbCliApp"
+
+    def __init__(
+        self,
+        ref: RunRef,
+        name: str,
+        groups: list[str] | None = None,
+        tags: list[str] | None = None,
+    ) -> None:
+        super().__init__()
+        self.ref = ref
+        self.run_name = name
+        self.known_groups = list(groups or [])
+        self.known_tags = list(tags or [])
+        self.info: RunInfo | None = None
+        self.meta: RunMetadata | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("Tags: …", id="tags")
+        yield Static("", id="info")
+        yield Static("", id="info-wide")
+        yield OptionList(
+            Option("Logs", id="logs"),
+            Option("Charts", id="charts"),
+            Option("Config", id="config"),
+            Option("Files", id="files"),
+            id="menu",
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.title = f"Run — {self.run_name}"
+        self.sub_title = self.ref.path
+        menu = self.query_one("#menu", OptionList)
+        menu.highlighted = 0
+        menu.focus()
+        self._render_info()
+        self.load_details()
+        self.load_metadata()
+
+    # ---- loading -------------------------------------------------------
+    @work(thread=True)
+    def load_details(self) -> None:
+        try:
+            info = self.app.client.run_details(self.ref)
+        except Exception as exc:
+            self.app.call_from_thread(self._load_failed, str(exc))
+            return
+        self.app.call_from_thread(self._set_info, info)
+
+    @work(thread=True)
+    def load_metadata(self) -> None:
+        try:
+            meta = self.app.client.run_metadata(self.ref)
+        except Exception:
+            meta = RunMetadata()  # no metadata file: show dashes
+        self.app.call_from_thread(self._set_meta, meta)
+
+    def _set_info(self, info: RunInfo) -> None:
+        self.info = info
+        self._render_info()
+
+    def _set_meta(self, meta: RunMetadata) -> None:
+        self.meta = meta
+        self._render_info()
+
+    def _load_failed(self, message: str) -> None:
+        self.query_one("#tags", Static).update(plain(f"Could not load run details: {message}"))
+
+    # ---- rendering -----------------------------------------------------
+    def _render_info(self) -> None:
+        tags = Text("Tags: ", style="bold")
+        if self.info is None:
+            tags.append("…")
+        elif not self.info.tags:
+            tags.append("none  (press t to add)", style="dim")
+        else:
+            for tag in self.info.tags:
+                tags.append(f" {tag} ", style="black on cyan")
+                tags.append(" ")
+        self.query_one("#tags", Static).update(tags)
+
+        short, wide = summary_fields(self.info, self.meta)
+        grid = Table.grid(padding=(0, 2))
+        for _ in range(4):
+            grid.add_column()
+        for i in range(0, len(short), 2):
+            row = []
+            for label, value in short[i : i + 2]:
+                row += [Text(label, style="dim"), Text(value)]
+            grid.add_row(*row)
+        self.query_one("#info", Static).update(grid)
+
+        wide_grid = Table.grid(padding=(0, 2))
+        wide_grid.add_column()
+        wide_grid.add_column(overflow="fold")
+        for label, value in wide:
+            wide_grid.add_row(Text(label, style="dim"), Text(value))
+        self.query_one("#info-wide", Static).update(wide_grid)
+
+    # ---- navigation ----------------------------------------------------
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        screens = {
+            "logs": LogsScreen,
+            "charts": ChartsScreen,
+            "config": ConfigScreen,
+            "files": FilesScreen,
+        }
+        self.app.push_screen(screens[str(event.option.id)](self.ref, self.run_name))
+
+    def _mark_project_edited(self) -> None:
+        """Tell the runs list (behind this screen) that its rows are out of date."""
+        self.app.touched_projects.add((self.ref.entity, self.ref.project))
+
+    # ---- the writes: group, tags, name, copy ---------------------------
+    def action_set_group(self) -> None:
+        if self.info is None:
+            self.notify("Run details are still loading.", severity="warning")
+            return
+        self.app.push_screen(GroupDialog(self.known_groups, self.info.group), self._on_group)
+
+    def _on_group(self, group: str | None) -> None:
+        if group:
+            self.write_group(group)
+
+    @work(thread=True, group="write")
+    def write_group(self, group: str) -> None:
+        try:
+            self.app.client.set_group(self.ref, group)
+        except Exception as exc:
+            self.app.call_from_thread(self.notify, f"Could not set group: {exc}", severity="error")
+            return
+        self.app.call_from_thread(self._group_saved, group)
+
+    def _group_saved(self, group: str) -> None:
+        if self.info is not None:
+            self.info = replace(self.info, group=group)
+        if group not in self.known_groups:
+            self.known_groups.append(group)
+        self._mark_project_edited()
+        self._render_info()
+        self.notify(f"Group set to “{group}”.")
+
+    def action_rename(self) -> None:
+        if self.info is None:
+            self.notify("Run details are still loading.", severity="warning")
+            return
+        self.app.push_screen(RenameDialog(self.info.name), self._on_rename)
+
+    def _on_rename(self, name: str | None) -> None:
+        if name:
+            self.write_name(name)
+
+    @work(thread=True, group="write")
+    def write_name(self, name: str) -> None:
+        try:
+            saved = self.app.client.rename_run(self.ref, name)
+        except Exception as exc:
+            self.app.call_from_thread(self.notify, f"Could not rename run: {exc}", severity="error")
+            return
+        self.app.call_from_thread(self._name_saved, saved)
+
+    def _name_saved(self, name: str) -> None:
+        self.run_name = name
+        self.title = f"Run — {name}"
+        if self.info is not None:
+            self.info = replace(self.info, name=name)
+        self._mark_project_edited()
+        self.notify(f"Run renamed to “{name}”.")
+
+    # ---- copy: estimate, confirm (yes/no), then run in a child process --
+    def action_copy_run(self) -> None:
+        if self.info is None:
+            self.notify("Run details are still loading.", severity="warning")
+            return
+        self.notify("Checking what would be copied…")
+        self.estimate_copy()
+
+    @work(thread=True, group="estimate", exclusive=True)
+    def estimate_copy(self) -> None:
+        try:
+            estimate = self.app.client.copy_estimate(self.ref)
+        except Exception:
+            estimate = None  # still let the user decide, just without sizes
+        self.app.call_from_thread(self._confirm_copy, estimate)
+
+    def _confirm_copy(self, estimate: CopyEstimate | None) -> None:
+        if self.info is None:
+            return
+        body = describe_copy(self.info.name, self.info.state, estimate)
+        self.app.push_screen(
+            ConfirmDialog("Copy this run?", body, yes="Yes, copy", no="No"), self._on_copy_confirmed
+        )
+
+    def _on_copy_confirmed(self, yes: bool | None) -> None:
+        if yes and self.info is not None:
+            self.app.push_screen(CopyProgressScreen(self.ref, self.info.name), self._on_copy_finished)
+
+    def _on_copy_finished(self, outcome: CopyOutcome | None) -> None:
+        if outcome is not None and outcome.run_id:  # a partial run also shows up in the list
+            self._mark_project_edited()
+
+    def action_add_tags(self) -> None:
+        if self.info is None:
+            self.notify("Run details are still loading.", severity="warning")
+            return
+        self.app.push_screen(
+            TagsDialog(self.known_tags, list(self.info.tags)), self._on_tags
+        )
+
+    def _on_tags(self, tags: list[str] | None) -> None:
+        if tags:
+            self.write_tags(tags)
+
+    @work(thread=True, group="write")
+    def write_tags(self, tags: list[str]) -> None:
+        try:
+            merged = self.app.client.add_tags(self.ref, tags)
+        except Exception as exc:
+            self.app.call_from_thread(self.notify, f"Could not add tags: {exc}", severity="error")
+            return
+        self.app.call_from_thread(self._tags_saved, merged)
+
+    def _tags_saved(self, tags: list[str]) -> None:
+        if self.info is not None:
+            self.info = replace(self.info, tags=tuple(tags))
+        self.known_tags = sorted(set(self.known_tags) | set(tags))
+        self._mark_project_edited()
+        self._render_info()
+        self.notify("Tags added.")
