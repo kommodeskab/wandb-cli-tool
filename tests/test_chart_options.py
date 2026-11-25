@@ -5,7 +5,8 @@ import math
 import pytest
 
 from wandb_cli_tool.charts import (
-    ChartLayout, ChartOptions, ChartSpec, Customization, Panel, apply_customization, chart_key, parse_options,
+    BAR, IMAGE, PLOT, TABLE, ChartLayout, ChartOptions, ChartSpec, Customization, Panel, apply_customization, chart_key,
+    parse_options,
 )
 from wandb_cli_tool.series import prepare_points, smooth_ema
 
@@ -123,6 +124,30 @@ def test_a_customization_applies_options_over_the_default_layout():
     custom = Customization(opts={"P": {chart_key(ChartSpec("a")): ChartOptions(logx=True)}})
     panels = apply_customization([Panel("P", [ChartSpec("a")])], custom)
     assert panels[0].charts[0].opts.logx
+
+
+def test_editing_a_generated_charts_series_persists_in_edited_and_cleans_up():
+    lay = ChartLayout([Panel("P", [ChartSpec("a"), ChartSpec("b")]), Panel("Tables", [ChartSpec("t1", kind=TABLE)])])
+    edited_plot = ChartSpec("a", x="_runtime", more=("b",), opts=ChartOptions(smooth=0.4))
+    lay.set_chart(0, 0, edited_plot)
+    assert lay.panels[0].charts[0] == edited_plot
+    assert lay.custom.edited["P"] == {"0:a": edited_plot} and lay.custom.x == {} and lay.custom.opts == {}
+    # roundtrips through JSON
+    loaded = Customization.from_json(lay.custom.to_json())
+    assert apply_customization(lay.default, loaded)[0].charts[0] == edited_plot
+    # reverting back to original metrics drops custom.edited
+    lay.set_chart(0, 0, ChartSpec("a", x="_runtime"))
+    assert lay.custom.edited == {} and lay.custom.x == {"P": {"0:a": "_runtime"}}
+    # editing a generated table key works and removing cleans it up
+    lay.set_chart(1, 0, ChartSpec("t2", kind=TABLE))
+    assert lay.panels[1].charts[0] == ChartSpec("t2", kind=TABLE)
+    lay.remove_chart(1, 0)
+    assert lay.custom.edited == {} and lay.custom.removed == {"Tables": ["table:t1"]}
+
+
+def test_malformed_edited_data_is_ignored():
+    bad = {"edited": {"P": {"0:a": "bad", "0:b": {"y": 1}}, "Q": 5}}
+    assert Customization.from_json(bad).edited == {}
 
 
 # ---- in the screens ---------------------------------------------------------------------------
@@ -282,3 +307,116 @@ async def test_options_dialog_for_a_bar_chart_only_asks_for_the_axis(make_app):
         assert "axis 0…1" in str(shown.border_subtitle)
     saved = LayoutStore().load(project_key("me", "alpha"))
     assert any(s.kind == BAR and s.opts.ymax == 1.0 for specs in saved.added.values() for s in specs)
+
+
+async def test_chart_options_edits_plot_metrics_x_bar_order_table_and_images(make_app):
+    from textual.widgets import OptionList, Select, SelectionList
+    from chart_helpers import add_bar
+    from wandb_cli_tool.screens.chart_widgets import BarView, ImageChartView, TableView
+
+    config.save(Credentials("k", "me"))
+    app = make_app()
+    async with app.run_test(size=(130, 50)) as pilot:
+        screen = await open_charts(pilot)
+        # edit a generated plot's series, x-axis and smoothing via `o`
+        await pilot.press("down", "right", "o")  # trainer/global_steps
+        await settle(pilot)
+        dialog = app.screen
+        assert isinstance(dialog, ChartOptionsDialog)
+        dialog.query_one("#choices", SelectionList).select((False, "val/loss"))
+        dialog.query_one("#x", Select).value = "acc"
+        dialog.query_one("#smooth", Input).value = "0.5"
+        await pilot.click("#ok")
+        await settle(pilot, 8)
+        shown = app.focused
+        assert isinstance(shown, ChartView)
+        assert shown.spec.series == ("trainer/global_steps", "val/loss")
+        assert shown.spec.x == "acc" and shown.spec.opts.smooth == 0.5
+
+        # edit a bar chart's metrics & order via `o`
+        await pilot.press("left")
+        await add_bar(pilot, (False, "acc"), (False, "val/loss"))
+        await pilot.press("o")
+        await settle(pilot)
+        dialog = app.screen
+        assert isinstance(dialog, ChartOptionsDialog) and dialog.is_bar
+        dialog.query_one("#choices", SelectionList).select((False, "trainer/loss"))
+        await settle(pilot)
+        order = dialog.query_one("#order", OptionList)
+        order.focus()
+        order.highlighted = 2
+        await pilot.press("ctrl+up")  # move trainer/loss before val/loss
+        await settle(pilot)
+        await pilot.click("#ok")
+        await settle(pilot, 8)
+        bar = app.focused
+        assert isinstance(bar, BarView)
+        assert bar.spec.series == ("acc", "trainer/loss", "val/loss")
+
+        # edit a table in the auto Tables panel
+        await pilot.press("left")
+        labels = [str(screen.query_one("#panels", OptionList).get_option_at_index(i).prompt)
+                  for i in range(screen.query_one("#panels", OptionList).option_count)]
+        tables_idx = next(i for i, l in enumerate(labels) if l.startswith("Tables ("))
+        screen.selected = tables_idx
+        await screen._show_panel()
+        await settle(pilot, 6)
+        screen.query(TableView).first().focus()
+        await settle(pilot)
+        await pilot.press("o")
+        await settle(pilot)
+        dialog = app.screen
+        assert isinstance(dialog, ChartOptionsDialog) and dialog.kind == TABLE
+        dialog.query_one("#table", Select).value = "results"
+        await pilot.click("#ok")
+        await settle(pilot, 6)
+        assert isinstance(app.focused, TableView) and app.focused.spec.y == "results"
+
+        # edit an image chart in the auto Images panel
+        images_idx = next(i for i, l in enumerate(labels) if l.startswith("Images ("))
+        screen.selected = images_idx
+        await screen._show_panel()
+        await settle(pilot, 6)
+        screen.query(ImageChartView).first().focus()
+        await settle(pilot)
+        await pilot.press("o")
+        await settle(pilot)
+        dialog = app.screen
+        assert isinstance(dialog, ChartOptionsDialog) and dialog.kind == IMAGE
+        dialog.query_one("#image-key", Select).value = "samples"
+        await pilot.click("#ok")
+        await settle(pilot, 6)
+        assert isinstance(app.focused, ImageChartView) and app.focused.spec.y == "samples"
+
+
+async def test_editing_a_plot_shows_and_reorders_y_values_with_taller_lists(make_app):
+    from textual.widgets import OptionList, SelectionList
+
+    config.save(Credentials("k", "me"))
+    app = make_app()
+    async with app.run_test(size=(130, 50)) as pilot:
+        await open_charts(pilot)
+        await pilot.press("down", "right", "o")  # trainer/global_steps
+        await settle(pilot)
+        dialog = app.screen
+        assert isinstance(dialog, ChartOptionsDialog)
+        assert dialog.query_one("#choices", SelectionList).styles.height.value == 10
+        assert dialog.query_one("#order", OptionList).styles.height.value == 8
+        order = dialog.query_one("#order", OptionList)
+        assert [str(order.get_option_at_index(i).prompt) for i in range(order.option_count)] == [
+            "1. trainer/global_steps",
+        ]
+        dialog.query_one("#choices", SelectionList).select((False, "acc"))
+        await settle(pilot, 2)
+        assert [str(order.get_option_at_index(i).prompt) for i in range(order.option_count)] == [
+            "1. trainer/global_steps", "2. acc",
+        ]
+        order.focus()
+        await pilot.press("ctrl+up")
+        await settle(pilot, 2)
+        assert [str(order.get_option_at_index(i).prompt) for i in range(order.option_count)] == [
+            "1. acc", "2. trainer/global_steps",
+        ]
+        await pilot.click("#ok")
+        await settle(pilot, 8)
+        assert app.focused.spec.series == ("acc", "trainer/global_steps")

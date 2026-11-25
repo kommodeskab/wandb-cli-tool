@@ -761,3 +761,182 @@ async def test_the_table_grouping_key_shows_its_state():
         await pilot.press("v")
         await settle(pilot)
         assert "v ☑ Line up rows by first column" in keys_of(screen)
+
+
+# ---- refreshing while on the charts tab ----------------------------------------------------------------
+async def test_refresh_on_charts_tab_keeps_panel_focused_chart_and_scroll():
+    from textual.containers import VerticalScroll
+
+    class ManyCharts(CompareClient):
+        METRICS_BY_RUN = {k: ["a/m0", "a/m1", "a/m2", "a/m3", "a/m4"] for k in ("id1", "id2")}
+
+    app = make(ManyCharts)
+    async with app.run_test(size=(150, 40)) as pilot:
+        screen = await compare(pilot, 0, 1)
+        await show_panel(pilot, screen, "a")
+        await pilot.press("right", "down", "down", "down")  # a/m3 (scrolled down)
+        await settle(pilot, 4)
+        charts_scroll = screen.query_one("#charts", VerticalScroll)
+        scroll_before = charts_scroll.scroll_y
+        before = list(screen.query(ComparePlotView))
+        assert scroll_before > 0 and app.focused is before[3]
+        app.client.many_calls.clear()
+
+        await pilot.press("r")
+        await settle(pilot, 10)
+        after = list(screen.query(ComparePlotView))
+        assert screen.selected == 1 and screen.panels[screen.selected].name == "a"
+        assert screen.query_one("#panels", OptionList).highlighted == 1
+        assert after == before and all(a is b for a, b in zip(after, before))  # updated in place
+        assert app.focused is before[3] and charts_scroll.scroll_y == scroll_before
+        assert app.client.many_calls  # fresh data was fetched
+
+
+async def test_refresh_with_new_panel_and_metric_before_keeps_panel_and_chart_identity():
+    class Growing(CompareClient):
+        extra: list[str] = []
+
+        def metric_keys(self, ref):
+            return sorted(["a/m0", "a/m1", "a/m2", "a/m3", "a/m4", *self.extra])
+
+    app = make(Growing)
+    async with app.run_test(size=(150, 40)) as pilot:
+        screen = await compare(pilot, 0, 1)
+        await show_panel(pilot, screen, "a")
+        await pilot.press("right", "down", "down", "down")  # a/m3 at index 3
+        await settle(pilot, 4)
+        assert app.focused.chart.metric == "a/m3"
+
+        Growing.extra = ["00/new", "a/aaa"]
+        try:
+            await pilot.press("r")
+            await settle(pilot, 10)
+        finally:
+            Growing.extra = []
+        assert screen.panels[screen.selected].name == "a" and screen.selected == 2
+        assert screen.query_one("#panels", OptionList).highlighted == 2
+        assert isinstance(app.focused, ComparePlotView)
+        assert app.focused.chart.metric == "a/m3" and app.focused.index == 4
+
+
+async def test_refresh_with_panels_list_focused_keeps_panel_and_focus():
+    app = make(WideClient)
+    async with app.run_test(size=(150, 40)) as pilot:
+        screen = await compare(pilot, 0, 1)
+        await pilot.press("4")
+        await settle(pilot, 6)
+        await pilot.press("down")  # panel 1, #panels stays focused
+        await settle(pilot, 6)
+        panels = screen.query_one("#panels", OptionList)
+        assert screen.selected == 1 and app.focused is panels
+
+        await pilot.press("r")
+        await settle(pilot, 10)
+        assert screen.selected == 1 and panels.highlighted == 1 and app.focused is panels
+
+
+async def test_refresh_keeps_compare_table_state_and_image_slider_position():
+    app = make(MediaClient)
+    media_layout(app)
+    async with app.run_test(size=(150, 50)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        await show_panel(pilot, screen, "Media")
+        [table] = screen.query(CompareTableView)
+        [image] = screen.query(CompareImageView)
+        table.focus()
+        await pilot.press("v", "down", "right")
+        await settle(pilot)
+        assert table.by_key is True and (table.cursor_coordinate.row, table.cursor_coordinate.column) == (1, 1)
+
+        image.focus()
+        await pilot.press("left")  # step 30 (off the end)
+        await settle(pilot, 8)
+        assert image.target == 30
+
+        await pilot.press("r")
+        await settle(pilot, 10)
+        assert table.by_key is True and (table.cursor_coordinate.row, table.cursor_coordinate.column) == (1, 1)
+        assert image.target == 30 and app.focused is image
+
+
+async def test_refresh_keeps_focus_on_second_split_plot_when_panel_rebuilds():
+    from wandb_cli_tool.charts import ChartSpec, Customization
+    from wandb_cli_tool.layout_store import project_key
+
+    app = make(WideClient)
+    custom = Customization(panels=["mine"], added={"mine": [ChartSpec("trainer/loss", more=("val/loss",))]})
+    key = project_key("me", "alpha")
+    app.layout_store.save(key, custom)
+    async with app.run_test(size=(150, 50)) as pilot:
+        screen = await compare(pilot, 0, 1)
+        await show_panel(pilot, screen, "mine")
+        views = list(screen.query(ComparePlotView))
+        assert [v.chart.metric for v in views] == ["trainer/loss", "val/loss"]
+        views[1].focus()
+        await settle(pilot)
+
+        # Adding another chart in the layout causes the panel to rebuild on reload
+        updated = Customization(panels=["mine"], added={"mine": [ChartSpec("trainer/loss", more=("val/loss",)), ChartSpec("acc")]})
+        app.layout_store.save(key, updated)
+        await pilot.press("r")
+        await settle(pilot, 10)
+        assert isinstance(app.focused, ComparePlotView)
+        assert app.focused.chart.metric == "val/loss" and app.focused.index == 1
+
+
+# ---- overview column fitting ---------------------------------------------------------------------------
+class LongOverviewClient(CompareClient):
+    GIT_URL = "https://github.com/my-organization/very-long-training-repository-name.git"
+    CMD = "python -m train.main --config configs/large.yaml --lr 0.0003 --batch-size 128"
+
+    def run_metadata(self, ref):
+        meta = super().run_metadata(ref)
+        return type(meta)(
+            host=meta.host,
+            gpu=meta.gpu,
+            cpu_cores=meta.cpu_cores,
+            python=meta.python,
+            git_remote=self.GIT_URL,
+            git_commit=meta.git_commit,
+            git_dirty=meta.git_dirty,
+            command=self.CMD,
+        )
+
+
+async def test_overview_fits_all_runs_without_horizontal_scroll_when_values_are_long():
+    app = make(LongOverviewClient)
+    async with app.run_test(size=(120, 40)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        table = screen.query_one("#overview", DataTable)
+        assert len(table.columns) == 4  # label + 3 runs
+        assert table.show_horizontal_scrollbar is False
+        assert table.virtual_size.width <= table.scrollable_content_region.width
+        git_index = next(i for i in range(table.row_count) if "Git repo" in str(table.get_row_at(i)[0]))
+        git_row = list(table.rows.values())[git_index]
+        assert git_row.height > 1
+        assert str(table.get_row_at(git_index)[1]) == LongOverviewClient.GIT_URL
+
+
+async def test_overview_scrolls_horizontally_when_screen_is_very_narrow():
+    from wandb_cli_tool.compare import MIN_OVERVIEW_COL
+
+    app = make(LongOverviewClient)
+    async with app.run_test(size=(52, 30)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        table = screen.query_one("#overview", DataTable)
+        run_cols = list(table.columns.values())[1:]
+        assert all(c.width >= MIN_OVERVIEW_COL for c in run_cols)
+        assert table.show_horizontal_scrollbar is True
+
+
+async def test_overview_refits_columns_when_terminal_resizes():
+    app = make(LongOverviewClient)
+    async with app.run_test(size=(140, 40)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        table = screen.query_one("#overview", DataTable)
+        wide_widths = [c.width for c in list(table.columns.values())[1:]]
+        await pilot.resize_terminal(85, 40)
+        await settle(pilot, 4)
+        narrow_widths = [c.width for c in list(table.columns.values())[1:]]
+        assert all(n < w for n, w in zip(narrow_widths, wide_widths))
+        assert table.show_horizontal_scrollbar is False

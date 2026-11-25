@@ -1,7 +1,8 @@
 import math
 
 from wandb_cli_tool.charts import (
-    OTHER_PANEL, RUNTIME, STEP, SYSTEM_PANEL, ChartSpec, build_panels, panel_name, x_options,
+    IMAGE, IMAGES_PANEL, OTHER_PANEL, RUNTIME, STEP, SYSTEM_PANEL, TABLE, TABLES_PANEL,
+    ChartSpec, build_panels, chart_key, panel_name, x_options,
 )
 from wandb_cli_tool.series import extract_points, plottable_keys
 
@@ -24,6 +25,32 @@ def test_build_panels_groups_and_orders():
     assert [c.y for c in panels[2 - 1].charts] == ["trainer/loss", "trainer/acc"]
     assert all(c.x == STEP for p in panels[1:] for c in p.charts)
     assert panels[0].charts == [ChartSpec("system.cpu", RUNTIME, system=True)]
+
+
+def test_build_panels_creates_tables_and_images_panels_only_when_logged():
+    panels = build_panels(
+        ["trainer/loss", "Tables/score", "Images/count"],
+        [],
+        tables=["preds", "results"],
+        images=["grid"],
+    )
+    assert [p.name for p in panels] == [SYSTEM_PANEL, "trainer", TABLES_PANEL, IMAGES_PANEL]
+    assert panels[2].charts == [
+        ChartSpec("preds", kind=TABLE),
+        ChartSpec("results", kind=TABLE),
+        ChartSpec("Tables/score"),
+    ]
+    assert panels[3].charts == [ChartSpec("grid", kind=IMAGE), ChartSpec("Images/count")]
+    without = build_panels(["Tables/score"], [])
+    assert [p.name for p in without] == [SYSTEM_PANEL, TABLES_PANEL]
+    assert without[1].charts == [ChartSpec("Tables/score")]
+
+
+def test_chart_key_distinguishes_plot_system_table_and_image():
+    assert chart_key(ChartSpec("a")) == "0:a"
+    assert chart_key(ChartSpec("a", system=True)) == "1:a"
+    assert chart_key(ChartSpec("a", kind=TABLE)) == "table:a"
+    assert chart_key(ChartSpec("a", kind=IMAGE)) == "image:a"
 
 
 def test_system_panel_always_present_and_user_system_prefix_merges():

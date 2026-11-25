@@ -40,6 +40,15 @@ def test_pinned_items_come_first_in_pin_order_and_the_rest_keep_their_order():
     assert pinned_first(items, ["zzz"], lambda x: x) == items  # pins of things that are not there
 
 
+def test_project_pins_are_remembered_per_entity_without_colliding_with_runs(tmp_path):
+    prefs = Preferences(tmp_path / "p.json")
+    me, team = Pins(prefs, "me"), Pins(prefs, "team-a")
+    assert me.toggle("projects", "beta") is True and me.toggle("projects", "alpha") is True
+    assert me.get("projects") == ["beta", "alpha"]
+    assert team.get("projects") == [] and me.get("runs") == []
+    assert Pins(Preferences(tmp_path / "p.json"), "me").get("projects") == ["beta", "alpha"]
+
+
 def test_filter_needs_every_word_and_ignores_case():
     assert matches_filter("train/Loss", "loss") and matches_filter("train/Loss", "TRAIN loss")
     assert not matches_filter("train/loss", "val loss") and matches_filter("anything", "") and matches_filter("x", "  ")

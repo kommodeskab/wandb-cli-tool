@@ -1,6 +1,7 @@
-"""Pinned runs, metrics and config keys: what the user wants to see first. UI-free.
+"""Pinned projects, runs, metrics and config keys: what the user wants to see first. UI-free.
 
-Pins are kept per project in the preferences, in the order they were pinned."""
+Pins are kept in the preferences (per entity for projects, per project for runs, metrics
+and config keys), in the order they were pinned."""
 
 from __future__ import annotations
 
@@ -9,12 +10,12 @@ from typing import Any, Callable, Sequence, TypeVar
 from .preferences import Preferences
 
 T = TypeVar("T")
-KINDS = ("runs", "metrics", "config")
+KINDS = ("projects", "runs", "metrics", "config")
 PREF_KEY = "pins"
 
 
 class Pins:
-    """The pins of one project."""
+    """The pins of one scope (entity for projects; project for runs, metrics and config)."""
 
     def __init__(self, prefs: Preferences, project: str) -> None:
         self._prefs = prefs
@@ -25,7 +26,7 @@ class Pins:
         return stored if isinstance(stored, dict) else {}
 
     def get(self, kind: str) -> list[str]:
-        """The pinned names of `kind` ("runs", "metrics" or "config"), oldest pin first."""
+        """The pinned names of `kind` ("projects", "runs", "metrics" or "config"), oldest pin first."""
         by_project = self._all().get(kind)
         names = by_project.get(self._project) if isinstance(by_project, dict) else None
         return [n for n in names if isinstance(n, str)] if isinstance(names, list) else []

@@ -233,7 +233,7 @@ async def test_without_a_browser_the_link_is_copied_instead_and_shown(monkeypatc
 
 # ---- following a live log ---------------------------------------------------------------------
 from wandb_cli_tool.screens import logs as logs_module
-from wandb_cli_tool.screens.logs import LogsScreen
+from wandb_cli_tool.screens.logs import LogsPane
 
 
 class Growing(FakeClient):
@@ -254,10 +254,10 @@ async def open_logs(pilot, row=0):
     await open_runs(pilot)
     await pilot.press(*["down"] * row, "enter")
     await settle(pilot, 6)
-    await pilot.press("enter")  # the menu's first entry: Logs
+    await pilot.press("2")  # Logs tab
     await settle(pilot, 6)
-    assert isinstance(pilot.app.screen, LogsScreen)
-    return pilot.app.screen
+    assert isinstance(pilot.app.screen, RunScreen) and pilot.app.screen.active_tab == "logs"
+    return pilot.app.screen.logs_pane
 
 
 async def test_the_log_of_a_running_run_is_followed_and_only_new_lines_are_added(monkeypatch):
@@ -408,7 +408,7 @@ async def test_the_follow_key_shows_whether_the_log_is_followed(monkeypatch):
 
         def bar():
             from wandb_cli_tool.screens.keybar import KeyBar
-            return screen.query_one(KeyBar).query_one("KeyLine").render().plain.replace("\xa0", " ")
+            return app.screen.query_one(KeyBar).query_one("KeyLine").render().plain.replace("\xa0", " ")
 
         assert "f ☑ Follow" in bar()
         await pilot.press("f")

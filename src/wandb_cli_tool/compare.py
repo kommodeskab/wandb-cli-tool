@@ -26,6 +26,42 @@ MAX_LIST_ITEMS = 20  # a longer list in a config is shown as one value instead o
 MAX_CONFIG_KEYS = 5000  # a pathological config cannot make the table huge
 VALUE_WIDTH = 60
 MISSING = "—"
+MIN_OVERVIEW_COL = 14  # readable floor before horizontal scrolling kicks in on very narrow screens
+MAX_OVERVIEW_LINES = 4  # cap wrapped overview cell text to roughly this many lines
+
+
+def overview_column_widths(
+    label_width: int,
+    naturals: Sequence[int],
+    available: int,
+    padding: int = 1,
+    min_col: int = MIN_OVERVIEW_COL,
+    fallback_max: int = 80,
+) -> list[int]:
+    """Content width for each run column of the overview table.
+
+    Fits every run into `available` cells without horizontal scrolling whenever possible:
+    columns narrower than an equal share keep their natural width and donate spare cells to
+    wider columns. When `available` cannot fit `min_col` per run, columns stop shrinking at
+    `min(natural, min_col)` so horizontal scrolling takes over while keeping cells readable.
+    """
+    n = len(naturals)
+    if not n:
+        return []
+    if available <= 0:
+        return [min(w, fallback_max) for w in naturals]
+    pad_total = (n + 1) * 2 * padding  # label column + n run columns, both sides
+    budget = available - label_width - pad_total
+    if sum(naturals) <= budget:
+        return list(naturals)
+    remaining = max(budget, 0)
+    widths = [0] * n
+    for pos, i in enumerate(sorted(range(n), key=lambda idx: naturals[idx])):
+        share = remaining // (n - pos)
+        w = min(naturals[i], max(share, min_col))
+        widths[i] = w
+        remaining = max(0, remaining - w)
+    return widths
 
 
 # ---- labels ------------------------------------------------------------------------------

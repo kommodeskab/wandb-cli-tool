@@ -44,9 +44,9 @@ def test_every_binding_has_an_action_to_run():
 
 def test_widget_bindings_that_call_the_screen_exist_on_every_screen_that_shows_them():
     """`screen.focus_chart` and `screen.focus_panels` (chart widgets) need those actions on the screens."""
-    from wandb_cli_tool.screens.charts import ChartsScreen
     from wandb_cli_tool.screens.compare import CompareScreen
+    from wandb_cli_tool.screens.run import RunScreen
 
-    for screen in (ChartsScreen, CompareScreen):
+    for screen in (RunScreen, CompareScreen):
         for action in ("focus_chart", "focus_panels", "cycle_focus"):
             assert hasattr(screen, f"action_{action}"), (screen.__name__, action)

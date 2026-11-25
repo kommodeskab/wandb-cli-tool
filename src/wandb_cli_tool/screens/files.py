@@ -86,35 +86,37 @@ def populate_tree(node: TreeNode, d: DirNode) -> None:
         node.add_leaf(Text.assemble(basename, (f"  {meta}", "dim")), data=info)
 
 
-class FilesScreen(Screen):
+class FilesPane(Vertical):
     """Every file logged by the run, as a folder tree. Enter opens a file (or a folder)."""
 
-    BINDINGS = [
-        Binding("escape", "app.pop_screen", "Back"),
-        Binding("r", "reload", "Refresh"),
-    ]
+    DEFAULT_CSS = """
+    FilesPane { height: 1fr; }
+    FilesPane #status { color: $text-muted; padding: 0 1; }
+    FilesPane #files { height: 1fr; }
+    """
     app: "WandbCliApp"
 
-    def __init__(self, ref: RunRef, name: str) -> None:
-        super().__init__()
+    def __init__(self, ref: RunRef, name: str, **kwargs) -> None:
+        super().__init__(**kwargs)
         self.ref = ref
         self.run_name = name
+        self._started = False
 
     def compose(self) -> ComposeResult:
-        yield Header()
         yield Static("Loading…", id="status")
         yield Tree("files", id="files")
-        yield KeyBar()
 
     def on_mount(self) -> None:
-        self.title = f"Files — {self.run_name}"
-        tree = self.query_one("#files", Tree)
-        tree.show_root = False
-        tree.focus()
-        self.load()
+        self.query_one("#files", Tree).show_root = False
+
+    def activate(self) -> None:
+        if not self._started:
+            self._started = True
+            self.load()
 
     def action_reload(self) -> None:
         self.query_one("#files", Tree).clear()
+        self._status("Loading…")
         self.load()
 
     def _status(self, text: str) -> None:

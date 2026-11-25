@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, Sequence
 
 from .palette import MAX_SERIES
 
 SYSTEM_PANEL = "System"
 OTHER_PANEL = "Other"  # metrics without a "/" in their name
+TABLES_PANEL = "Tables"
+IMAGES_PANEL = "Images"
 
 STEP = "_step"
 RUNTIME = "_runtime"
@@ -171,8 +173,13 @@ def x_options(metrics: list[str], system: bool) -> list[tuple[str, str]]:
     return [(axis_label(STEP), STEP), *options, *((m, m) for m in metrics)]
 
 
-def build_panels(metrics: list[str], system_metrics: list[str]) -> list[Panel]:
-    """System first, then one panel per metric prefix (alphabetical), "Other" last."""
+def build_panels(
+    metrics: list[str],
+    system_metrics: list[str],
+    tables: Sequence[str] = (),
+    images: Sequence[str] = (),
+) -> list[Panel]:
+    """System first, then metric-prefix panels (alphabetical), "Other", "Tables" and "Images"."""
     groups: dict[str, list[ChartSpec]] = {}
     for key in metrics:
         groups.setdefault(panel_name(key), []).append(ChartSpec(key))
@@ -180,10 +187,16 @@ def build_panels(metrics: list[str], system_metrics: list[str]) -> list[Panel]:
         SYSTEM_PANEL, [ChartSpec(k, RUNTIME, system=True) for k in system_metrics]
     )
     system.charts.extend(groups.pop(SYSTEM_PANEL, []))  # a user panel named "System" merges
+    tables_extra = groups.pop(TABLES_PANEL, []) if tables else []
+    images_extra = groups.pop(IMAGES_PANEL, []) if images else []
     other = groups.pop(OTHER_PANEL, None)
     panels = [system, *(Panel(n, c) for n, c in sorted(groups.items()))]
     if other:
         panels.append(Panel(OTHER_PANEL, other))
+    if tables:
+        panels.append(Panel(TABLES_PANEL, [ChartSpec(k, kind=TABLE) for k in tables] + tables_extra))
+    if images:
+        panels.append(Panel(IMAGES_PANEL, [ChartSpec(k, kind=IMAGE) for k in images] + images_extra))
     return panels
 
 
@@ -199,8 +212,17 @@ MAX_PANELS, MAX_CHARTS = 200, 1000  # sanity limits when reading a file
 
 
 def chart_key(spec: ChartSpec) -> str:
-    """Identifies a generated chart inside its panel (used for x-axis overrides)."""
+    """Identifies a generated chart inside its panel."""
+    if spec.kind != PLOT:
+        return f"{spec.kind}:{spec.y}"
     return f"{int(spec.system)}:{spec.y}"
+
+
+def _spec_to_json(c: ChartSpec) -> dict[str, Any]:
+    return {
+        "y": c.y, "x": c.x, "system": c.system, "kind": c.kind, "more": list(c.more),
+        **({} if c.opts.is_default else {"opts": c.opts.to_json()}),
+    }
 
 
 def _spec_from_json(c: Any) -> ChartSpec | None:
@@ -225,25 +247,25 @@ class Customization:
     x: dict[str, dict[str, str]] = field(default_factory=dict)  # panel -> chart_key -> x-axis
     removed: dict[str, list[str]] = field(default_factory=dict)  # panel -> chart_keys of deleted generated charts
     opts: dict[str, dict[str, ChartOptions]] = field(default_factory=dict)  # panel -> chart_key -> options
+    removed_panels: list[str] = field(default_factory=list)  # generated panels the user deleted
+    edited: dict[str, dict[str, ChartSpec]] = field(default_factory=dict)  # panel -> chart_key -> edited spec
 
     @property
     def is_empty(self) -> bool:
-        return not (self.panels or self.added or self.x or self.removed or self.opts)
+        return not (
+            self.panels or self.added or self.x or self.removed or self.opts
+            or self.removed_panels or self.edited
+        )
 
     def to_json(self) -> dict[str, Any]:
         return {
             "panels": list(self.panels),
-            "added": {
-                p: [
-                    {"y": c.y, "x": c.x, "system": c.system, "kind": c.kind, "more": list(c.more),
-                     **({} if c.opts.is_default else {"opts": c.opts.to_json()})}
-                    for c in specs
-                ]
-                for p, specs in self.added.items()
-            },
+            "added": {p: [_spec_to_json(c) for c in specs] for p, specs in self.added.items()},
             "x": {p: dict(m) for p, m in self.x.items()},
             "removed": {p: list(keys) for p, keys in self.removed.items()},
             "opts": {p: {k: o.to_json() for k, o in m.items()} for p, m in self.opts.items()},
+            "removed_panels": list(self.removed_panels),
+            "edited": {p: {k: _spec_to_json(c) for k, c in m.items()} for p, m in self.edited.items()},
         }
 
     @staticmethod
@@ -287,7 +309,31 @@ class Customization:
                     good_keys = [k for k in keys if isinstance(k, str)]
                     if good_keys:
                         out.removed[panel] = good_keys
+        removed_panels = data.get("removed_panels")
+        if isinstance(removed_panels, list):
+            out.removed_panels = list(dict.fromkeys(p for p in removed_panels if isinstance(p, str) and p))[:MAX_PANELS]
+        edited = data.get("edited")
+        if isinstance(edited, dict):
+            for panel, overrides in edited.items():
+                if isinstance(panel, str) and isinstance(overrides, dict):
+                    good_edited = {
+                        k: spec for k, v in overrides.items()
+                        if isinstance(k, str) and (spec := _spec_from_json(v)) is not None
+                    }
+                    if good_edited:
+                        out.edited[panel] = good_edited
         return out
+
+
+def _resolve_generated(panel: str, c: ChartSpec, custom: Customization) -> ChartSpec:
+    k = chart_key(c)
+    if k in custom.edited.get(panel, ()):
+        return custom.edited[panel][k]
+    return replace(
+        c,
+        x=custom.x.get(panel, {}).get(k, c.x),
+        opts=custom.opts.get(panel, {}).get(k, c.opts),
+    )
 
 
 def apply_customization(default: list[Panel], custom: Customization) -> list[Panel]:
@@ -296,16 +342,13 @@ def apply_customization(default: list[Panel], custom: Customization) -> list[Pan
         Panel(
             p.name,
             [
-                replace(
-                    c,
-                    x=custom.x.get(p.name, {}).get(chart_key(c), c.x),
-                    opts=custom.opts.get(p.name, {}).get(chart_key(c), c.opts),
-                )
+                _resolve_generated(p.name, c, custom)
                 for c in p.charts
                 if chart_key(c) not in custom.removed.get(p.name, ())
             ],
         )
         for p in default
+        if p.name not in custom.removed_panels
     ]
     by_name = {p.name: p for p in panels}
 
@@ -344,11 +387,25 @@ class ChartLayout:
         return next((i for i, p in enumerate(self.panels) if p.name == name), 0)
 
     def add_panel(self, name: str) -> int:
-        """Create a panel (or just find the existing one); returns its index."""
-        if all(p.name != name for p in self.panels):
+        """Create a panel (or bring back / find an existing one); returns its index."""
+        if name in self.custom.removed_panels:
+            self.custom.removed_panels.remove(name)
+            self._rebuild()
+        if all(p.name != name for p in self.panels) and name not in self._default_by_name:
             self.custom.panels.append(name)
             self._rebuild()
         return self.index_of(name)
+
+    def remove_panel(self, panel_index: int) -> None:
+        """Delete a panel. User panels are dropped; generated panels are remembered as removed."""
+        name = self.panels[panel_index].name
+        if name in self.custom.panels:
+            self.custom.panels.remove(name)
+        if name in self._default_by_name and name not in self.custom.removed_panels:
+            self.custom.removed_panels.append(name)
+        for store in (self.custom.added, self.custom.x, self.custom.opts, self.custom.removed, self.custom.edited):
+            store.pop(name, None)
+        self._rebuild()
 
     def add_chart(self, panel_index: int, spec: ChartSpec) -> int:
         """Append a chart to a panel; returns its index within the panel."""
@@ -365,15 +422,24 @@ class ChartLayout:
         return [c for c in generated if chart_key(c) not in removed]
 
     def set_chart(self, panel_index: int, chart_index: int, spec: ChartSpec) -> None:
-        """Change a chart (its x-axis and options). Generated charts record overrides, added
-        charts are edited in place."""
+        """Change a chart (its definition, x-axis and options). Generated charts record overrides
+        or a replacement spec; added charts are edited in place."""
         name = self.panels[panel_index].name
         generated = self._visible_generated(name)
         if chart_index < len(generated):
             original = generated[chart_index]
             key = chart_key(original)
-            self._override(self.custom.x, name, key, spec.x, original.x)
-            self._override(self.custom.opts, name, key, spec.opts, original.opts)
+            same_shape = (spec.y, spec.more, spec.system, spec.kind) == (
+                original.y, original.more, original.system, original.kind
+            )
+            if same_shape:
+                self._override(self.custom.edited, name, key, None, None)
+                self._override(self.custom.x, name, key, spec.x, original.x)
+                self._override(self.custom.opts, name, key, spec.opts, original.opts)
+            else:
+                self._override(self.custom.x, name, key, original.x, original.x)
+                self._override(self.custom.opts, name, key, original.opts, original.opts)
+                self._override(self.custom.edited, name, key, spec, None)
         else:
             self.custom.added[name][chart_index - len(generated)] = spec
         self._rebuild()
@@ -397,7 +463,7 @@ class ChartLayout:
         if chart_index < len(generated):
             key = chart_key(generated[chart_index])
             self.custom.removed.setdefault(name, []).append(key)
-            for store in (self.custom.x, self.custom.opts):  # settings of a deleted chart are moot
+            for store in (self.custom.x, self.custom.opts, self.custom.edited):  # settings of a deleted chart are moot
                 overrides = store.get(name)
                 if overrides is not None:
                     overrides.pop(key, None)

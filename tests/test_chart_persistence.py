@@ -10,10 +10,10 @@ from wandb_cli_tool.config import Credentials
 from wandb_cli_tool.layout_store import LayoutStore
 from wandb_cli_tool.screens.charts import ChartView
 from chart_helpers import add_plot
-from wandb_cli_tool.screens.chart_dialogs import AxisDialog
+from wandb_cli_tool.screens.chart_dialogs import ChartOptionsDialog
 from wandb_cli_tool.screens.dialogs import ConfirmDialog
 
-DEFAULT_PANELS = ["System (2)", "trainer (2)", "val (1)", "Other (1)"]
+DEFAULT_PANELS = ["System (2)", "trainer (2)", "val (1)", "Other (1)", "Tables (2)", "Images (2)"]
 
 
 def saved_file():
@@ -47,7 +47,7 @@ async def test_added_panels_and_charts_survive_closing_and_reopening_the_app(mak
     async with app2.run_test(size=(130, 45)) as pilot:
         screen = await open_charts(pilot)
         assert panel_labels(screen) == DEFAULT_PANELS + ["mine (1)"]
-        await pilot.press("down", "down", "down", "down")  # select "mine"
+        await pilot.press(*["down"] * (len(DEFAULT_PANELS)))  # select "mine"
         await settle(pilot, 5)
         (view,) = screen.query(ChartView)
         assert (view.spec.y, view.spec.x) == ("trainer/loss", "trainer/global_steps")
@@ -76,9 +76,9 @@ async def test_an_x_axis_change_on_a_generated_chart_persists(make_app):
         screen = await open_charts(pilot)
         await pilot.press("down")  # trainer
         await settle(pilot, 4)
-        await pilot.press("right", "down", "x")  # second chart: trainer/loss
+        await pilot.press("right", "down", "o")  # second chart: trainer/loss
         await settle(pilot)
-        assert isinstance(app.screen, AxisDialog)
+        assert isinstance(app.screen, ChartOptionsDialog)
         app.screen.query_one("#x", Select).value = "acc"
         await pilot.click("#ok")
         await settle(pilot, 5)
@@ -101,7 +101,7 @@ async def test_new_metrics_still_appear_next_to_saved_customizations(make_app, m
     app2 = make_app()
     async with app2.run_test(size=(130, 45)) as pilot:
         screen = await open_charts(pilot)
-        assert panel_labels(screen) == ["System (2)", "trainer (3)", "val (1)", "Other (1)", "mine (1)"]
+        assert panel_labels(screen) == ["System (2)", "trainer (3)", "val (1)", "Other (1)", "Tables (2)", "Images (2)", "mine (1)"]
 
 
 async def test_reset_asks_first_and_then_restores_the_default(make_app):
@@ -139,7 +139,7 @@ async def test_reset_also_undoes_x_axis_choices(make_app):
     app = make_app()
     async with app.run_test(size=(130, 45)) as pilot:
         screen = await open_charts(pilot)
-        await pilot.press("down", "right", "x")
+        await pilot.press("down", "right", "o")
         await settle(pilot)
         app.screen.query_one("#x", Select).value = "acc"
         await pilot.click("#ok")

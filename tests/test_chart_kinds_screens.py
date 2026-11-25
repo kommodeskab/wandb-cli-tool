@@ -12,7 +12,7 @@ from wandb_cli_tool.config import Credentials
 from wandb_cli_tool.layout_store import LayoutStore, project_key
 from wandb_cli_tool.palette import SERIES_DARK, SERIES_LIGHT, hex_to_rgb
 from wandb_cli_tool.screens.chart_dialogs import (
-    AxisDialog, BarDialog, ChartKindDialog, MetricPicker, PlotDialog, TableDialog,
+    BarDialog, ChartKindDialog, ChartOptionsDialog, MetricPicker, PlotDialog, TableDialog,
 )
 from wandb_cli_tool.screens.chart_widgets import BarView, ChartView, TableView
 from wandb_cli_tool.tables import TableData
@@ -54,7 +54,7 @@ async def test_the_kind_dialog_offers_plot_bar_and_table(make_app):
         assert all("not available" not in l for l in labels)
         await pilot.press("escape")
         await settle(pilot)
-        assert app.screen is screen and panel_labels(screen)[0] == "System (2)"  # nothing was added
+        assert app.screen is screen.screen and panel_labels(screen)[0] == "System (2)"  # nothing was added
 
 
 async def test_unavailable_kinds_are_greyed_out_with_the_reason_and_cannot_be_chosen(make_app, monkeypatch):
@@ -102,8 +102,8 @@ async def test_a_plot_shows_several_values_with_a_legend_and_palette_colors_in_o
         # one request per series, all against the shared x-axis
         assert sorted(app.client.series_calls[-3:]) == sorted((n, "_step") for n in names)
         drawn = [c for c in calls if "color" in c]
-        assert [c["label"] for c in drawn] == names  # colliding short names fall back to full names
-        assert [c["color"] for c in drawn] == [hex_to_rgb(c) for c in SERIES_DARK[:3]]  # fixed slot order
+        assert [c["label"] for c in drawn] == list(reversed(names))  # colliding short names fall back; #1 drawn last (on top)
+        assert [c["color"] for c in drawn] == [hex_to_rgb(c) for c in reversed(SERIES_DARK[:3])]  # fixed slot order
         assert panel_labels(screen)[-1] == "mine (1)"
 
 
@@ -148,7 +148,45 @@ async def test_light_themes_use_the_light_palette(monkeypatch):
         view.plt.plot = lambda *a, **k: (calls.append(k), original(*a, **k))[1]
         app.theme = "textual-light"
         view.show({"a": [(0, 1), (1, 2)], "b": [(0, 2), (1, 1)]})
-        assert [c["color"] for c in calls] == [hex_to_rgb(c) for c in SERIES_LIGHT[:2]]
+        assert [c["color"] for c in calls] == [hex_to_rgb(c) for c in reversed(SERIES_LIGHT[:2])]
+
+
+async def test_plot_dialog_shows_and_reorders_selected_metrics_and_sizes_lists(make_app, monkeypatch):
+    calls = plot_spy(monkeypatch)
+    app, ctx = await start(make_app)
+    async with ctx as pilot:
+        screen = await mine(pilot)
+        dialog = await start_add(pilot, "plot")
+        assert isinstance(dialog, PlotDialog)
+        assert dialog.query_one("#choices", SelectionList).styles.height.value == 12
+        assert dialog.query_one("#order", OptionList).styles.height.value == 10
+        await pick(pilot, dialog, (False, "acc"), (False, "trainer/loss"), (False, "val/loss"))
+        order = dialog.query_one("#order", OptionList)
+        assert [str(order.get_option_at_index(i).prompt) for i in range(order.option_count)] == [
+            "1. acc", "2. trainer/loss", "3. val/loss",
+        ]
+        order.focus()
+        await pilot.press("ctrl+up")  # move val/loss from #3 to #2, then to #1
+        await pilot.press("ctrl+up")
+        await settle(pilot, 3)
+        assert [str(order.get_option_at_index(i).prompt) for i in range(order.option_count)] == [
+            "1. val/loss", "2. acc", "3. trainer/loss",
+        ]
+        calls.clear()
+        await pilot.click("#ok")
+        await settle(pilot, 5)
+        (view,) = of(screen, ChartView)
+        assert view.spec.series == ("val/loss", "acc", "trainer/loss")
+        drawn = [c for c in calls if "color" in c]
+        # Top priority series ("val/loss") is plotted last (on top) with slot 0's color
+        assert drawn[-1]["label"] == "val/loss" and drawn[-1]["color"] == hex_to_rgb(SERIES_DARK[0])
+
+        # BarDialog also uses the taller lists
+        bar_dialog = await start_add(pilot, "bar")
+        assert bar_dialog.query_one("#choices", SelectionList).styles.height.value == 12
+        assert bar_dialog.query_one("#order", OptionList).styles.height.value == 10
+        await pilot.press("escape")
+        await settle(pilot)
 
 
 async def test_a_plot_holds_at_most_eight_values_and_never_a_ninth_color(make_app, monkeypatch):
@@ -354,7 +392,7 @@ async def test_tables_are_fetched_once_per_session(make_app):
         await add_table(pilot, "preds")
         await pilot.press("up")  # other panel and back
         await settle(pilot, 4)
-        await pilot.press("down", "down", "down", "down")
+        await pilot.press("down")
         await settle(pilot, 4)
         assert of(app.screen, TableView) and app.client.table_calls == [PREDS]
 
@@ -377,8 +415,7 @@ async def test_a_saved_table_that_no_longer_exists_says_so(make_app):
     app = make_app()
     async with app.run_test(size=SIZE) as pilot:
         screen = await open_charts(pilot)
-        await pilot.press("down", "down", "down", "down")
-        await settle(pilot, 5)
+        await show(pilot, screen, "mine")
         assert "no logged table called “vanished”" in screen_text(app)
 
 
@@ -396,7 +433,7 @@ async def test_big_tables_report_how_much_is_shown(make_app, monkeypatch):
 # ---- using the charts ------------------------------------------------------------------------------
 
 
-async def test_the_x_axis_key_only_applies_to_plots(make_app):
+async def test_the_x_axis_key_is_removed_and_o_edits_charts(make_app):
     app, ctx = await start(make_app)
     async with ctx as pilot:
         screen = await mine(pilot)
@@ -404,7 +441,7 @@ async def test_the_x_axis_key_only_applies_to_plots(make_app):
         assert isinstance(app.focused, BarView)
         await pilot.press("x")
         await settle(pilot)
-        assert app.screen is screen and any("only applies to plots" in n.message for n in app._notifications)
+        assert app.screen is screen.screen  # x is not bound; editing lives under o
 
 
 async def test_changing_the_x_axis_of_a_multi_series_plot_changes_all_its_series(make_app):
@@ -412,10 +449,10 @@ async def test_changing_the_x_axis_of_a_multi_series_plot_changes_all_its_series
     async with ctx as pilot:
         screen = await mine(pilot)
         await add_plot(pilot, (False, "trainer/loss"), (False, "val/loss"))
-        await pilot.press("x")
+        await pilot.press("o")
         await settle(pilot)
         dialog = app.screen
-        assert isinstance(dialog, AxisDialog) and "trainer/loss, val/loss" in screen_text(app)
+        assert isinstance(dialog, ChartOptionsDialog) and "trainer/loss, val/loss" in screen_text(app)
         dialog.query_one("#x", Select).value = "acc"
         await pilot.click("#ok")
         await settle(pilot, 5)
@@ -458,8 +495,7 @@ async def test_chart_kinds_and_their_settings_survive_restarting_the_app(make_ap
     app2 = make_app()
     async with app2.run_test(size=SIZE) as pilot:
         screen = await open_charts(pilot)
-        await pilot.press("down", "down", "down", "down")
-        await settle(pilot, 6)
+        await show(pilot, screen, "mine")
         (plot,), (bar,), (table,) = of(screen, ChartView), of(screen, BarView), of(screen, TableView)
         assert (plot.spec.series, plot.spec.x) == (("trainer/loss", "val/loss"), "acc")
         assert bar.spec.series == ("val/loss", "acc") and bar.items == [("val/loss", 0.4), ("acc", 0.9)]

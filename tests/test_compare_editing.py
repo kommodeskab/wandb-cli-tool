@@ -8,7 +8,7 @@ from conftest import FakeClient
 from test_compare_screen import MediaClient, WideClient, compare, keys_of, make, settle
 from wandb_cli_tool.charts import BAR, IMAGE, PLOT, TABLE, ChartOptions, ChartSpec, chart_key
 from wandb_cli_tool.layout_store import LayoutStore, project_key
-from wandb_cli_tool.screens.chart_dialogs import AxisDialog, ChartOptionsDialog
+from wandb_cli_tool.screens.chart_dialogs import ChartOptionsDialog
 from wandb_cli_tool.screens.compare_widgets import (
     CompareBarView, CompareImageView, ComparePlotView, CompareTableView,
 )
@@ -59,7 +59,7 @@ async def test_the_editing_keys_exist_only_on_the_charts_tab():
         assert screen.check_action("add_chart", ()) is True and screen.check_action("new_panel", ()) is True
         bar = keys_of(screen)
         assert "New panel" in bar and "Add chart" in bar
-        assert "X-axis" not in bar and "Delete chart" not in bar and "Default layout" not in bar  # nothing focused / customized
+        assert "X-axis" not in bar and "Delete panel" in bar and "Default layout" not in bar  # panel list focused
         await pilot.press("3")
         await settle(pilot, 4)
         assert "Add chart" not in keys_of(screen) and "Hide identical rows" in keys_of(screen)  # `i` takes the old place of `d` there
@@ -112,12 +112,12 @@ async def test_an_added_chart_is_there_when_a_single_run_is_opened_and_back():
         await add_plot(pilot, (False, "trainer/loss"))
         await pilot.press("escape")  # back to the run list ...
         await settle(pilot, 4)
-        await pilot.press("enter")  # ... open run-1, then its charts
+        await pilot.press("enter")  # ... open run-1, then its Charts tab
         await settle(pilot, 6)
-        await pilot.press("down", "enter")
+        await pilot.press("3")
         await settle(pilot, 8)
-        from wandb_cli_tool.screens.charts import ChartsScreen
-        assert isinstance(app.screen, ChartsScreen)
+        from wandb_cli_tool.screens.run import RunScreen
+        assert isinstance(app.screen, RunScreen) and app.screen.active_tab == "charts"
         assert any(l.startswith("mine (1)") for l in [str(app.screen.query_one("#panels", OptionList).get_option_at_index(i).prompt)
                                                        for i in range(app.screen.query_one("#panels", OptionList).option_count)])
 
@@ -137,10 +137,10 @@ async def test_the_x_axis_of_a_split_plot_changes_for_all_its_plots():
     async with app.run_test(size=(150, 50)) as pilot:
         screen = await mine(pilot)
         await add_plot(pilot, (False, "trainer/loss"), (False, "val/loss"))
-        await pilot.press("x")
+        await pilot.press("o")
         await settle(pilot)
         dialog = app.screen
-        assert isinstance(dialog, AxisDialog)
+        assert isinstance(dialog, ChartOptionsDialog)
         dialog.query_one("#x", Select).value = "_runtime"
         await pilot.click("#ok")
         await settle(pilot, 8)
@@ -246,3 +246,48 @@ async def test_editing_works_when_the_runs_share_no_metrics_with_the_layout():
         await add_plot(pilot, (False, "val/loss"))
         [view] = screen.query(ComparePlotView)
         assert "no data: run-2" in str(view.border_subtitle)
+
+
+async def test_compare_auto_panels_panel_delete_and_editing_tables_or_images():
+    from wandb_cli_tool.tables import TableData, TableInfo
+
+    class TwoTablesMedia(MediaClient):
+        def run_tables(self, ref):
+            return (
+                [TableInfo("preds", f"media/table/{ref.id}.table.json", 2, 2),
+                 TableInfo("results", "media/table/results.table.json", 1, 2)]
+                if ref.id != "id2" else []
+            )
+
+        def table_data(self, ref, path):
+            if path == "media/table/results.table.json":
+                return TableData(("metric", "val"), (("acc", "0.9"),), 1, 2)
+            return super().table_data(ref, path)
+
+    app = make(TwoTablesMedia)
+    async with app.run_test(size=(150, 60)) as pilot:
+        screen = await to_charts(pilot)
+        assert any(l.startswith("Tables (") for l in labels(screen))
+        assert any(l.startswith("Images (") for l in labels(screen))
+
+        # delete the Images panel from #panels
+        await show(pilot, screen, "Images")
+        screen.query_one("#panels", OptionList).focus()
+        await settle(pilot)
+        await pilot.press("delete", "y")
+        await settle(pilot, 8)
+        assert not any(l.startswith("Images (") for l in labels(screen))
+        assert saved().removed_panels == ["Images"]
+
+        # edit a table in the Tables panel via `o`
+        await show(pilot, screen, "Tables")
+        screen.query(CompareTableView).first().focus()
+        await settle(pilot)
+        await pilot.press("o")
+        await settle(pilot)
+        dialog = app.screen
+        assert isinstance(dialog, ChartOptionsDialog) and dialog.kind == TABLE
+        dialog.query_one("#table", Select).value = "results"
+        await pilot.click("#ok")
+        await settle(pilot, 8)
+        assert screen.query(CompareTableView).first().spec.y == "results"

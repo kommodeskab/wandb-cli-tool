@@ -8,44 +8,70 @@ from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.containers import VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Header, OptionList, Static
-from textual.widgets.option_list import Option
+from textual.widgets import Header, Static, TabbedContent, TabPane
 
 from ..api import CopyEstimate, RunInfo, RunMetadata, RunRef
 from .keybar import KeyBar
 from ..plain import plain
 from ..runfacts import summary_fields
-from .charts import ChartsScreen
-from .config import ConfigScreen
+from .charts import ChartsPane
+from .config import ConfigPane
 from .copy import CopyOutcome, CopyProgressScreen, describe_copy
 from .dialogs import (
     ConfirmDialog, DeleteChoice, DeleteRunsDialog, GroupDialog, RenameDialog, TagsDialog,
 )
-from .files import FilesScreen
-from .logs import LogsScreen
+from .files import FilesPane
+from .logs import LogsPane
 
 if TYPE_CHECKING:
     from ..app import WandbCliApp
 
+CHARTS_ACTIONS = (
+    "new_panel",
+    "add_chart",
+    "delete_item",
+    "reset_layout",
+    "cycle_focus",
+    "focus_chart",
+    "focus_panels",
+)
+
+
 class RunScreen(Screen):
-    """A run: tags and key facts at the top, then a menu (Logs, Charts, Config, Files)."""
+    """A run: five tabs (Overview, Logs, Charts, Config, Files) switched with 1–5."""
 
     BINDINGS = [
         Binding("escape", "app.pop_screen", "Back"),
+        Binding("1", "tab('overview')", "Overview"),
+        Binding("2", "tab('logs')", "Logs"),
+        Binding("3", "tab('charts')", "Charts"),
+        Binding("4", "tab('config')", "Config"),
+        Binding("5", "tab('files')", "Files"),
         Binding("g", "set_group", "Set group"),
         Binding("t", "add_tags", "Add tags"),
-        Binding("r", "rename", "Rename"),
+        Binding("r", "run_r", "Rename"),
         Binding("c", "copy_run", "Copy run"),
         Binding("s", "stop_run", "Stop run"),
-        Binding("delete", "delete_run", "Delete run"),
-        Binding("o", "open_in_browser", "Open in browser"),
+        Binding("delete", "run_delete", "Delete run"),
+        Binding("backspace", "delete_item", "Delete chart", show=False),
+        Binding("o", "run_o", "Open in browser"),
+        Binding("f", "run_f", "Follow"),
+        Binding("n", "new_panel", "New panel"),
+        Binding("a", "add_chart", "Add chart"),
+        Binding("d", "reset_layout", "Default layout"),
+        Binding("tab", "cycle_focus(1)", "Next chart"),
+        Binding("shift+tab", "cycle_focus(-1)", "Previous", show=False),
+        Binding("right", "focus_chart(0)", "Charts", show=False),
     ]
     DEFAULT_CSS = """
+    #tabs { height: 1fr; }
+    RunScreen TabPane { height: 1fr; padding: 0; }
+    #overview { height: 1fr; }
     #tags { padding: 1 1 0 1; }
     #info { padding: 0 1; }
     #info-wide { padding: 0 1 1 1; }
-    #menu { height: auto; margin: 0 1; }
     """
     app: "WandbCliApp"
 
@@ -66,24 +92,49 @@ class RunScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static("Tags: …", id="tags")
-        yield Static("", id="info")
-        yield Static("", id="info-wide")
-        yield OptionList(
-            Option("Logs", id="logs"),
-            Option("Charts", id="charts"),
-            Option("Config", id="config"),
-            Option("Files", id="files"),
-            id="menu",
-        )
+        with TabbedContent(initial="overview-pane", id="tabs"):
+            with TabPane("Overview", id="overview-pane"):
+                with VerticalScroll(id="overview"):
+                    yield Static("Tags: …", id="tags")
+                    yield Static("", id="info")
+                    yield Static("", id="info-wide")
+            with TabPane("Logs", id="logs-pane"):
+                yield LogsPane(self.ref, self.run_name, id="logs-view")
+            with TabPane("Charts", id="charts-pane"):
+                yield ChartsPane(self.ref, self.run_name, id="charts-view")
+            with TabPane("Config", id="config-pane"):
+                yield ConfigPane(self.ref, self.run_name, id="config-view")
+            with TabPane("Files", id="files-pane"):
+                yield FilesPane(self.ref, self.run_name, id="files-view")
         yield KeyBar()
+
+    @property
+    def active_tab(self) -> str:
+        try:
+            return (self.query_one("#tabs", TabbedContent).active or "").removesuffix("-pane")
+        except Exception:
+            return "overview"
+
+    @property
+    def logs_pane(self) -> LogsPane:
+        return self.query_one("#logs-view", LogsPane)
+
+    @property
+    def charts_pane(self) -> ChartsPane:
+        return self.query_one("#charts-view", ChartsPane)
+
+    @property
+    def config_pane(self) -> ConfigPane:
+        return self.query_one("#config-view", ConfigPane)
+
+    @property
+    def files_pane(self) -> FilesPane:
+        return self.query_one("#files-view", FilesPane)
 
     def on_mount(self) -> None:
         self.title = f"Run — {self.run_name}"
         self.sub_title = self.ref.path
-        menu = self.query_one("#menu", OptionList)
-        menu.highlighted = 0
-        menu.focus()
+        self.query_one("#overview").focus()
         self._render_info()
         self.load_details()
         self.load_metadata()
@@ -108,6 +159,7 @@ class RunScreen(Screen):
 
     def _set_info(self, info: RunInfo) -> None:
         self.info = info
+        self.logs_pane.set_live(info.state == "running")
         self._render_info()
         self.refresh_bindings()  # "Stop run" only applies while the run is running
 
@@ -150,24 +202,127 @@ class RunScreen(Screen):
         self.query_one("#info-wide", Static).update(wide_grid)
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
+        tab = self.active_tab
         if action == "stop_run":
-            return self.info is not None and self.info.state == "running"
+            return tab == "overview" and self.info is not None and self.info.state == "running"
+        if action in ("set_group", "add_tags", "copy_run"):
+            return tab == "overview"
+        if action == "run_r":
+            return tab in ("overview", "logs", "charts", "files")
+        if action == "run_delete":
+            if tab == "overview":
+                return True
+            return self.charts_pane.check_action("delete_item", ()) if tab == "charts" else False
+        if action == "run_o":
+            if tab == "overview":
+                return True
+            return self.charts_pane.check_action("chart_options", ()) if tab == "charts" else False
+        if action == "run_f":
+            if tab == "logs":
+                return self.logs_pane.check_action("toggle_follow", ())
+            if tab == "charts":
+                return self.charts_pane.check_action("cycle_refresh", ())
+            return False
+        if action in CHARTS_ACTIONS:
+            return self.charts_pane.check_action(action, parameters) if tab == "charts" else False
         return True
 
-    # ---- navigation ----------------------------------------------------
-    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+    def key_label(self, action: str) -> str | None:
+        tab = self.active_tab
+        if action == "run_r":
+            return {"overview": "Rename", "logs": "Reload", "charts": "Refresh", "files": "Refresh"}.get(tab)
+        if action == "run_delete":
+            return self.charts_pane.chart_key_label("delete_item") if tab == "charts" else "Delete run"
+        if action == "run_o":
+            return "Chart options" if tab == "charts" else "Open in browser"
+        if action == "run_f":
+            return self.charts_pane.key_label("cycle_refresh") if tab == "charts" else "Follow"
+        return None
+
+    def toggle_state(self, action: str) -> bool | None:
+        if action == "run_f" and self.active_tab == "logs":
+            return self.logs_pane.toggle_state("toggle_follow")
+        return None
+
+    # ---- tab switching and shared bindings -----------------------------
+    def action_tab(self, name: str) -> None:
+        self.query_one("#tabs", TabbedContent).active = f"{name}-pane"
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         event.stop()
-        screens = {
-            "logs": LogsScreen,
-            "charts": ChartsScreen,
-            "config": ConfigScreen,
-            "files": FilesScreen,
-        }
-        if event.option.id == "logs":  # a running run's log is followed
-            live = self.info is not None and self.info.state == "running"
-            self.app.push_screen(LogsScreen(self.ref, self.run_name, live))
-            return
-        self.app.push_screen(screens[str(event.option.id)](self.ref, self.run_name))
+        tab = self.active_tab
+        if tab == "logs":
+            self.logs_pane.activate(self.info.state == "running" if self.info is not None else None)
+            self.query_one("#log").focus()
+        elif tab == "charts":
+            self.charts_pane.activate()
+            self.query_one("#panels").focus()
+        elif tab == "config":
+            self.config_pane.activate()
+            self.query_one("#config").focus()
+        elif tab == "files":
+            self.files_pane.activate()
+            self.query_one("#files").focus()
+        else:
+            self.query_one("#overview").focus()
+        self.refresh_bindings()
+
+    def action_run_r(self) -> None:
+        tab = self.active_tab
+        if tab == "overview":
+            self.action_rename()
+        elif tab == "logs":
+            self.logs_pane.action_reload()
+        elif tab == "charts":
+            self.charts_pane.action_refresh_now()
+        elif tab == "files":
+            self.files_pane.action_reload()
+
+    def action_run_delete(self) -> None:
+        if self.active_tab == "charts":
+            self.charts_pane.action_delete_item()
+        elif self.active_tab == "overview":
+            self.action_delete_run()
+
+    def action_run_o(self) -> None:
+        if self.active_tab == "charts":
+            self.charts_pane.action_chart_options()
+        elif self.active_tab == "overview":
+            self.action_open_in_browser()
+
+    def action_run_f(self) -> None:
+        if self.active_tab == "logs":
+            self.logs_pane.action_toggle_follow()
+        elif self.active_tab == "charts":
+            self.charts_pane.action_cycle_refresh()
+
+    def action_new_panel(self) -> None:
+        if self.active_tab == "charts":
+            self.charts_pane.action_new_panel()
+
+    def action_add_chart(self) -> None:
+        if self.active_tab == "charts":
+            self.charts_pane.action_add_chart()
+
+    def action_delete_item(self) -> None:
+        if self.active_tab == "charts":
+            self.charts_pane.action_delete_item()
+
+    def action_reset_layout(self) -> None:
+        if self.active_tab == "charts":
+            self.charts_pane.action_reset_layout()
+
+    def action_focus_chart(self, delta: int) -> None:
+        if self.active_tab == "charts":
+            self.charts_pane.action_focus_chart(delta)
+
+    def action_focus_panels(self) -> None:
+        if self.active_tab == "charts":
+            self.charts_pane.action_focus_panels()
+
+    def action_cycle_focus(self, delta: int) -> None:
+        if self.active_tab == "charts":
+            self.charts_pane.action_cycle_focus(delta)
 
     def _mark_project_edited(self) -> None:
         """Tell the runs list (behind this screen) that its rows are out of date."""

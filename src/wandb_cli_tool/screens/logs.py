@@ -5,13 +5,11 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
-from textual.binding import Binding
-from textual.screen import Screen
-from textual.widgets import Header, RichLog, Static
+from textual.containers import Vertical
+from textual.widgets import RichLog, Static
 from textual.worker import get_current_worker
 
 from ..api import RunRef
-from .keybar import KeyBar
 from ..plain import plain
 
 if TYPE_CHECKING:
@@ -21,38 +19,67 @@ BATCH_SIZE = 200
 FOLLOW_SECONDS = 5  # how often a followed (live) log is checked for new lines
 
 
-class LogsScreen(Screen):
+class LogsPane(Vertical):
     """Terminal output of a run. Scroll with arrows/PageUp/PageDown/Home/End. A run that is still
     running is followed: new lines are added (and shown) every few seconds; `f` turns that off."""
 
-    BINDINGS = [
-        Binding("escape", "app.pop_screen", "Back"),
-        Binding("r", "reload", "Reload"),
-        Binding("f", "toggle_follow", "Follow"),
-    ]
+    DEFAULT_CSS = """
+    LogsPane { height: 1fr; }
+    LogsPane #status { color: $text-muted; padding: 0 1; }
+    LogsPane #log { height: 1fr; }
+    """
     app: "WandbCliApp"
 
-    def __init__(self, ref: RunRef, name: str, live: bool = False) -> None:
-        super().__init__()
+    def __init__(self, ref: RunRef, name: str, live: bool = False, **kwargs) -> None:
+        super().__init__(**kwargs)
         self.ref = ref
         self.run_name = name
         self.live = live  # the run is running, so more lines may come
         self.follow = live
         self._lines = 0
         self._loading = False
+        self._started = False
+        self._timer = None
 
     def compose(self) -> ComposeResult:
-        yield Header()
         yield Static("Loading…", id="status")
         yield RichLog(id="log", wrap=True, markup=False, highlight=False, auto_scroll=False)
-        yield KeyBar()
 
-    def on_mount(self) -> None:
-        self.title = f"Logs — {self.run_name}"
-        self.query_one("#log", RichLog).focus()
-        self.load()
+    def on_unmount(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+
+    def activate(self, live: bool | None = None) -> None:
+        if live is not None:
+            self.set_live(live)
+        if not self._started:
+            self._started = True
+            self.load()
+            self._apply_timer()
+        elif self.live and self.follow and not self._loading:
+            self.load()
+
+    def set_live(self, live: bool) -> None:
+        if live == self.live:
+            return
+        self.live = live
+        self.follow = live
+        if self._started:
+            self._apply_timer()
+            if not self._loading:
+                self._finish()
+                if live:
+                    self.load()
+        if self.is_attached:
+            self.screen.refresh_bindings()
+
+    def _apply_timer(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
         if self.live:
-            self.set_interval(FOLLOW_SECONDS, self._tick)
+            self._timer = self.set_interval(FOLLOW_SECONDS, self._tick)
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action == "toggle_follow":
@@ -60,7 +87,13 @@ class LogsScreen(Screen):
         return True
 
     def _tick(self) -> None:
-        if self.follow and not self._loading and self.app.screen is self:
+        if (
+            self.follow
+            and not self._loading
+            and self.is_attached
+            and self.app.screen is self.screen
+            and self.screen.active_tab == "logs"
+        ):
             self.load()  # only the lines after the ones already shown are added
 
     def toggle_state(self, action: str) -> bool | None:
@@ -68,7 +101,8 @@ class LogsScreen(Screen):
 
     def action_toggle_follow(self) -> None:
         self.follow = not self.follow
-        self.refresh_bindings()  # the key shows the new state
+        if self.is_attached:
+            self.screen.refresh_bindings()  # the key shows the new state
         self._finish()
         if self.follow:
             self.load()

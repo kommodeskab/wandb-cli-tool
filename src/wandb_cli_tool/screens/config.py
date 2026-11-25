@@ -5,13 +5,11 @@ from typing import TYPE_CHECKING, Any
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
-from textual.binding import Binding
-from textual.screen import Screen
-from textual.widgets import Header, Static, Tree
+from textual.containers import Vertical
+from textual.widgets import Static, Tree
 from textual.widgets.tree import TreeNode
 
 from ..api import RunRef
-from .keybar import KeyBar
 from ..plain import plain
 
 if TYPE_CHECKING:
@@ -48,27 +46,30 @@ def populate(node: TreeNode, value: Any, depth: int = 0) -> None:
         node.add_leaf(Text(f"… {len(entries) - MAX_CHILDREN} more", style="dim"))
 
 
-class ConfigScreen(Screen):
+class ConfigPane(Vertical):
     """The run's config as an expandable tree (↑/↓ move, Enter/Space expand)."""
 
-    BINDINGS = [Binding("escape", "app.pop_screen", "Back")]
+    DEFAULT_CSS = """
+    ConfigPane { height: 1fr; }
+    ConfigPane #status { color: $text-muted; padding: 0 1; }
+    ConfigPane #config { height: 1fr; }
+    """
     app: "WandbCliApp"
 
-    def __init__(self, ref: RunRef, name: str) -> None:
-        super().__init__()
+    def __init__(self, ref: RunRef, name: str, **kwargs) -> None:
+        super().__init__(**kwargs)
         self.ref = ref
         self.run_name = name
+        self._started = False
 
     def compose(self) -> ComposeResult:
-        yield Header()
         yield Static("Loading…", id="status")
         yield Tree("config", id="config")
-        yield KeyBar()
 
-    def on_mount(self) -> None:
-        self.title = f"Config — {self.run_name}"
-        self.query_one("#config", Tree).focus()
-        self.load()
+    def activate(self) -> None:
+        if not self._started:
+            self._started = True
+            self.load()
 
     @work(thread=True, exclusive=True)
     def load(self) -> None:

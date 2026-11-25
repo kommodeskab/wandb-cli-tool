@@ -10,11 +10,9 @@ from typing import TYPE_CHECKING, Callable, TypeVar
 
 from textual import work
 from textual.app import ComposeResult
-from textual.binding import Binding
-from textual.containers import Horizontal, VerticalScroll
-from textual.screen import Screen
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.worker import get_current_worker
-from textual.widgets import Header, OptionList, Static
+from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 from ..api import RunRef
@@ -23,7 +21,6 @@ from ..charts import (
 )
 from ..images import ImageInfo, ImageSeries, ImageStep
 from ..layout_store import project_key
-from .keybar import KeyBar
 from ..plain import plain
 from ..refresh import PREF_KEY, interval_from_pref, label as interval_label, next_choice, to_pref
 from ..series import Point, batches, extract_points, is_number, last_values
@@ -63,37 +60,24 @@ class ChartData:
     images: list[ImageInfo] = field(default_factory=list)
 
 
-class ChartsScreen(ChartEditing, Screen):
+class ChartsPane(ChartEditing, Vertical):
     """Panels on the left, the selected panel's charts on the right."""
 
-    BINDINGS = [
-        Binding("escape", "app.pop_screen", "Back"),
-        Binding("n", "new_panel", "New panel"),
-        Binding("a", "add_chart", "Add chart"),
-        Binding("x", "change_x", "X-axis"),
-        Binding("o", "chart_options", "Chart options"),
-        Binding("delete", "delete_chart", "Delete chart"),
-        Binding("backspace", "delete_chart", "Delete chart", show=False),  # laptops without a Delete key
-        Binding("d", "reset_layout", "Default layout"),
-        Binding("r", "refresh_now", "Refresh"),
-        Binding("f", "cycle_refresh", "Auto-refresh"),
-        Binding("tab", "cycle_focus(1)", "Next chart"),
-        Binding("shift+tab", "cycle_focus(-1)", "Previous", show=False),
-        Binding("right", "focus_chart(0)", "Charts", show=False),
-    ]
     DEFAULT_CSS = """
-    #panels { width: 30; border: round $primary; }
-    #panels:focus { border: round $accent; }
-    #charts { width: 1fr; }
-    #status { color: $text-muted; padding: 0 1; }
+    ChartsPane { height: 1fr; }
+    ChartsPane #panels { width: 30; border: round $primary; }
+    ChartsPane #panels:focus { border: round $accent; }
+    ChartsPane #charts { width: 1fr; }
+    ChartsPane #status { color: $text-muted; padding: 0 1; }
     """
     app: "WandbCliApp"
 
-    def __init__(self, ref: RunRef, name: str) -> None:
-        super().__init__()
+    def __init__(self, ref: RunRef, name: str, **kwargs) -> None:
+        super().__init__(**kwargs)
         self.ref = ref
         self.run_name = name
         self.ready = False
+        self._started = False
         self.metrics: list[str] = []
         self._metric_set: set[str] = set()  # what THIS run logged: shared charts may ask for more
         self._system_set: set[str] = set()
@@ -130,18 +114,18 @@ class ChartsScreen(ChartEditing, Screen):
         return project_key(self.ref.entity, self.ref.project)
 
     def compose(self) -> ComposeResult:
-        yield Header()
         yield Static("Loading metrics…", id="status")
         with Horizontal():
             yield OptionList(id="panels")
             yield VerticalScroll(id="charts")
-        yield KeyBar()
 
     def on_mount(self) -> None:
-        self.title = f"Charts — {self.run_name}"
         self.interval = interval_from_pref(self.app.preferences.get(PREF_KEY))
-        self.query_one("#panels", OptionList).focus()
-        self.load()
+
+    def activate(self) -> None:
+        if not self._started:
+            self._started = True
+            self.load()
 
     def on_unmount(self) -> None:
         self._stop_timer()
@@ -199,7 +183,7 @@ class ChartsScreen(ChartEditing, Screen):
         self._apply_data(data)
         # the generated panels, plus whatever the user customized in an earlier session
         self.chart_layout = ChartLayout(
-            build_panels(self.metrics, self.system_metrics),
+            build_panels(self.metrics, self.system_metrics, [t.key for t in self.tables], [i.key for i in self.images]),
             self.app.layout_store.load(self._layout_key),
         )
         self.ready = True
@@ -208,7 +192,8 @@ class ChartsScreen(ChartEditing, Screen):
         self._update_status()
         self._refresh_panel_list()
         await self._show_panel()
-        self.query_one("#panels", OptionList).focus()
+        if self.is_attached and self.screen.active_tab == "charts":
+            self.query_one("#panels", OptionList).focus()
 
     # ---- refreshing ----------------------------------------------------
     def action_refresh_now(self) -> None:
@@ -240,25 +225,37 @@ class ChartsScreen(ChartEditing, Screen):
         self._refreshing = False
         self._refresh_error = ""
         panel = self.panels[self.selected].name if self.panels else None
-        focused = self.focused
+        focused = self.screen.focused
         focus_index = focused.index if isinstance(focused, ChartBase) else None
+        focus_spec = focused.spec if isinstance(focused, ChartBase) else None
         shown_before = list(self.panels[self.selected].charts) if self.panels else []
 
         self._apply_data(data)
         self._cache.clear()  # old points are stale; charts fetch again
         self._table_cache.clear()
         # defaults are rebuilt from the new metrics; the user's customizations are kept as they are
-        self.chart_layout = ChartLayout(build_panels(self.metrics, self.system_metrics), self.chart_layout.custom)
-        self.selected = self.chart_layout.index_of(panel) if panel else 0
+        self.chart_layout = ChartLayout(
+            build_panels(self.metrics, self.system_metrics, [t.key for t in self.tables], [i.key for i in self.images]),
+            self.chart_layout.custom,
+        )
+        self.selected = self.chart_layout.index_of(panel) if panel and self.panels else 0
         self._shown_panel = self.selected  # the same panel stays shown: no remount just for a new number
         self._last_refresh = datetime.now()
         self._apply_timer()  # stops itself once the run has finished
         self._update_status()
         self._refresh_panel_list()
-        if list(self.panels[self.selected].charts) == shown_before:
+        new_charts = list(self.panels[self.selected].charts) if self.panels else []
+        if new_charts == shown_before and self.panels:
             self._load_views(list(self.query(f".{CHART_CLASS}")), quiet=True)  # same charts: just update their data
         else:  # a new metric/table appeared in this panel: rebuild it
-            await self._show_panel(focus=focus_index)
+            target = (
+                next((i for i, c in enumerate(new_charts) if c == focus_spec), focus_index)
+                if focus_spec is not None
+                else None
+            )
+            await self._show_panel(focus=target)
+            if focus_spec is not None and not new_charts:
+                self.action_focus_panels()
 
     # ---- the automatic timer -------------------------------------------
     def _stop_timer(self) -> None:
@@ -273,7 +270,7 @@ class ChartsScreen(ChartEditing, Screen):
             self._timer = self.set_interval(self.interval, self._tick)
 
     def _tick(self) -> None:
-        if self.app.screen is self:  # not while a dialog is open on top
+        if self.is_attached and self.app.screen is self.screen and self.screen.active_tab == "charts":  # not while a dialog is open on top
             self.refresh_now()
 
     def key_label(self, action: str) -> str | None:
@@ -322,11 +319,12 @@ class ChartsScreen(ChartEditing, Screen):
 
     def _focused_chart(self) -> tuple[ChartSpec, int] | None:
         """The focused chart's spec and its position in the panel."""
-        view = self.focused
+        view = self.screen.focused
         return (view.spec, view.index) if isinstance(view, ChartBase) else None
 
     def _update_status(self) -> None:
-        self.refresh_bindings()  # the live/customized state may have changed what keys apply
+        if self.is_attached:
+            self.screen.refresh_bindings()  # the live/customized state may have changed what keys apply
         self._status("  ·  ".join(p for p in (self._status_base, self._refresh_status()) if p))
 
     # ---- rendering -----------------------------------------------------
@@ -337,14 +335,19 @@ class ChartsScreen(ChartEditing, Screen):
             self._panel_labels = labels
             options.clear_options()
             options.add_options([Option(plain(text), id=str(i)) for i, text in enumerate(labels)])
-        options.highlighted = self.selected
+        if self.panels:
+            self.selected = min(self.selected, len(self.panels) - 1)
+            options.highlighted = self.selected
 
     async def _show_panel(self, focus: int | None = None) -> None:
         async with self._render_lock:
-            self.workers.cancel_group(self, "series")  # nothing is fetched for a panel that is no longer shown
+            self.app.workers.cancel_group(self, "series")  # nothing is fetched for a panel that is no longer shown
             self._shown_panel = self.selected
             container = self.query_one("#charts", VerticalScroll)
             await container.remove_children()
+            if not self.panels:
+                await container.mount(Static("No panels.", markup=False))
+                return
             panel = self.panels[self.selected]
             if not panel.charts:
                 hint = "No charts in this panel."
@@ -359,7 +362,7 @@ class ChartsScreen(ChartEditing, Screen):
     async def on_option_list_option_highlighted(
         self, event: OptionList.OptionHighlighted
     ) -> None:
-        if event.option_list.id != "panels" or not self.ready:
+        if event.option_list.id != "panels" or not self.ready or not self.panels:
             return
         if event.option_index != self._shown_panel:
             self.selected = event.option_index
@@ -560,7 +563,7 @@ class ChartsScreen(ChartEditing, Screen):
         views = list(self.query(f".{CHART_CLASS}"))
         if not views:
             return
-        current = self.focused
+        current = self.screen.focused
         index = current.index + delta if isinstance(current, ChartBase) else 0
         views[max(0, min(index, len(views) - 1))].focus()
 
@@ -568,7 +571,7 @@ class ChartsScreen(ChartEditing, Screen):
         """Tab / Shift+Tab: panel list -> each chart in turn -> back to the panel list.
         (The way out of a table, where the arrow keys move inside it.)"""
         stops = [self.query_one("#panels", OptionList), *self.query(f".{CHART_CLASS}")]
-        current = self.focused
+        current = self.screen.focused
         here = stops.index(current) if current in stops else 0
         stops[(here + delta) % len(stops)].focus()
 

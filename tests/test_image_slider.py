@@ -124,7 +124,7 @@ async def test_clicking_the_slider_jumps_to_that_step(make_app):
         await pilot.pause(0.35)
         await settle(pilot, 4)
         assert view.cursor.index in (1, 2)
-        text = "\n".join(s.text for s in screen._compositor.render_strips())
+        text = "\n".join(s.text for s in app.screen._compositor.render_strips())
         assert "●" in text and "◀" in text and "▶" in text
 
 
@@ -265,7 +265,8 @@ async def test_a_saved_image_chart_whose_key_vanished_says_so(make_app):
     app = make_app()
     async with app.run_test(size=SIZE) as pilot:
         screen = await open_charts(pilot)
-        await pilot.press("down", "down", "down", "down")
+        screen.selected = next(i for i, l in enumerate(panel_labels(screen)) if l.startswith("mine ("))
+        await screen._show_panel()
         await settle(pilot, 5)
         (view,) = screen.query(ImageChartView)
         assert "no logged images called “gone”" in screen_text(app) and app.client.image_step_calls == []
@@ -281,7 +282,7 @@ async def test_image_charts_are_saved_with_the_layout_and_come_back_showing_the_
     app2 = make_app()
     async with app2.run_test(size=SIZE) as pilot:
         screen = await open_charts(pilot)
-        await pilot.press("down", "down", "down", "down")
+        await pilot.press(*["down"] * (len(panel_labels(screen)) - 1))
         await pilot.pause(0.4)
         await settle(pilot, 5)
         (view,) = screen.query(ImageChartView)
@@ -295,7 +296,7 @@ async def test_x_does_nothing_for_images_but_delete_works(make_app):
         assert app.focused is view
         await pilot.press("x")
         await settle(pilot)
-        assert any("only applies to plots" in n.message for n in app._notifications)
+        assert app.screen is screen.screen  # x is no longer bound
         await pilot.press("delete")
         await settle(pilot)
         await pilot.press("y")
@@ -388,5 +389,5 @@ async def test_the_image_keys_are_in_the_key_bar_only_for_steps_with_several_ima
     async with ctx as pilot:
         screen, view = await with_images(pilot, "grid")  # 3 images per step
         assert view.check_action("sub", ()) is True
-        bar = screen.query_one(KeyBar).query_one("KeyLine").render().plain.replace("\xa0", " ")
+        bar = app.screen.query_one(KeyBar).query_one("KeyLine").render().plain.replace("\xa0", " ")
         assert "[ Previous image" in bar and "] Next image" in bar

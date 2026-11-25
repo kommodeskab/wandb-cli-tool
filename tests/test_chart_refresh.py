@@ -14,7 +14,7 @@ from wandb_cli_tool.refresh import (
     DEFAULT_REFRESH, PREF_KEY, REFRESH_CHOICES, interval_from_pref, label, next_choice, to_pref,
 )
 from wandb_cli_tool.screens.chart_widgets import BarView, ChartView, TableView
-from wandb_cli_tool.screens.charts import ChartsScreen
+from wandb_cli_tool.screens.charts import ChartsPane
 from wandb_cli_tool.screens.dialogs import ConfirmDialog
 from wandb_cli_tool.tables import TableData
 
@@ -99,7 +99,7 @@ async def start(make_app=None, client=Live, interval=None):
 
 async def charts_of(pilot):
     screen = await open_charts(pilot)  # run-1, which is running
-    assert isinstance(screen, ChartsScreen)
+    assert isinstance(screen, ChartsPane)
     return screen
 
 
@@ -231,10 +231,10 @@ async def test_a_finished_run_gets_no_timer_but_can_still_be_refreshed_by_hand()
         await settle(pilot, 5)
         await pilot.press("down", "enter")  # run-2, which is finished
         await settle(pilot, 5)
-        await pilot.press("down", "enter")  # Charts
+        await pilot.press("3")  # Charts tab
         await settle(pilot, 8)
-        screen = app.screen
-        assert isinstance(screen, ChartsScreen) and screen.interval == 30 and screen._timer is None
+        screen = app.screen.charts_pane
+        assert isinstance(screen, ChartsPane) and screen.interval == 30 and screen._timer is None
         assert "run finished" in status(screen)
         before = app.client.calls["keys"]
         await pilot.press("r")
@@ -283,7 +283,7 @@ async def test_the_timer_does_not_refresh_while_a_dialog_is_open_and_refreshes_n
         await pilot.press("d")  # nothing customized: a notice, not a dialog
         await pilot.press("a")  # the add-chart dialog
         await settle(pilot)
-        assert app.screen is not screen
+        assert app.screen is not screen.screen
         calls = app.client.calls["keys"]
         screen._tick()
         await settle(pilot, 4)
@@ -352,7 +352,7 @@ async def test_the_auto_refresh_key_shows_the_interval_in_use():
         screen = await charts_of(pilot)
 
         def bar():
-            return screen.query_one(KeyBar).query_one("KeyLine").render().plain.replace("\xa0", " ")
+            return app.screen.query_one(KeyBar).query_one("KeyLine").render().plain.replace("\xa0", " ")
 
         assert "f Auto-refresh: 30 s" in bar()
         await pilot.press("f")  # the next choice
@@ -362,3 +362,23 @@ async def test_the_auto_refresh_key_shows_the_interval_in_use():
             await pilot.press("f")
             await settle(pilot, 2)
         assert "f Auto-refresh: off" in bar()
+
+
+async def test_a_new_metric_sorting_before_the_focused_chart_keeps_focus_on_the_same_chart():
+    class SortedLive(Live):
+        def metric_keys(self, ref):
+            return sorted(super().metric_keys(ref))
+
+    app, ctx = await start(client=SortedLive, interval=0)
+    async with ctx as pilot:
+        screen = await charts_of(pilot)
+        await select_trainer(pilot)
+        await pilot.press("right", "down")  # trainer/loss at index 1
+        assert app.focused.spec.y == "trainer/loss" and app.focused.index == 1
+        SortedLive.extra_metrics = ["trainer/aaa"]
+        try:
+            await pilot.press("r")
+            await settle(pilot, 8)
+        finally:
+            SortedLive.extra_metrics = []
+        assert app.focused.spec.y == "trainer/loss" and app.focused.index == 2

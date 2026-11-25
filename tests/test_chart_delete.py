@@ -98,6 +98,41 @@ def test_reset_brings_everything_back():
     assert not layout.is_customized and ys(layout, "a") == ["a/x", "a/y", "a/z"]
 
 
+def test_deleting_panels_user_and_generated_and_resetting():
+    layout = ChartLayout(default())
+    mine = layout.add_panel("mine")
+    layout.add_chart(mine, ChartSpec("acc"))
+    layout.remove_panel(mine)
+    assert all(p.name != "mine" for p in layout.panels)
+    assert not layout.is_customized  # deleting a freshly added empty/populated user panel leaves nothing
+
+    a = layout.index_of("a")
+    layout.set_chart(a, 0, ChartSpec("a/x", "acc"))
+    layout.remove_panel(a)
+    assert all(p.name != "a" for p in layout.panels)
+    assert layout.custom.removed_panels == ["a"] and layout.custom.x == {}
+    # stays deleted when rebuilt from fresh defaults; bringing back "a" via add_panel restores it
+    reloaded = ChartLayout(default(), Customization.from_json(json.loads(json.dumps(layout.custom.to_json()))))
+    assert all(p.name != "a" for p in reloaded.panels)
+    reloaded.add_panel("a")
+    assert ys(reloaded, "a") == ["a/x", "a/y", "a/z"] and reloaded.custom.removed_panels == []
+
+    # deleting every panel leaves an empty list cleanly, and reset() restores all of them
+    while layout.panels:
+        layout.remove_panel(0)
+    assert layout.panels == []
+    layout.reset()
+    assert not layout.is_customized and ys(layout, "a") == ["a/x", "a/y", "a/z"]
+
+
+@pytest.mark.parametrize("bad", [None, 3, "x", [1, None, ""]])
+def test_malformed_removed_panels_data_is_ignored(bad):
+    cleaned = Customization.from_json({"removed_panels": bad}).removed_panels
+    assert isinstance(cleaned, list) and all(isinstance(x, str) and x for x in cleaned)
+    if bad in (None, 3, "x"):
+        assert cleaned == []
+
+
 # ---- saving ------------------------------------------------------------------------------------
 
 
@@ -147,15 +182,67 @@ async def select_panel(pilot, name):
     await settle(pilot, 5)
 
 
-async def test_delete_needs_a_focused_chart(make_app):
+async def test_delete_on_panel_list_deletes_panel_and_disabled_when_no_panels_remain(make_app):
     app, ctx = await start(make_app)
     async with ctx as pilot:
         screen = await open_charts(pilot)  # focus is on the panel list
-        assert screen.check_action("delete_chart", ()) is False  # not offered in the key bar either
+        assert screen.check_action("delete_item", ()) is True
+        assert screen.chart_key_label("delete_item") == "Delete panel"
+        await select_panel(pilot, "Tables")
         await pilot.press("delete")
         await settle(pilot)
-        assert app.screen is screen  # nothing opened, nothing deleted
-        assert saved() is None
+        assert isinstance(app.screen, ConfirmDialog)
+        assert "Tables" in " ".join(app.screen.query_one("#confirm-body").render().plain.split())
+        await pilot.press("y")
+        await settle(pilot, 6)
+        assert not any(l.startswith("Tables (") for l in panel_labels(screen))
+        assert saved()["removed_panels"] == ["Tables"]
+        # delete remaining panels one by one -> empty panel list disables delete_item and add_chart
+        while screen.panels:
+            await pilot.press("delete")
+            await settle(pilot)
+            await pilot.press("y")
+            await settle(pilot, 5)
+        assert screen.panels == []
+        assert screen.check_action("delete_item", ()) is False
+        assert screen.check_action("add_chart", ()) is False
+        await pilot.press("delete")
+        await settle(pilot)
+        assert app.screen is screen.screen  # nothing opened
+        # reset brings all panels back
+        await pilot.press("d", "y")
+        await settle(pilot, 6)
+        assert any(l.startswith("Tables (") for l in panel_labels(screen)) and saved() is None
+
+
+async def test_auto_tables_and_images_panels_and_deleting_items_from_them(make_app):
+    from wandb_cli_tool.screens.chart_widgets import ImageChartView
+
+    app, ctx = await start(make_app)
+    async with ctx as pilot:
+        screen = await open_charts(pilot)
+        labels = panel_labels(screen)
+        assert "Tables (2)" in labels and "Images (2)" in labels
+        await select_panel(pilot, "Tables")
+        assert [v.spec.y for v in screen.query(TableView)] == ["preds", "results"]
+        screen.query(TableView).first().focus()
+        await settle(pilot)
+        assert screen.chart_key_label("delete_item") == "Delete table"
+        await pilot.press("delete", "y")
+        await settle(pilot, 6)
+        assert [v.spec.y for v in screen.query(TableView)] == ["results"]
+        assert saved()["removed"]["Tables"] == ["table:preds"]
+
+        await pilot.press("shift+tab", "down")  # Shift+Tab leaves the table back to #panels; Down onto Images
+        await settle(pilot, 5)
+        assert [v.spec.y for v in screen.query(ImageChartView)] == ["grid", "samples"]
+        screen.query(ImageChartView).first().focus()
+        await settle(pilot)
+        assert screen.chart_key_label("delete_item") == "Delete images"
+        await pilot.press("delete", "y")
+        await settle(pilot, 6)
+        assert [v.spec.y for v in screen.query(ImageChartView)] == ["samples"]
+        assert saved()["removed"]["Images"] == ["image:grid"]
 
 
 async def test_deleting_asks_first_and_no_changes_nothing(make_app):
@@ -254,7 +341,7 @@ async def test_deleting_the_last_chart_leaves_an_empty_panel_and_moves_focus_to_
         await pilot.press("y")
         await settle(pilot, 6)
         assert panel_labels(screen)[-1] == "mine (0)"
-        assert "No charts in this panel" in "\n".join(s.text for s in screen._compositor.render_strips())
+        assert "No charts in this panel" in "\n".join(s.text for s in app.screen._compositor.render_strips())
         assert app.focused.id == "panels"
         assert saved()["panels"] == ["mine"] and saved()["added"] == {}  # the empty panel is still there
 
@@ -270,7 +357,7 @@ async def test_the_x_axis_key_after_a_deletion_changes_the_right_chart(make_app)
         await settle(pilot)
         await pilot.press("y")
         await settle(pilot, 6)
-        await pilot.press("x")
+        await pilot.press("o")
         await settle(pilot)
         app.screen.query_one("#x", Select).value = "acc"
         await pilot.click("#ok")

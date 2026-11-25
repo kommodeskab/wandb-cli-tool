@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
@@ -27,7 +28,8 @@ from ..charts import (
     BAR, IMAGE, RUNTIME, STEP, TABLE, WALL_TIME, ChartLayout, ChartSpec, Panel, build_panels, display_names,
 )
 from ..compare import (
-    CompareChart, ConfigDiff, compare_charts, diff_config, is_single_value, metric_rows, overview_rows, run_labels,
+    MAX_OVERVIEW_LINES, CompareChart, ConfigDiff, compare_charts, diff_config, is_single_value, metric_rows,
+    overview_column_widths, overview_rows, run_labels,
 )
 from ..images import ImageInfo, ImageSeries, ImageStep
 from ..tables import TableData, TableInfo
@@ -53,8 +55,29 @@ CELL_WIDTH = 80
 LOAD_WORKERS = 8  # requests in flight while the runs of a comparison load
 
 
-def _clip(text: str) -> str:
-    return text if len(text) <= CELL_WIDTH else text[: CELL_WIDTH - 1] + "…"
+def _clip(text: str, limit: int = CELL_WIDTH) -> str:
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return text[: max(limit - 1, 0)] + "…"
+
+
+def _clip_cells(text: str, max_cells: int) -> str:
+    if cell_len(text) <= max_cells:
+        return text
+    if max_cells <= 1:
+        return "…"[:max_cells]
+    out, used = [], 0
+    for ch in text:
+        w = cell_len(ch)
+        if used + w > max_cells - 1:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + "…"
+
+
+def _chart_identity(chart: CompareChart) -> tuple:
+    return (chart.kind, chart.metric, chart.metrics, chart.system, chart.x)
 
 
 @dataclass
@@ -137,10 +160,9 @@ class CompareScreen(ChartEditing, Screen):
         Binding("i", "toggle_identical", "Hide identical rows"),
         Binding("n", "new_panel", "New panel"),
         Binding("a", "add_chart", "Add chart"),
-        Binding("x", "change_x", "X-axis"),
         Binding("o", "chart_options", "Chart options"),
-        Binding("delete", "delete_chart", "Delete chart"),
-        Binding("backspace", "delete_chart", "Delete chart", show=False),  # laptops without a Delete key
+        Binding("delete", "delete_item", "Delete chart"),
+        Binding("backspace", "delete_item", "Delete chart", show=False),  # laptops without a Delete key
         Binding("d", "reset_layout", "Default layout"),
         Binding("b", "flip_best", "Flip lower/higher is better"),
         Binding("B", "flip_all_best", "Flip all", show=False),
@@ -172,6 +194,7 @@ class CompareScreen(ChartEditing, Screen):
         # per table: hide the rows that are the same in every run (the config table starts that way)
         self.hide_identical = {"overview": False, "metrics": False, "config": True}
         self._hidden_overview_rows = 0
+        self._overview_width = 0
         self.higher: set[str] = set()  # metrics where a higher value is better (the default: lower is)
         self.filters = {"metrics": "", "config": ""}  # what the user typed to narrow each table by key
         self.pinned: dict[str, list[str]] = {"metrics": [], "config": []}  # keys shown first
@@ -181,6 +204,7 @@ class CompareScreen(ChartEditing, Screen):
         self.tables: list[TableInfo] = []
         self.images: list[ImageInfo] = []
         self.selected = 0
+        self._panel_labels: list[str] = []
         self._shown_panel: int | None = None
         self._render_lock = asyncio.Lock()
         self._series_cache: dict[tuple[int, bool, str, str], list[Point]] = {}
@@ -255,12 +279,18 @@ class CompareScreen(ChartEditing, Screen):
             return self.active_tab == "charts" and self.check_chart_action(action)
         return True
 
+    def key_label(self, action: str) -> str | None:
+        return self.chart_key_label(action) if self.active_tab == "charts" else None
+
     def _colors(self) -> list[str]:
         dark = is_dark(self)
         return [series_color(slot, dark) for slot in range(len(self.runs))]
 
-    def _header(self, i: int) -> Text:
-        return Text.assemble(("■ ", self._colors()[i]), self.labels[i])
+    def _header(self, i: int, max_width: int | None = None) -> Text:
+        label = self.labels[i]
+        if max_width is not None:
+            label = _clip_cells(label, max(1, max_width - 2))  # "■ " takes 2 cells
+        return Text.assemble(("■ ", self._colors()[i]), label)
 
     def _status(self, text: str) -> None:
         self.query_one("#status", Static).update(plain(text))
@@ -283,6 +313,8 @@ class CompareScreen(ChartEditing, Screen):
         self.app.call_from_thread(self._loaded, data)
 
     def action_reload(self) -> None:
+        if not self.ready:
+            return
         self.ready = False
         self._series_cache.clear()
         self._loaded_count = 0
@@ -295,20 +327,53 @@ class CompareScreen(ChartEditing, Screen):
             self._status(f"Loading runs… {self._loaded_count}/{len(self.runs)}")
 
     async def _loaded(self, data: list[RunData]) -> None:
+        panel = self.panels[self.selected].name if self.panels else None
+        focused = self.focused
+        focused_chart = (focused.chart, focused.index) if isinstance(focused, CompareBase) else None
+        shown_before = (
+            compare_charts(self.panels[self.selected])
+            if self.panels and self._shown_panel == self.selected
+            else None
+        )
+
         self.data = data
         self.ready = True
         self._render_overview()
         self._render_metrics()
         self._render_config()
-        self._build_panels()
+        self._build_panels(keep_panel=panel)
+        mounted = list(self.query(f".{CHART_CLASS}"))
+        same_panel = (
+            bool(self.panels)
+            and shown_before is not None
+            and compare_charts(self.panels[self.selected]) == shown_before
+            and bool(mounted)
+        )
+        self._shown_panel = self.selected  # keep OptionHighlighted from remounting on reload
         self._refresh_panel_list()
-        await self._show_panel()
+        if same_panel:
+            self._reload_views(mounted, keep_position=True)  # same charts: update in place keeping focus & scroll
+        else:
+            focus_view: int | None = None
+            if focused_chart is not None and self.panels:
+                old_chart, old_index = focused_chart
+                new_charts = compare_charts(self.panels[self.selected])
+                if new_charts:
+                    focus_view = next(
+                        (i for i, c in enumerate(new_charts) if _chart_identity(c) == _chart_identity(old_chart)),
+                        min(old_index, len(new_charts) - 1),
+                    )
+            await self._show_panel(focus_view=focus_view)
+            if focused_chart is not None and focus_view is None:
+                self.action_focus_panels()
         problems = [f"{self.labels[i]}: {d.error}" for i, d in enumerate(data) if d.error]
         if problems:
             self.notify("Some data could not be loaded — " + "; ".join(problems), severity="warning")
         self._update_status()
 
     def _update_status(self) -> None:
+        if self.is_attached:
+            self.refresh_bindings()
         tab = self.active_tab
         if tab == "config":
             self._status(self._config_summary)
@@ -327,17 +392,43 @@ class CompareScreen(ChartEditing, Screen):
         for i in range(len(self.runs)):
             table.add_column(self._header(i), key=str(i))
 
+    def _overview_available_width(self) -> int:
+        table = self.query_one("#overview", DataTable)
+        width = table.size.width or self.size.width
+        return max(0, width - table.styles.scrollbar_size_vertical)
+
+    def on_resize(self) -> None:
+        if self.ready and self._overview_available_width() != self._overview_width:
+            self._render_overview()
+
     def _render_overview(self) -> None:
         table = self.query_one("#overview", DataTable)
-        self._fill(table, "")
+        cursor = table.cursor_row if table.row_count else 0
         rows = overview_rows([d.info for d in self.data], [d.meta for d in self.data])
-        self._hidden_overview_rows = 0
-        for row in rows:
-            if self.hide_identical["overview"] and not row.differs:
-                self._hidden_overview_rows += 1
-                continue
-            label = Text(("≠ " if row.differs else "  ") + row.label, style="bold" if row.differs else "dim")
-            table.add_row(label, *(plain(_clip(v)) for v in row.values))
+        shown = [r for r in rows if r.differs or not self.hide_identical["overview"]]
+        self._hidden_overview_rows = len(rows) - len(shown)
+
+        label_texts = [("≠ " if r.differs else "  ") + r.label for r in shown]
+        label_width = max((cell_len(t) for t in label_texts), default=0)
+        naturals = [
+            max([cell_len(f"■ {self.labels[i]}"), *(cell_len(r.values[i]) for r in shown)], default=0)
+            for i in range(len(self.runs))
+        ]
+        available = self._overview_available_width()
+        self._overview_width = available
+        widths = overview_column_widths(
+            label_width, naturals, available, padding=table.cell_padding, fallback_max=CELL_WIDTH
+        )
+
+        table.clear(columns=True)
+        table.add_column("", width=label_width or None, key="label")
+        for i, width in enumerate(widths):
+            table.add_column(self._header(i, width), width=width or None, key=str(i))
+        for row, label_text in zip(shown, label_texts):
+            label = Text(label_text, style="bold" if row.differs else "dim")
+            cells = [plain(_clip(v, max(w * MAX_OVERVIEW_LINES, 1))) for v, w in zip(row.values, widths)]
+            table.add_row(label, *cells, height=None)
+        self._place_cursor(table, cursor)
 
     # ---- metrics -----------------------------------------------------------------------
     _metrics_summary = ""
@@ -541,17 +632,18 @@ class CompareScreen(ChartEditing, Screen):
     def _layout_key(self) -> str:
         return project_key(self.entity, self.project)
 
-    def _build_panels(self) -> None:
+    def _build_panels(self, keep_panel: str | None = None) -> None:
         """The project's chart layout (what the user set up in the run screens, and here) over the
         metrics of all the compared runs."""
         self.metrics = sorted({m for d in self.data for m in d.metrics})
         self.system_metrics = sorted({m for d in self.data for m in d.system_metrics})
-        self.tables = list({t.key: t for d in self.data for t in d.tables}.values())
-        self.images = list({i.key: i for d in self.data for i in d.images}.values())
+        self.tables = sorted({t.key: t for d in self.data for t in d.tables}.values(), key=lambda t: t.key)
+        self.images = sorted({i.key: i for d in self.data for i in d.images}.values(), key=lambda i: i.key)
         self.chart_layout = ChartLayout(
-            build_panels(self.metrics, self.system_metrics), self.app.layout_store.load(self._layout_key)
+            build_panels(self.metrics, self.system_metrics, [t.key for t in self.tables], [i.key for i in self.images]),
+            self.app.layout_store.load(self._layout_key),
         )
-        self.selected = 0
+        self.selected = self.chart_layout.index_of(keep_panel) if keep_panel and self.panels else 0
 
     def _focused_chart(self) -> tuple[ChartSpec, int] | None:
         """The focused chart's layout chart and its position in the panel (a plot with several metrics
@@ -561,19 +653,31 @@ class CompareScreen(ChartEditing, Screen):
 
     def _refresh_panel_list(self) -> None:
         options = self.query_one("#panels", OptionList)
-        options.clear_options()
-        options.add_options([Option(plain(f"{p.name} ({len(p.charts)})"), id=str(i)) for i, p in enumerate(self.panels)])
+        labels = [f"{p.name} ({len(p.charts)})" for p in self.panels]
+        if labels != self._panel_labels:  # an unchanged list (most reloads) is not redrawn
+            self._panel_labels = labels
+            options.clear_options()
+            options.add_options([Option(plain(text), id=str(i)) for i, text in enumerate(labels)])
         if self.panels:
             options.highlighted = self.selected
 
-    async def _show_panel(self, focus: int | None = None) -> None:
+    def _reload_views(self, views: list, keep_position: bool = False) -> None:
+        self._load_plots([v for v in views if isinstance(v, ComparePlotView)])  # together: one batch per run
+        for view in views:
+            if isinstance(view, CompareImageView):
+                self._load_images(view, keep_position=keep_position)
+            elif not isinstance(view, ComparePlotView):
+                self._load_chart(view)
+
+    async def _show_panel(self, focus: int | None = None, *, focus_view: int | None = None) -> None:
         async with self._render_lock:
             self.workers.cancel_group(self, "plots")  # nothing is fetched for a panel that is no longer shown
             self._shown_panel = self.selected
             container = self.query_one("#charts", VerticalScroll)
             await container.remove_children()
             if not self.panels:
-                await container.mount(Static("None of the runs logged any metrics.", markup=False))
+                note = "No panels." if self.chart_layout and self.chart_layout.is_customized else "None of the runs logged any metrics."
+                await container.mount(Static(note, markup=False))
                 return
             charts = compare_charts(self.panels[self.selected])
             if not charts:
@@ -581,16 +685,15 @@ class CompareScreen(ChartEditing, Screen):
                 return
             views = [self._make_view(c, i) for i, c in enumerate(charts)]
             await container.mount_all(views)
-            self._load_plots([v for v in views if isinstance(v, ComparePlotView)])  # together: one batch per run
-            for view in views:
-                if not isinstance(view, ComparePlotView):
-                    self._load_chart(view)
-            if focus is not None:  # a layout chart: its first drawn chart gets the focus
+            self._reload_views(views)
+            if focus_view is not None:
+                views[min(focus_view, len(views) - 1)].focus()
+            elif focus is not None:  # a layout chart: its first drawn chart gets the focus
                 target = next((v for v in views if v.layout_index == focus), views[-1])
                 target.focus()
 
     async def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
-        if event.option_list.id != "panels" or not self.ready:
+        if event.option_list.id != "panels" or not self.ready or not self.panels:
             return
         if event.option_index != self._shown_panel:
             self.selected = event.option_index
@@ -736,16 +839,16 @@ class CompareScreen(ChartEditing, Screen):
         if view.is_attached:
             view.show_tables(tables)
 
-    def _load_images(self, view: CompareImageView) -> None:
+    def _load_images(self, view: CompareImageView, keep_position: bool = False) -> None:
         key = view.chart.metric
         have = [i for i, d in enumerate(self.data) if any(img.key == key for img in d.images)]
         if not have:
             view.show_unavailable(f"No compared run logged images called “{key}”.")
         else:
-            self._fetch_steps(view, key, have)
+            self._fetch_steps(view, key, have, keep_position)
 
     @work(thread=True)
-    def _fetch_steps(self, view: CompareImageView, key: str, have: list[int]) -> None:
+    def _fetch_steps(self, view: CompareImageView, key: str, have: list[int], keep_position: bool = False) -> None:
         def one(i: int) -> ImageSeries:
             return self.app.client.image_steps(self.runs[i][0], key)
 
@@ -756,11 +859,11 @@ class CompareScreen(ChartEditing, Screen):
             self.app.call_from_thread(view.show_unavailable, f"Could not read the images: {exc}")
             return
         series = [found.get(i) for i in range(len(self.runs))]
-        self.app.call_from_thread(self._steps_ready, view, series)
+        self.app.call_from_thread(self._steps_ready, view, series, keep_position)
 
-    def _steps_ready(self, view: CompareImageView, series: list[ImageSeries | None]) -> None:
+    def _steps_ready(self, view: CompareImageView, series: list[ImageSeries | None], keep_position: bool = False) -> None:
         if view.is_attached:
-            view.set_series(series)
+            view.set_series(series, keep_position=keep_position)
 
     def on_compare_image_view_wanted(self, event: CompareImageView.Wanted) -> None:
         view = event.view

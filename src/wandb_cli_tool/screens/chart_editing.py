@@ -12,26 +12,45 @@ from __future__ import annotations
 
 from ..charts import BAR, IMAGE, PLOT, TABLE, ChartSpec
 from .chart_dialogs import (
-    AxisDialog, BarDialog, ChartKindDialog, ChartOptionsDialog, ImageDialog, PlotDialog, TableDialog,
+    BarDialog, ChartKindDialog, ChartOptionsDialog, ImageDialog, PlotDialog, TableDialog,
 )
 from .dialogs import ConfirmDialog, NewPanelDialog
 
-EDIT_ACTIONS = ("new_panel", "add_chart", "change_x", "chart_options", "delete_chart", "reset_layout")
+EDIT_ACTIONS = ("new_panel", "add_chart", "chart_options", "delete_item", "reset_layout")
 
 
 class ChartEditing:
     empty_note = "This run has no metrics, tables or images to chart."
 
+    def _panel_list_focused(self) -> bool:
+        try:
+            return self.query_one("#panels").has_focus
+        except Exception:
+            return False
+
     def check_chart_action(self, action: str) -> bool | None:
         """Whether an editing action does something right now (the key bar lists only those)."""
-        focused = self._focused_chart()
-        if action in ("change_x", "delete_chart"):
-            return focused is not None
+        if action == "add_chart":
+            return bool(self.ready and self.panels)
         if action == "chart_options":
-            return focused is not None and focused[0].kind in (PLOT, BAR)
+            return self._focused_chart() is not None
+        if action == "delete_item":
+            return self._focused_chart() is not None or (
+                bool(self.ready and self.panels) and self._panel_list_focused()
+            )
         if action == "reset_layout":
             return bool(self.chart_layout and self.chart_layout.is_customized)
         return True
+
+    def chart_key_label(self, action: str) -> str | None:
+        if action != "delete_item":
+            return None
+        focused = self._focused_chart()
+        if focused is not None:
+            return {TABLE: "Delete table", IMAGE: "Delete images"}.get(focused[0].kind, "Delete chart")
+        if self.ready and self.panels and self._panel_list_focused():
+            return "Delete panel"
+        return "Delete chart"
 
     def _save_layout(self) -> None:
         """Persist the customizations right away, so nothing is lost if the app is killed."""
@@ -53,7 +72,7 @@ class ChartEditing:
 
     def action_add_chart(self) -> None:
         """Step 1: what kind of chart? Step 2 (below) asks for that kind's details."""
-        if not self.ready:
+        if not self.ready or not self.panels:
             return
         values = len(self.metrics) + len(self.system_metrics)
         if not (values or self.tables or self.images):
@@ -87,41 +106,48 @@ class ChartEditing:
         self._refresh_panel_list()
         await self._show_panel(focus=index)
 
-    def action_change_x(self) -> None:
+    def action_chart_options(self) -> None:
         focused = self._focused_chart()
         if focused is None:
             return
         spec, index = focused
-        if spec.kind != PLOT:
-            self.notify("The x-axis only applies to plots.")
-            return
-        self.app.push_screen(AxisDialog(self.metrics, spec), lambda new: self._on_change_x(index, new))
+        self.app.push_screen(
+            ChartOptionsDialog(spec, self.metrics, self.system_metrics, self.tables, self.images),
+            lambda new: self._on_edit_chart(index, new),
+        )
 
-    def action_chart_options(self) -> None:
-        focused = self._focused_chart()
-        if focused is not None and focused[0].kind in (PLOT, BAR):
-            spec, index = focused
-            self.app.push_screen(ChartOptionsDialog(spec), lambda new: self._on_change_x(index, new))  # a changed spec
-
-    async def _on_change_x(self, index: int, spec: ChartSpec | None) -> None:
+    async def _on_edit_chart(self, index: int, spec: ChartSpec | None) -> None:
         if not spec:
             return
         self.chart_layout.set_chart(self.selected, index, spec)
         self._save_layout()
+        self._refresh_panel_list()
         await self._show_panel(focus=index)
 
-    def action_delete_chart(self) -> None:
-        """Delete the focused chart or table from this panel (after confirming)."""
-        focused = self._focused_chart()
-        if not self.ready or focused is None:
+    def action_delete_item(self) -> None:
+        """Delete the focused chart/table/image, or the selected panel when the panel list has focus."""
+        if not self.ready:
             return
-        spec, index = focused
-        self.app.push_screen(
-            ConfirmDialog("Delete this chart?", f"“{spec.title}”", yes="Yes, delete", no="No"),
-            lambda yes: self._on_delete(index, yes),
-        )
+        focused = self._focused_chart()
+        if focused is not None:
+            spec, index = focused
+            heading = {TABLE: "Delete this table?", IMAGE: "Delete these images?"}.get(spec.kind, "Delete this chart?")
+            self.app.push_screen(
+                ConfirmDialog(heading, f"“{spec.title}”", yes="Yes, delete", no="No"),
+                lambda yes: self._on_delete_chart(index, yes),
+            )
+            return
+        if self.panels and self._panel_list_focused():
+            panel_index = self.selected
+            panel = self.panels[panel_index]
+            n = len(panel.charts)
+            suffix = f" ({n} item{'s' * (n != 1)})" if n else ""
+            self.app.push_screen(
+                ConfirmDialog("Delete this panel?", f"“{panel.name}”{suffix}", yes="Yes, delete", no="No"),
+                lambda yes: self._on_delete_panel(panel_index, yes),
+            )
 
-    async def _on_delete(self, index: int, yes: bool | None) -> None:
+    async def _on_delete_chart(self, index: int, yes: bool | None) -> None:
         if not yes:
             return
         self.chart_layout.remove_chart(self.selected, index)
@@ -132,8 +158,18 @@ class ChartEditing:
         if not remaining:
             self.action_focus_panels()  # nothing left to focus in this panel
 
+    async def _on_delete_panel(self, panel_index: int, yes: bool | None) -> None:
+        if not yes:
+            return
+        self.chart_layout.remove_panel(panel_index)
+        self.selected = min(panel_index, len(self.panels) - 1) if self.panels else 0
+        self._save_layout()
+        self._refresh_panel_list()
+        await self._show_panel()
+        self.action_focus_panels()
+
     def action_reset_layout(self) -> None:
-        """Forget all panels, charts and x-axis choices made in this project (after confirming)."""
+        """Forget all panels, charts and edits made in this project (after confirming)."""
         if not self.ready:
             return
         if not self.chart_layout.is_customized:
@@ -143,7 +179,7 @@ class ChartEditing:
             ConfirmDialog(
                 "Back to the default layout?",
                 "This removes the panels and charts you added, brings back the charts\n"
-                "you deleted, and undoes axis and option changes.",
+                "you deleted (and any deleted panels), and undoes chart edits.",
                 yes="Yes, reset", no="No",
             ),
             self._on_reset,

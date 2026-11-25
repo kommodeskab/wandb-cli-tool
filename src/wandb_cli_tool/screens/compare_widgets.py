@@ -225,6 +225,7 @@ class CompareTableView(CompareBase, DataTable):
     def _render_table(self) -> None:
         if self.tables is None:
             return
+        cursor = self.cursor_coordinate if self.row_count else None  # kept across a refresh
         merged = merge_tables(self.tables, self.by_key)
         colors = self._colors()
         self.clear(columns=True)
@@ -232,6 +233,12 @@ class CompareTableView(CompareBase, DataTable):
         for run, cells in merged.rows:
             self.add_row(Text.assemble(("■ ", colors[run]), self.run_labels[run]), *[plain(c) for c in cells])
         self.styles.height = table_height(len(merged.rows))
+        if cursor is not None and merged.rows:
+            self.move_cursor(
+                row=min(cursor.row, len(merged.rows) - 1),
+                column=min(cursor.column, len(merged.columns)),
+                animate=False,
+            )
         notes = [f"{len(merged.rows):,} rows"]
         if merged.truncated:
             notes.append(f"first {MAX_COMPARE_ROWS} of each run")
@@ -347,8 +354,16 @@ class CompareImageView(CompareBase, Vertical):
     def token(self) -> tuple[int, int]:
         return (self.target if self.target is not None else -1, self.sub)
 
+    def _leave_unavailable(self) -> None:
+        if self.unavailable is not None:  # the key appeared (e.g. on refresh): back to full size
+            self.unavailable = None
+            self.query_one("#cells").display = True
+            self.query_one("#slider").display = True
+            self.styles.height = IMAGE_COMPARE_HEIGHT
+
     def set_series(self, series: list[ImageSeries | None], keep_position: bool = False) -> None:
         """The runs' image steps. First time the newest step is shown; on a refresh the slider stays."""
+        self._leave_unavailable()
         previous = self.target
         was_end = self.cursor.at_end
         self.series, self.steps = series, union_steps(series)
@@ -356,7 +371,8 @@ class CompareImageView(CompareBase, Vertical):
         if not keep_position or was_end or previous is None:
             self.cursor = StepCursor(n, n - 1)
         else:
-            self.cursor = StepCursor(n, min(range(n), key=lambda i: abs(self.steps[i] - previous)))
+            nearest = min(range(n), key=lambda i: abs(self.steps[i] - previous)) if n else 0
+            self.cursor = StepCursor(n, nearest)
         self._sync(immediate=True)
 
     def show_unavailable(self, message: str) -> None:

@@ -7,9 +7,9 @@ from wandb_cli_tool.api import FileInfo, RunRef
 from wandb_cli_tool.app import WandbCliApp
 from wandb_cli_tool.config import Credentials
 from wandb_cli_tool.player import INSTALL_HINT
-from wandb_cli_tool.screens.config import MAX_CHILDREN, ConfigScreen, populate
+from wandb_cli_tool.screens.config import MAX_CHILDREN, ConfigPane, populate
 from wandb_cli_tool.screens.dialogs import GroupDialog, RenameDialog, TagsDialog
-from wandb_cli_tool.screens.files import FileScreen, FilesScreen
+from wandb_cli_tool.screens.files import FileScreen, FilesPane
 from wandb_cli_tool.screens.run import RunScreen
 from wandb_cli_tool.screens.runs import RunsScreen
 
@@ -87,14 +87,22 @@ async def test_menu_opens_logs_charts_config_and_files(make_app):
     app = make()
     async with app.run_test(size=SIZE) as pilot:
         await to_run(pilot)
-        menu = app.screen.query_one("#menu", OptionList)
-        assert menu.option_count == 4
-        await pilot.press("down", "down", "enter")
+        assert app.screen.active_tab == "overview"
+        await pilot.press("4")
         await settle(pilot)
-        assert isinstance(app.screen, ConfigScreen)
-        await pilot.press("escape", "down", "enter")
+        assert app.screen.active_tab == "config" and isinstance(app.screen.config_pane, ConfigPane)
+        await pilot.press("5")
         await settle(pilot)
-        assert isinstance(app.screen, FilesScreen)
+        assert app.screen.active_tab == "files" and isinstance(app.screen.files_pane, FilesPane)
+        await pilot.press("2")
+        await settle(pilot)
+        assert app.screen.active_tab == "logs"
+        await pilot.press("3")
+        await settle(pilot)
+        assert app.screen.active_tab == "charts"
+        await pilot.press("1")
+        await settle(pilot)
+        assert app.screen.active_tab == "overview"
 
 
 # ---- group ------------------------------------------------------------------------
@@ -289,7 +297,7 @@ async def test_config_is_shown_as_an_expandable_tree(make_app):
     app = make()
     async with app.run_test(size=SIZE) as pilot:
         await to_run(pilot)
-        await pilot.press("down", "down", "enter")
+        await pilot.press("4")
         await settle(pilot)
         tree = app.screen.query_one("#config", Tree)
         assert labels(tree.root) == ["lr: 0.1", "model  {} 2", "seed: 1", "tags: []"]
@@ -310,7 +318,7 @@ async def test_empty_config_and_huge_lists_are_handled(make_app):
     app = WandbCliApp(client_factory=Empty, audio_player=FakePlayer())
     async with app.run_test(size=SIZE) as pilot:
         await to_run(pilot)
-        await pilot.press("down", "down", "enter")
+        await pilot.press("4")
         await settle(pilot)
         assert "no config" in screen_text(app)
 
@@ -326,9 +334,9 @@ async def test_empty_config_and_huge_lists_are_handled(make_app):
 
 async def to_files(pilot):
     await to_run(pilot)
-    await pilot.press("down", "down", "down", "enter")
+    await pilot.press("5")
     await settle(pilot)
-    assert isinstance(pilot.app.screen, FilesScreen)
+    assert isinstance(pilot.app.screen, RunScreen) and pilot.app.screen.active_tab == "files"
 
 
 def find(node, basename):
@@ -383,7 +391,7 @@ async def test_enter_on_a_folder_expands_it_and_does_not_open_a_file(make_app):
         assert tree.cursor_node is tree.root.children[0]  # media/
         await pilot.press("enter")
         await settle(pilot)
-        assert isinstance(app.screen, FilesScreen) and tree.root.children[0].is_expanded
+        assert isinstance(app.screen, RunScreen) and app.screen.active_tab == "files" and tree.root.children[0].is_expanded
         assert "images/" in screen_text(app)
         await pilot.press("enter")
         await settle(pilot)

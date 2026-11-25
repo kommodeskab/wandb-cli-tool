@@ -9,7 +9,7 @@ uv sync
 uv run wandb-cli-tool          # or: uv tool install .   and then just: wandb-cli-tool
 ```
 
-On first launch you are asked for your API key and then pick an entity. Navigate with the arrow keys, `Enter` to open, `Esc` to go back, `q` to quit. The key bar at the bottom shows the keys that apply right now (a key that switches something shows its state: ☑ on, ☐ off, or the value in use, e.g. `Auto-refresh: 30 s`) (it wraps onto more lines on a narrow terminal). Logout (`l`), change entity (`e`) and quit (`q`) are listed on the projects page only, but work everywhere.
+On first launch you are asked for your API key and then pick an entity. Navigate with the arrow keys, `Enter` to open, `Esc` to go back, `q` to quit. In the projects list, `p` pins a project to the top (marked ★, remembered per entity; `p` again unpins). The key bar at the bottom shows the keys that apply right now (a key that switches something shows its state: ☑ on, ☐ off, or the value in use, e.g. `Auto-refresh: 30 s`) (it wraps onto more lines on a narrow terminal). Logout (`l`), change entity (`e`) and quit (`q`) are listed on the projects page only, but work everywhere.
 
 ## Sorting runs
 
@@ -22,7 +22,7 @@ In a project's run list, press `Space` to select the run under the cursor (a ✓
 - **Overview** (`1`): the facts from the top of a run screen (status, start, run time, group, tags, host, GPU, git, command, ID), one column per run. Rows where the runs differ are marked `≠`; `i` hides the identical rows.
 - **Config** (`3`): only what differs. A row is an entry (nested keys are written `model.name`, list items `layers[0]`) with each run's value; `—` means that run's config lacks the entry, and entries only some runs have are yellow. Entries that are the same in every run are hidden (`d` shows them), and the status line says how many there are.
 - **Metrics** (`2`): the latest value of every metric, one column per run, with a **Best** column naming the best run of each metric (green). Lower is better by default; press `b` to flip the metric under the cursor to "higher is better" (and back), or `B` to flip all. The **Better** column shows the direction, and your choices are remembered for the project. `i` hides rows where all runs agree.
-- **Charts** (`4`): the project's chart layout over all the selected runs. Charts are added, changed and deleted here with the same keys as in a single run (`n` new panel, `a` add chart, `x` x-axis, `o` options, `Delete`, `d` back to the default layout), and the layout is the project's one layout, so every change shows in the single-run screens too (and the other way round). The metrics, tables and images you can choose from are those of all the selected runs. A plot overlays one curve per run. A plot with several metrics is split into one plot per metric, so the lines stay readable. A bar chart draws, for each metric, one bar per run side by side. A plot where every run logged a single value is drawn as bars instead. Runs that did not log a metric are named in the chart and never queried. A table is shown as one table with a colored Run column (`v` lines up rows with the same first column), and images are shown side by side at the same step with one slider for all runs.
+- **Charts** (`4`): the project's chart layout over all the selected runs. Charts and panels are added, changed and deleted here with the same keys as in a single run (`n` new panel, `a` add chart, `o` chart options, `Delete`, `d` back to the default layout), and the layout is the project's one layout, so every change shows in the single-run screens too (and the other way round). The metrics, tables and images you can choose from are those of all the selected runs. A plot overlays one curve per run. A plot with several metrics is split into one plot per metric, so the lines stay readable. A bar chart draws, for each metric, one bar per run side by side. A plot where every run logged a single value is drawn as bars instead. Runs that did not log a metric are named in the chart and never queried. A table is shown as one table with a colored Run column (`v` lines up rows with the same first column), and images are shown side by side at the same step with one slider for all runs.
 
 In the Metrics and Config tabs, `/` filters the rows by key as you type (every word must occur in the key; `Enter` keeps the filter, `Esc` clears it; each tab keeps its own), and `p` pins the metric or config key under the cursor to the top (marked ★; a pinned key is always listed, even when its values are identical). Pins are remembered per project.
 
@@ -57,9 +57,9 @@ On a run's screen: `g` sets its group, `t` adds tags, `r` renames it, `c` copies
 
 ## Charts
 
-In a run's Charts screen, `n` creates a panel, `a` adds a chart to the selected panel, and `x` changes the x-axis of the focused plot. `a` first asks what kind of chart:
+In a run's Charts tab (`3`), `n` creates a panel and `a` adds a chart to the selected panel. Any logged `wandb.Table` or `wandb.Image` keys also appear automatically in **Tables** and **Images** panels. `a` first asks what kind of chart:
 
-- **Plot**: tick one or more values (up to 8, e.g. `train_loss` and `val_loss`) to draw them in one plot with a legend, and pick the x-axis they share. A filter box narrows the list.
+- **Plot**: tick one or more values (up to 8, e.g. `train_loss` and `val_loss`) to draw them in one plot with a legend, and pick the x-axis they share. The selected metrics appear below in draw order (top draws on top); focus the order list and press `Ctrl+↑` / `Ctrl+↓` to reorder them. A filter box narrows the list.
 - **Bar chart**: tick two or more metrics; each bar is that metric's latest value. They are drawn top to bottom in the order you pick them; to rearrange, focus the order list in the dialog and press `Ctrl+↑` / `Ctrl+↓`.
 - **Table**: show a `wandb.Table` that the run logged (the latest version of the one you pick). Use the arrow keys inside the table and `Tab` to move to the next chart.
 
@@ -77,9 +77,9 @@ Series colors come from a fixed palette in a fixed order. The kind and its setti
 
 When a run later logs the missing data, a refresh brings the chart to life. The first time you change something, the app tells you the change applies to all runs in the project, and deleting a chart or resetting (below) says so too. While the tool is under development, saved layouts may occasionally be discarded after an update (layouts saved per run in earlier versions were dropped when this changed).
 
-To change how a plot is drawn, focus it and press `o`: a fixed y-range (min and/or max), smoothing (0 to 0.99, an exponential moving average as in W&B: 0.9 is heavy), and a logarithmic y and/or x axis. Points a log axis cannot show (zero or negative) are left out, and the chart says how many. A bar chart can have a fixed value axis (`o` on it asks for a min and a max; a bar is clipped to the axis, and the figure beside it is still the real value). The settings are saved with the chart and shared by all runs of the project, like everything else about the layout (also in the compare screen).
+To edit a chart, focus it and press `o`: change its metrics, x-axis, y-range (min and/or max), smoothing (0 to 0.99, an exponential moving average as in W&B: 0.9 is heavy), and logarithmic y and/or x axes on a plot (points a log axis cannot show are left out, and the chart says how many); change metrics, bar order, and fixed value axis on a bar chart; or switch the key shown by a table or image chart. Settings are saved with the chart and shared by all runs of the project, like everything else about the layout (also in the compare screen).
 
-To delete a chart or table, focus it (`→` or `Tab`), press `Delete` (or `Backspace`), and confirm. It is removed from that panel in every run of the project (no run's data is touched), and a deleted default chart stays deleted next time (even when new metrics appear). `d` brings everything back. Tables are as tall as their rows need (up to 20 lines, then they scroll). These customizations are saved per run (in `chart_layouts.json` in the config directory, `~/.config/wandb-cli-tool/` on Linux) as soon as you make them, and are restored next time. Press `d` to go back to the default layout for that run (after a yes/no confirmation): this removes the panels and charts you added and any x-axis changes. While the tool is under development, saved layouts may occasionally be discarded after an update.
+To delete a chart, table or image, focus it (`→` or `Tab`), press `Delete` (or `Backspace`), and confirm. To delete a whole panel, focus the panel list and press `Delete` (or `Backspace`) and confirm. Deleted default charts and panels stay deleted next time (even when new metrics appear); `d` brings everything back after a yes/no confirmation. Tables are as tall as their rows need (up to 20 lines, then they scroll).
 
 ## Showing images in the VS Code terminal
 
@@ -106,4 +106,4 @@ Inside the image view: `+` / `-` / `0` zoom, `m` cycles the render mode.
 uv run pytest
 ```
 
-See `CLAUDE.md` for the architecture.
+See `AGENTS.md` (and `.agents/rules/`) for the architecture.

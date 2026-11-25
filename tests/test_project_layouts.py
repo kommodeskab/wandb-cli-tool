@@ -26,7 +26,7 @@ from wandb_cli_tool.refresh import PREF_KEY
 from wandb_cli_tool.screens.chart_widgets import (
     IMAGE_CHART_HEIGHT, NOTE_HEIGHT, PLOT_HEIGHT, BarView, ChartView, ImageChartView, TableView,
 )
-from wandb_cli_tool.screens.charts import ChartsScreen
+from wandb_cli_tool.screens.charts import ChartsPane
 
 SIZE = (130, 50)
 FULL = ["acc", "trainer/global_steps", "trainer/loss", "val/loss"]
@@ -93,19 +93,19 @@ async def pick_row(pilot, row):
 
 
 async def open_run_charts(pilot, project=0, run=0):
-    """From the projects list: project -> run -> its Charts screen."""
+    """From the projects list: project -> run -> its Charts tab."""
     await settle(pilot, 4)
     await pick_row(pilot, project)
     await pick_row(pilot, run)
-    await pilot.press("down", "enter")  # the run menu: Charts is the second entry
+    await pilot.press("3")  # Charts tab
     await settle(pilot, 8)
-    screen = pilot.app.screen
-    assert isinstance(screen, ChartsScreen)
+    screen = pilot.app.screen.charts_pane
+    assert isinstance(screen, ChartsPane)
     return screen
 
 
 async def back_to_projects(pilot):
-    await pilot.press("escape", "escape", "escape")
+    await pilot.press("escape", "escape")
     await settle(pilot, 4)
     assert pilot.app.screen.query("#items")
 
@@ -202,7 +202,7 @@ async def test_an_x_axis_choice_applies_to_every_run_that_has_the_metric():
     async with ctx as pilot:
         full = await open_run_charts(pilot, run=0)
         await select_panel(pilot, full, "trainer")
-        await pilot.press("right", "down", "x")  # trainer/loss
+        await pilot.press("right", "down", "o")  # trainer/loss
         await settle(pilot)
         app.screen.query_one("#x", Select).value = "acc"
         await pilot.click("#ok")

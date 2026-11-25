@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Sequence
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -27,6 +28,50 @@ def _x_choices(metrics: list[str], system: bool) -> list[tuple[object, str]]:
 
 def metric_options(metrics: list[str], system_metrics: list[str]) -> list[tuple[str, Value]]:
     return [(m, (False, m)) for m in metrics] + [(f"{m}  [system]", (True, m)) for m in system_metrics]
+
+
+def _metric_options_with(
+    metrics: Sequence[str], system_metrics: Sequence[str], extra: Sequence[Value]
+) -> list[tuple[str, Value]]:
+    """Available metrics plus any `extra` values missing from the current run (shared charts)."""
+    options = metric_options(list(metrics), list(system_metrics))
+    seen = {value for _, value in options}
+    for value in extra:
+        if value not in seen:
+            is_sys, name = value
+            options.append((f"{name}  [system]" if is_sys else name, value))
+            seen.add(value)
+    return options
+
+
+def _x_choices_with(metrics: Sequence[str], system: bool, current: str) -> list[tuple[object, str]]:
+    """x-axis choices plus `current` when a shared chart uses a metric not logged in this run."""
+    choices = _x_choices(list(metrics), system)
+    if current not in {value for _, value in choices}:
+        choices.append((plain(current), current))
+    return choices
+
+
+def _key_choices(items: Sequence[TableInfo] | Sequence[ImageInfo], current: str) -> list[tuple[object, str]]:
+    choices = [(plain(item.label), item.key) for item in items]
+    if current not in {value for _, value in choices}:
+        choices.append((plain(current), current))
+    return choices
+
+
+def _refresh_order_list(
+    order: OptionList, chosen: Sequence[Value], labels: dict[Value, str], highlight: int | None = None
+) -> None:
+    order.clear_options()
+    order.add_options([Option(plain(f"{i + 1}. {labels[v]}")) for i, v in enumerate(chosen)])
+    if chosen:
+        order.highlighted = highlight if highlight is not None else len(chosen) - 1
+
+
+def _move_order_item(picker: "MetricPicker", order: OptionList, delta: int) -> int | None:
+    if order.highlighted is None or not order.has_focus:
+        return None
+    return picker.move(order.highlighted, delta)
 
 
 class ChartKindDialog(CancellableDialog):
@@ -71,7 +116,7 @@ class MetricPicker(Vertical):
 
     DEFAULT_CSS = """
     MetricPicker { height: auto; }
-    MetricPicker SelectionList { height: 6; }
+    MetricPicker SelectionList { height: 12; }
     """
 
     class Changed(Message):
@@ -80,11 +125,17 @@ class MetricPicker(Vertical):
     class LimitReached(Message):
         """The user tried to pick more than `limit`."""
 
-    def __init__(self, options: list[tuple[str, Value]], limit: int | None = None, **kwargs) -> None:
+    def __init__(
+        self,
+        options: list[tuple[str, Value]],
+        limit: int | None = None,
+        initial: Sequence[Value] = (),
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
         self.options = options
         self.limit = limit
-        self.chosen: list[Value] = []  # pick order
+        self.chosen: list[Value] = list(initial)  # pick order
 
     def compose(self) -> ComposeResult:
         yield Input(placeholder="Filter metrics… (Tab: go to the list, Space: tick)", id="filter")
@@ -136,10 +187,15 @@ class MetricPicker(Vertical):
 
 
 class PlotDialog(CancellableDialog):
-    """Add a plot: pick one or more metrics (up to 8) and the x-axis they share."""
+    """Add a plot: pick one or more metrics (up to 8), arrange draw priority (Ctrl+↑/↓), and pick the x-axis."""
 
+    BINDINGS = [
+        ("ctrl+up", "move(-1)", "Move up"),
+        ("ctrl+down", "move(1)", "Move down"),
+    ]
     DEFAULT_CSS = """
     PlotDialog > VerticalScroll { width: 80; height: auto; max-height: 100%; border: round $accent; padding: 1 2; background: $surface; }
+    PlotDialog #order { height: 10; }
     #plot-error { color: $error; }
     """
 
@@ -147,12 +203,17 @@ class PlotDialog(CancellableDialog):
         super().__init__()
         self.metrics = metrics
         self.system_metrics = system_metrics
+        self.options = metric_options(metrics, system_metrics)
+        self.labels = {value: label for label, value in self.options}
         self._system_x = False
+        self._cursor: int | None = None
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
             yield Label(f"Add a plot (at most {MAX_SERIES} values)", markup=False)
-            yield MetricPicker(metric_options(self.metrics, self.system_metrics), limit=MAX_SERIES, id="picker")
+            yield MetricPicker(self.options, limit=MAX_SERIES, id="picker")
+            yield Label("Plot order (top draws on top; Ctrl+↑ / Ctrl+↓ moves):")
+            yield OptionList(id="order")
             yield Label("X-axis:")
             yield Select(_x_choices(self.metrics, False), allow_blank=False, id="x")
             yield Static("", id="plot-error")
@@ -166,11 +227,16 @@ class PlotDialog(CancellableDialog):
     def _error(self, text: str) -> None:
         self.query_one("#plot-error", Static).update(plain(text))
 
+    def _refresh_order(self, highlight: int | None = None) -> None:
+        _refresh_order_list(self.query_one("#order", OptionList), self.query_one("#picker", MetricPicker).chosen, self.labels, highlight)
+
     def on_metric_picker_limit_reached(self, event: MetricPicker.LimitReached) -> None:
         self._error(f"A plot can show at most {MAX_SERIES} values.")
 
     def on_metric_picker_changed(self, event: MetricPicker.Changed) -> None:
         self._error("")
+        cursor, self._cursor = self._cursor, None
+        self._refresh_order(cursor)
         chosen = self.query_one("#picker", MetricPicker).chosen
         system = any(is_system for is_system, _ in chosen)
         if system != self._system_x:  # system metrics only have time-based x-axes
@@ -181,6 +247,9 @@ class PlotDialog(CancellableDialog):
             x.set_options([(plain(label), value) for label, value in options])
             if previous in [v for _, v in options]:
                 x.value = previous
+
+    def action_move(self, delta: int) -> None:
+        self._cursor = _move_order_item(self.query_one("#picker", MetricPicker), self.query_one("#order", OptionList), delta)
 
     def _submit(self) -> None:
         chosen = self.query_one("#picker", MetricPicker).chosen
@@ -204,7 +273,7 @@ class BarDialog(CancellableDialog):
     ]
     DEFAULT_CSS = """
     BarDialog > VerticalScroll { width: 80; height: auto; max-height: 100%; border: round $accent; padding: 1 2; background: $surface; }
-    BarDialog OptionList { height: 6; }
+    BarDialog #order { height: 10; }
     #bar-error { color: $error; }
     """
 
@@ -232,12 +301,7 @@ class BarDialog(CancellableDialog):
         self.query_one("#bar-error", Static).update(plain(text))
 
     def _refresh_order(self, highlight: int | None = None) -> None:
-        order = self.query_one("#order", OptionList)
-        chosen = self.query_one("#picker", MetricPicker).chosen
-        order.clear_options()
-        order.add_options([Option(plain(f"{i + 1}. {self.labels[v]}")) for i, v in enumerate(chosen)])
-        if chosen:
-            order.highlighted = highlight if highlight is not None else len(chosen) - 1
+        _refresh_order_list(self.query_one("#order", OptionList), self.query_one("#picker", MetricPicker).chosen, self.labels, highlight)
 
     def on_metric_picker_changed(self, event: MetricPicker.Changed) -> None:
         self._error("")
@@ -248,10 +312,7 @@ class BarDialog(CancellableDialog):
         self._error(f"A bar chart can show at most {MAX_BAR_VALUES} values.")
 
     def action_move(self, delta: int) -> None:
-        order = self.query_one("#order", OptionList)
-        if order.highlighted is None or not order.has_focus:
-            return
-        self._cursor = self.query_one("#picker", MetricPicker).move(order.highlighted, delta)
+        self._cursor = _move_order_item(self.query_one("#picker", MetricPicker), self.query_one("#order", OptionList), delta)
         # the list is redrawn by on_metric_picker_changed, which uses self._cursor
 
     def _submit(self) -> None:
@@ -313,49 +374,52 @@ class ImageDialog(KeyPickerDialog):
         super().__init__([(plain(i.label), i.key) for i in images])
 
 
-class AxisDialog(CancellableDialog):
-    """Change the x-axis of a plot."""
-
-    DEFAULT_CSS = """
-    AxisDialog > Vertical { width: 76; height: auto; border: round $accent; padding: 1 2; background: $surface; }
-    """
-
-    def __init__(self, metrics: list[str], spec: ChartSpec) -> None:
-        super().__init__()
-        self.metrics = metrics
-        self.spec = spec
-
-    def compose(self) -> ComposeResult:
-        with Vertical():
-            yield Label("Change the x-axis of: " + ", ".join(self.spec.series), markup=False)
-            yield Select(_x_choices(self.metrics, self.spec.system), allow_blank=False, id="x")
-            with Horizontal():
-                yield Button("OK", variant="primary", id="ok")
-                yield Button("Cancel", id="cancel")
-
-    def on_mount(self) -> None:
-        x = self.query_one("#x", Select)
-        x.value = self.spec.x
-        x.focus()
-
-    def _submit(self) -> None:
-        self.dismiss(replace(self.spec, x=str(self.query_one("#x", Select).value)))
-
-
 class ChartOptionsDialog(CancellableDialog):
-    """Value range, smoothing and log axes of a plot; only the value range of a bar chart.
-    Empty = automatic / off."""
+    """Edit how a chart is built and drawn (metrics, x-axis / order / key, and axis options)."""
 
+    BINDINGS = [
+        ("ctrl+up", "move(-1)", "Move up"),
+        ("ctrl+down", "move(1)", "Move down"),
+    ]
     DEFAULT_CSS = """
-    ChartOptionsDialog > Vertical { width: 70; height: auto; border: round $accent; padding: 1 2; background: $surface; }
-    ChartOptionsDialog Input { margin-bottom: 1; }
-    #options-error { color: $error; }
+    ChartOptionsDialog > VerticalScroll { width: 82; height: auto; max-height: 100%; border: round $accent; padding: 1 2; background: $surface; }
+    ChartOptionsDialog MetricPicker SelectionList { height: 10; }
+    ChartOptionsDialog #order { height: 8; margin-bottom: 0; }
+    ChartOptionsDialog #opts-row { height: auto; margin-top: 0; }
+    ChartOptionsDialog .opt-col { width: 1fr; height: auto; margin-right: 1; }
+    ChartOptionsDialog #log-row { height: auto; margin-bottom: 0; }
+    ChartOptionsDialog #log-row Checkbox { width: 1fr; }
+    ChartOptionsDialog Input { margin-bottom: 0; }
+    ChartOptionsDialog #options-error { color: $error; }
     """
 
-    def __init__(self, spec: ChartSpec) -> None:
+    def __init__(
+        self,
+        spec: ChartSpec,
+        metrics: Sequence[str] = (),
+        system_metrics: Sequence[str] = (),
+        tables: Sequence[TableInfo] = (),
+        images: Sequence[ImageInfo] = (),
+    ) -> None:
         super().__init__()
         self.spec = spec
+        self.kind = spec.kind
         self.is_bar = spec.kind == BAR
+        self.metrics = list(metrics)
+        self.system_metrics = list(system_metrics)
+        self.tables = list(tables)
+        self.images = list(images)
+        self._system_x = spec.system
+        self._cursor: int | None = None
+        if self.kind == PLOT:
+            self._initial: list[Value] = [(spec.system, m) for m in spec.series]
+            self._picker_options = _metric_options_with(self.metrics, self.system_metrics, self._initial)
+            self._labels = {value: label for label, value in self._picker_options}
+        elif self.kind == BAR:
+            metric_set, system_set = set(self.metrics), set(self.system_metrics)
+            self._initial = [(m not in metric_set and m in system_set, m) for m in spec.series]
+            self._picker_options = _metric_options_with(self.metrics, self.system_metrics, self._initial)
+            self._labels = {value: label for label, value in self._picker_options}
 
     def compose(self) -> ComposeResult:
         o = self.spec.opts
@@ -363,26 +427,101 @@ class ChartOptionsDialog(CancellableDialog):
         def text(v: float | None) -> str:
             return "" if v is None else f"{v:.10g}"
 
-        what = "Axis" if self.is_bar else "Y"
-        with Vertical():
-            yield Label(("Bar chart options: " if self.is_bar else "Plot options: ") + ", ".join(self.spec.series), markup=False)
-            yield Label(f"{what} min (empty = automatic)", markup=False)
-            yield Input(text(o.ymin), id="ymin")
-            yield Label(f"{what} max (empty = automatic)", markup=False)
-            yield Input(text(o.ymax), id="ymax")
-            if not self.is_bar:
-                yield Label("Smoothing, 0 to 0.99 (empty = off; 0.9 is heavy)")
-                yield Input(text(o.smooth or None), id="smooth")
-                yield Checkbox("Logarithmic y-axis", o.logy, id="logy")
-                yield Checkbox("Logarithmic x-axis", o.logx, id="logx")
-            yield Static("", id="options-error")
+        heading = {
+            PLOT: f"Plot options: {', '.join(self.spec.series)}",
+            BAR: f"Bar chart options: {', '.join(self.spec.series)}",
+            TABLE: f"Table options: {self.spec.y}",
+            IMAGE: f"Image options: {self.spec.y}",
+        }[self.kind]
+        with VerticalScroll():
+            yield Label(heading, markup=False)
+            if self.kind == TABLE:
+                yield Label("Table:")
+                yield Select(_key_choices(self.tables, self.spec.y), value=self.spec.y, allow_blank=False, id="table")
+            elif self.kind == IMAGE:
+                yield Label("Image key:")
+                yield Select(_key_choices(self.images, self.spec.y), value=self.spec.y, allow_blank=False, id="image-key")
+            elif self.kind == PLOT:
+                yield MetricPicker(self._picker_options, limit=MAX_SERIES, initial=self._initial, id="picker")
+                yield Label("Plot order (top draws on top; Ctrl+↑ / Ctrl+↓ moves):")
+                yield OptionList(id="order")
+                yield Label("X-axis:")
+                yield Select(
+                    _x_choices_with(self.metrics, self.spec.system, self.spec.x),
+                    value=self.spec.x, allow_blank=False, id="x",
+                )
+                with Horizontal(id="opts-row"):
+                    with Vertical(classes="opt-col"):
+                        yield Label("Y min (empty = auto)")
+                        yield Input(text(o.ymin), id="ymin")
+                    with Vertical(classes="opt-col"):
+                        yield Label("Y max (empty = auto)")
+                        yield Input(text(o.ymax), id="ymax")
+                    with Vertical(classes="opt-col"):
+                        yield Label("Smoothing (0 to 0.99)")
+                        yield Input(text(o.smooth or None), id="smooth")
+                with Horizontal(id="log-row"):
+                    yield Checkbox("Logarithmic y-axis", o.logy, id="logy")
+                    yield Checkbox("Logarithmic x-axis", o.logx, id="logx")
+            else:  # BAR
+                yield MetricPicker(self._picker_options, limit=MAX_BAR_VALUES, initial=self._initial, id="picker")
+                yield Label("Bar order (Ctrl+↑ / Ctrl+↓ moves the highlighted one):")
+                yield OptionList(id="order")
+                with Horizontal(id="opts-row"):
+                    with Vertical(classes="opt-col"):
+                        yield Label("Axis min (empty = auto)")
+                        yield Input(text(o.ymin), id="ymin")
+                    with Vertical(classes="opt-col"):
+                        yield Label("Axis max (empty = auto)")
+                        yield Input(text(o.ymax), id="ymax")
+            if self.kind in (PLOT, BAR):
+                yield Static("", id="options-error")
             with Horizontal():
                 yield Button("Apply", variant="primary", id="ok")
-                yield Button("Back to defaults", id="reset")
+                if self.kind in (PLOT, BAR):
+                    yield Button("Back to defaults", id="reset")
                 yield Button("Cancel", id="cancel")
 
     def on_mount(self) -> None:
-        self.query_one("#ymin", Input).focus()
+        if self.kind in (PLOT, BAR):
+            self._refresh_order()
+        target = {TABLE: "#table", IMAGE: "#image-key"}.get(self.kind, "#ymin")
+        self.query_one(target).focus()
+
+    def _error(self, message: str) -> None:
+        if self.kind in (PLOT, BAR):
+            self.query_one("#options-error", Static).update(plain(message))
+
+    def _refresh_order(self, highlight: int | None = None) -> None:
+        _refresh_order_list(self.query_one("#order", OptionList), self.query_one("#picker", MetricPicker).chosen, self._labels, highlight)
+
+    def on_metric_picker_changed(self, event: MetricPicker.Changed) -> None:
+        self._error("")
+        if self.kind in (PLOT, BAR):
+            cursor, self._cursor = self._cursor, None
+            self._refresh_order(cursor)
+        if self.kind != PLOT:
+            return
+        chosen = self.query_one("#picker", MetricPicker).chosen
+        system = any(is_system for is_system, _ in chosen)
+        if system != self._system_x:
+            self._system_x = system
+            x = self.query_one("#x", Select)
+            previous = x.value
+            options = x_options(self.metrics, system)
+            x.set_options([(plain(label), value) for label, value in options])
+            if previous in [v for _, v in options]:
+                x.value = previous
+
+    def on_metric_picker_limit_reached(self, event: MetricPicker.LimitReached) -> None:
+        limit = MAX_BAR_VALUES if self.is_bar else MAX_SERIES
+        what = "bar chart" if self.is_bar else "plot"
+        self._error(f"A {what} can show at most {limit} values.")
+
+    def action_move(self, delta: int) -> None:
+        if self.kind not in (PLOT, BAR):
+            return
+        self._cursor = _move_order_item(self.query_one("#picker", MetricPicker), self.query_one("#order", OptionList), delta)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         # Textual also runs CancellableDialog's handler (OK / cancel); only Reset is ours, so it
@@ -393,17 +532,45 @@ class ChartOptionsDialog(CancellableDialog):
             self.dismiss(replace(self.spec, opts=ChartOptions()))
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        event.stop()
-        self._submit()
+        if event.input.id in ("ymin", "ymax", "smooth"):
+            event.stop()
+            self._submit()
 
     def _submit(self) -> None:
-        if self.is_bar:
-            smooth, logy, logx = "", False, False
-        else:
+        if self.kind == TABLE:
+            self.dismiss(ChartSpec(str(self.query_one("#table", Select).value), kind=TABLE))
+            return
+        if self.kind == IMAGE:
+            self.dismiss(ChartSpec(str(self.query_one("#image-key", Select).value), kind=IMAGE))
+            return
+        chosen = self.query_one("#picker", MetricPicker).chosen
+        if self.kind == PLOT:
+            if not chosen:
+                self._error("Tick at least one value.")
+                return
+            if len({is_system for is_system, _ in chosen}) > 1:
+                self._error("Pick either run metrics or system metrics in one plot, not both.")
+                return
             smooth = self.query_one("#smooth", Input).value
             logy, logx = self.query_one("#logy", Checkbox).value, self.query_one("#logx", Checkbox).value
-        result = parse_options(self.query_one("#ymin", Input).value, self.query_one("#ymax", Input).value, smooth, logy, logx)
+            result = parse_options(
+                self.query_one("#ymin", Input).value, self.query_one("#ymax", Input).value, smooth, logy, logx,
+            )
+            if isinstance(result, str):
+                self._error(result)
+                return
+            names = [name for _, name in chosen]
+            x = str(self.query_one("#x", Select).value)
+            self.dismiss(ChartSpec(names[0], x, chosen[0][0], PLOT, tuple(names[1:]), result))
+            return
+        if len(chosen) < 2:
+            self._error("Pick at least two values. A single value is better shown as a number.")
+            return
+        result = parse_options(
+            self.query_one("#ymin", Input).value, self.query_one("#ymax", Input).value, "", False, False,
+        )
         if isinstance(result, str):
-            self.query_one("#options-error", Static).update(plain(result))
-        else:
-            self.dismiss(replace(self.spec, opts=result))
+            self._error(result)
+            return
+        names = [name for _, name in chosen]
+        self.dismiss(ChartSpec(names[0], kind=BAR, more=tuple(names[1:]), opts=result))

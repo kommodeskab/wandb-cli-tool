@@ -331,3 +331,90 @@ async def test_duplicate_rows_from_shifting_pages_are_shown_once(make_app):
     async with app.run_test() as pilot:
         await settle(pilot, 4)
         assert prompts(app.screen) == ["a", "b"]
+
+
+async def test_pinning_projects_moves_them_first_keeps_cursor_and_persists(make_app):
+    from wandb_cli_tool.app import WandbCliApp
+
+    class ThreeProjects(GatedClient):
+        def iter_projects(self, entity):
+            if entity == "team-a":
+                yield from [ProjectInfo("proj-x"), ProjectInfo("proj-y")]
+                return
+            yield from [ProjectInfo("alpha"), ProjectInfo("beta"), ProjectInfo("gamma")]
+
+    config.save(Credentials("k", "me"))
+    app = WandbCliApp(client_factory=ThreeProjects)
+    async with app.run_test() as pilot:
+        await settle(pilot, 4)
+        table = app.screen.query_one("#items", DataTable)
+        assert prompts(app.screen) == ["alpha", "beta", "gamma"]
+        await pilot.press("down", "p")  # pin beta -> jumps to top; cursor stays on row 1
+        await settle(pilot)
+        assert prompts(app.screen) == ["★ beta", "alpha", "gamma"]
+        assert table.cursor_row == 1 and prompts(app.screen)[table.cursor_row] == "alpha"
+        await pilot.press("down", "p")  # pin gamma -> second pin after beta
+        await settle(pilot)
+        assert prompts(app.screen) == ["★ beta", "★ gamma", "alpha"]
+        assert app.preferences.get("pins")["projects"] == {"me": ["beta", "gamma"]}
+        await pilot.press("r")  # refresh keeps pinned order
+        await settle(pilot, 4)
+        assert prompts(app.screen) == ["★ beta", "★ gamma", "alpha"]
+        # switching entity uses that entity's own pins
+        await pilot.press("e")
+        await settle(pilot)
+        await pilot.press("down", "enter")  # team-a
+        await settle(pilot, 4)
+        assert prompts(app.screen) == ["proj-x", "proj-y"]
+        await pilot.press("down", "p")
+        await settle(pilot)
+        assert prompts(app.screen) == ["★ proj-y", "proj-x"]
+        # unpin works too
+        await pilot.press("up", "p")
+        await settle(pilot)
+        assert prompts(app.screen) == ["proj-x", "proj-y"]
+
+    # a new session starts with the saved pins (switch back to me to verify me's pins persisted)
+    config.save(Credentials("k", "me"))
+    app2 = WandbCliApp(client_factory=ThreeProjects)
+    async with app2.run_test() as pilot:
+        await settle(pilot, 4)
+        assert prompts(app2.screen) == ["★ beta", "★ gamma", "alpha"]
+        assert app2.screen.pinned == ["beta", "gamma"]
+
+
+async def test_cached_and_hostile_project_names_work_with_pins(make_app):
+    from wandb_cli_tool.app import WandbCliApp
+
+    class HostileProjects(GatedClient):
+        def iter_projects(self, entity):
+            self.gate.wait(5)
+            yield from [ProjectInfo("alpha"), ProjectInfo("[bold]proj [/x]")]
+
+    config.save(Credentials("k", "me"))
+    DiskCache().set(
+        "list",
+        "projects:me",
+        [["alpha", ["alpha", "", "", ""], ""], ["[bold]proj [/x]", ["[bold]proj [/x]", "", "", ""], ""]],
+    )
+    GatedClient.gate, GatedClient.fail = threading.Event(), False
+    app = WandbCliApp(client_factory=HostileProjects)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        assert prompts(app.screen) == ["alpha", "[bold]proj [/x]"]
+        await pilot.press("down", "p")  # pin hostile bracketed name
+        await settle(pilot)
+        assert prompts(app.screen) == ["★ [bold]proj [/x]", "alpha"]
+        GatedClient.gate.set()  # fresh replacement keeps pinned project first
+        await settle(pilot, 5)
+        assert prompts(app.screen) == ["★ [bold]proj [/x]", "alpha"]
+
+    # new session reads cache with pin already applied
+    GatedClient.gate = threading.Event()
+    app2 = WandbCliApp(client_factory=HostileProjects)
+    async with app2.run_test() as pilot:
+        await settle(pilot)
+        assert prompts(app2.screen) == ["★ [bold]proj [/x]", "alpha"]
+        GatedClient.gate.set()
+        await settle(pilot, 5)
+        assert prompts(app2.screen) == ["★ [bold]proj [/x]", "alpha"]

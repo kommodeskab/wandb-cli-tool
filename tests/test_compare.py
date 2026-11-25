@@ -3,7 +3,8 @@
 from wandb_cli_tool.api import RunInfo, RunMetadata
 from wandb_cli_tool.charts import BAR, PLOT, ChartSpec, Panel
 from wandb_cli_tool.compare import (
-    compare_charts, diff_config, flatten_config, is_single_value, overview_rows, run_labels,
+    MIN_OVERVIEW_COL, compare_charts, diff_config, flatten_config, is_single_value, overview_column_widths,
+    overview_rows, run_labels,
 )
 from wandb_cli_tool.screens.compare_widgets import grouped_bars_height, render_grouped_bars
 
@@ -155,3 +156,19 @@ def test_the_slider_covers_every_step_any_run_has_and_runs_show_their_nearest():
 def test_tables_and_images_of_a_layout_are_compared_too():
     panel = Panel("p", [ChartSpec("preds", kind=TABLE), ChartSpec("grid", kind=IMAGE)])
     assert [(c.kind, c.metrics) for c in compare_charts(panel)] == [(TABLE, ("preds",)), (IMAGE, ("grid",))]
+
+
+def test_overview_column_widths_fits_all_runs_and_clamps_only_when_very_narrow():
+    assert overview_column_widths(10, [], 100) == []
+    # fits naturally: no shrinking or padding
+    assert overview_column_widths(10, [15, 20], 100) == [15, 20]
+    # wide columns split available budget (100 - 10 - 8 = 82) without exceeding it
+    widths = overview_column_widths(10, [80, 80, 80], 100)
+    assert widths == [27, 27, 28] and 10 + sum(widths) + 4 * 2 <= 100
+    # water-filling: short column keeps its natural width and donates spare budget to wide columns
+    widths = overview_column_widths(10, [12, 80, 80], 100)
+    assert widths == [12, 35, 35] and 10 + sum(widths) + 4 * 2 <= 100
+    # very narrow screen: wide columns stop shrinking at MIN_OVERVIEW_COL, short ones keep natural
+    assert overview_column_widths(10, [8, 80, 80], 40) == [8, MIN_OVERVIEW_COL, MIN_OVERVIEW_COL]
+    # fallback when width is not yet known
+    assert overview_column_widths(10, [15, 120], 0, fallback_max=80) == [15, 80]

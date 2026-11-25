@@ -156,7 +156,8 @@ class ChartView(ChartBase, PlotextPlot):
         else:
             dark = is_dark(self)
             labels = display_names(names, spec.system)
-            for slot, (name, label) in enumerate(zip(names, labels)):
+            # Draw in reverse order so the top-listed (index 0) series paints on top of the rest
+            for slot, (name, label) in reversed(list(enumerate(zip(names, labels)))):
                 points = series.get(name)
                 if not points:
                     continue

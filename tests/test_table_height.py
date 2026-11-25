@@ -95,5 +95,5 @@ async def test_tables_in_the_charts_screen_fit_their_data(make_app, monkeypatch)
         small, large = list(screen.query(TableView))
         assert small.outer_size.height == 6  # not a mostly-empty 20-line box
         assert large.outer_size.height == TABLE_MAX_HEIGHT
-        text = "\n".join(s.text for s in screen._compositor.render_strips())
+        text = "\n".join(s.text for s in app.screen._compositor.render_strips())
         assert "bird" in text  # all three rows of the small table are visible

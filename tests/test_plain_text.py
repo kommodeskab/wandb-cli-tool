@@ -94,18 +94,14 @@ async def test_config_files_logs_and_metrics_with_bracketed_text(make_app):
     app, ctx = await hostile_app()
     async with ctx as pilot:
         await to_run(pilot)
-        await pilot.press("down", "down", "enter")  # Config
+        await pilot.press("4")  # Config
         await settle(pilot, 4)
         tree = app.screen.query_one("#config", Tree)
         assert [str(c.label) for c in tree.root.children][0] == "lr [/o]: 0.1"
-        await pilot.press("escape", "up", "up", "enter")  # Logs
+        await pilot.press("2")  # Logs
         await settle(pilot, 5)
         assert "[ERROR] boom [/oops]" in screen_text(app)
-        await pilot.press("escape")
-        await settle(pilot)
-        menu = app.screen.query_one("#menu", OptionList)
-        menu.highlighted = 3  # Files
-        await pilot.press("enter")
+        await pilot.press("5")  # Files
         await settle(pilot, 8)
         files = app.screen.query_one("#files", Tree)
         labels = [str(c.label) for c in files.root.children]
@@ -218,11 +214,13 @@ async def test_comparing_runs_with_bracketed_text(make_app):
         panels = screen.query_one("#panels", OptionList)
         assert panels.option_count >= 1
         assert any("weights[0]" in str(panels.get_option_at_index(i).prompt) for i in range(panels.option_count))
+        saw_plots = False
         for i in range(panels.option_count):  # draw every panel: none may crash
             screen.selected = i
             await screen._show_panel()
             await settle(pilot, 4)
-        assert list(screen.query(ComparePlotView))
+            saw_plots = saw_plots or bool(list(screen.query(ComparePlotView)))
+        assert saw_plots
 
 
 async def test_new_run_management_screens_show_bracketed_names_literally(make_app):

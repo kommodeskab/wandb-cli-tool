@@ -1,12 +1,13 @@
-from textual.widgets import SelectionList, Button, Input, OptionList, RichLog, Select, Static
+from textual.widgets import SelectionList, Button, Input, OptionList, RichLog, Select, Static, TabbedContent
 
 from wandb_cli_tool import config
 from wandb_cli_tool.config import Credentials
-from wandb_cli_tool.screens.charts import ChartsScreen, ChartView
+from wandb_cli_tool.screens.charts import ChartsPane, ChartView
 from chart_helpers import add_plot, start_add
-from wandb_cli_tool.screens.chart_dialogs import AxisDialog, PlotDialog
+from wandb_cli_tool.screens.chart_dialogs import ChartOptionsDialog, PlotDialog
 from wandb_cli_tool.screens.dialogs import NewPanelDialog
-from wandb_cli_tool.screens.logs import LogsScreen
+from wandb_cli_tool.screens.keybar import KeyBar
+from wandb_cli_tool.screens.logs import LogsPane
 from wandb_cli_tool.screens.run import RunScreen
 from wandb_cli_tool.screens.runs import RunsScreen
 
@@ -34,22 +35,64 @@ def panel_labels(screen):
 
 async def open_charts(pilot):
     await open_run(pilot)
-    await pilot.press("down", "enter")  # Charts
+    await pilot.press("3")  # Charts tab
     await settle(pilot, 5)
-    assert isinstance(pilot.app.screen, ChartsScreen)
-    return pilot.app.screen
+    assert isinstance(pilot.app.screen, RunScreen) and pilot.app.screen.active_tab == "charts"
+    return pilot.app.screen.charts_pane
 
 
-async def test_run_menu_offers_logs_and_charts(make_app):
+async def test_run_tabs_use_1_to_5_lazy_load_and_preserve_state(make_app):
     config.save(Credentials("k", "me"))
     app = make_app()
-    async with app.run_test(size=(130, 45)) as pilot:
+    async with app.run_test(size=(150, 45)) as pilot:
         await open_run(pilot)
-        menu = app.screen.query_one(OptionList)
-        assert [str(menu.get_option_at_index(i).prompt) for i in range(menu.option_count)] == [
-            "Logs", "Charts", "Config", "Files"
-        ]
-        assert app.screen.ref.id == "id1" and app.screen.ref.project == "alpha"
+        screen = app.screen
+        tabs = screen.query_one("#tabs", TabbedContent)
+        labels = [str(tabs.get_tab(pane.id).label) for pane in tabs.query("TabPane")]
+        assert labels == ["Overview", "Logs", "Charts", "Config", "Files"]
+        assert screen.active_tab == "overview"
+        assert screen.ref.id == "id1" and screen.ref.project == "alpha"
+        assert not (screen.logs_pane._started or screen.charts_pane._started or screen.config_pane._started or screen.files_pane._started)
+        assert app.client.series_calls == []
+
+        def bar():
+            return screen.query_one(KeyBar).query_one("KeyLine").render().plain.replace("\xa0", " ")
+
+        assert "1 Overview" in bar() and "2 Logs" in bar() and "5 Files" in bar()
+        assert "r Rename" in bar() and "s Stop run" in bar()
+
+        await pilot.press("2")  # Logs
+        await settle(pilot, 4)
+        assert screen.active_tab == "logs" and screen.logs_pane._started
+        assert "r Reload" in bar() and "f ☑ Follow" in bar()
+
+        await pilot.press("3")  # Charts
+        await settle(pilot, 5)
+        assert screen.active_tab == "charts" and screen.charts_pane._started
+        assert "r Refresh" in bar() and "n New panel" in bar()
+        await pilot.press("down")  # select "trainer"
+        await settle(pilot, 4)
+        assert screen.charts_pane.selected == 1
+        series_count = len(app.client.series_calls)
+
+        await pilot.press("4")  # Config
+        await settle(pilot, 4)
+        assert screen.active_tab == "config" and screen.config_pane._started
+        assert "r Rename" not in bar() and "r Refresh" not in bar() and "r Reload" not in bar()
+
+        await pilot.press("5")  # Files
+        await settle(pilot, 4)
+        assert screen.active_tab == "files" and screen.files_pane._started
+        assert "r Refresh" in bar()
+
+        await pilot.press("3")  # back to Charts: panel and loaded data stay
+        await settle(pilot, 3)
+        assert screen.charts_pane.selected == 1
+        assert len(app.client.series_calls) == series_count
+
+        await pilot.press("escape")  # Esc from any tab returns straight to runs list
+        await settle(pilot, 3)
+        assert isinstance(app.screen, RunsScreen)
 
 
 async def test_logs_screen_shows_lines_and_escape_goes_back(make_app):
@@ -57,17 +100,21 @@ async def test_logs_screen_shows_lines_and_escape_goes_back(make_app):
     app = make_app()
     async with app.run_test(size=(130, 45)) as pilot:
         await open_run(pilot)
-        await pilot.press("enter")  # Logs
+        await pilot.press("2")  # Logs
         await settle(pilot, 4)
-        assert isinstance(app.screen, LogsScreen)
+        assert isinstance(app.screen, RunScreen) and app.screen.active_tab == "logs"
+        assert isinstance(app.screen.logs_pane, LogsPane)
         log = app.screen.query_one(RichLog)
         text = "\n".join(strip.text for strip in log.lines)
         assert "epoch 1" in text and "red" in text and "\x1b" not in text
         assert "100% done" in text and "50%" not in text  # \r keeps the final state
-        assert "4 lines" in str(app.screen.query_one("#status", Static).render())
+        assert "4 lines" in str(app.screen.logs_pane.query_one("#status", Static).render())
+        await pilot.press("1")
+        await settle(pilot)
+        assert app.screen.active_tab == "overview"
         await pilot.press("escape")
         await settle(pilot)
-        assert isinstance(app.screen, RunScreen)
+        assert isinstance(app.screen, RunsScreen)
 
 
 async def test_charts_group_metrics_into_panels_with_system_first(make_app):
@@ -76,7 +123,7 @@ async def test_charts_group_metrics_into_panels_with_system_first(make_app):
     async with app.run_test(size=(130, 45)) as pilot:
         screen = await open_charts(pilot)
         assert panel_labels(screen) == [
-            "System (2)", "trainer (2)", "val (1)", "Other (1)"
+            "System (2)", "trainer (2)", "val (1)", "Other (1)", "Tables (2)", "Images (2)"
         ]
         # System panel is shown first, plotted against runtime
         views = list(screen.query(ChartView))
@@ -124,10 +171,10 @@ async def test_change_x_axis_of_existing_chart(make_app):
         await pilot.press("right")  # focus first chart
         await pilot.press("down")  # second chart (loss)
         assert isinstance(app.focused, ChartView) and app.focused.spec.y == "trainer/loss"
-        await pilot.press("x")
+        await pilot.press("o")
         await settle(pilot)
         dialog = app.screen
-        assert isinstance(dialog, AxisDialog) and "trainer/loss" in screen_text_of(dialog)
+        assert isinstance(dialog, ChartOptionsDialog) and "trainer/loss" in screen_text_of(dialog)
         dialog.query_one("#x", Select).value = "acc"
         await pilot.click("#ok")
         await settle(pilot, 4)
@@ -149,7 +196,7 @@ async def test_system_chart_x_options_exclude_step(make_app):
         assert "_step" not in values and "_runtime" in values
         await pilot.press("escape")
         await settle(pilot)
-        assert isinstance(app.screen, ChartsScreen)
+        assert isinstance(app.screen, RunScreen) and app.screen.active_tab == "charts"
 
 
 async def test_single_value_chart_is_shown_as_number_not_plot(make_app):
