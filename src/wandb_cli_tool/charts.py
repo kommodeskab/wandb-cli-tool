@@ -12,6 +12,7 @@ SYSTEM_PANEL = "System"
 OTHER_PANEL = "Other"  # metrics without a "/" in their name
 TABLES_PANEL = "Tables"
 IMAGES_PANEL = "Images"
+AUDIO_PANEL = "Audio"
 
 STEP = "_step"
 RUNTIME = "_runtime"
@@ -19,8 +20,8 @@ WALL_TIME = "_timestamp"
 
 AXIS_LABELS = {STEP: "Step", RUNTIME: "Runtime (s)", WALL_TIME: "Wall time"}
 
-PLOT, BAR, TABLE, IMAGE = "plot", "bar", "table", "image"
-KINDS = (PLOT, BAR, TABLE, IMAGE)
+PLOT, BAR, TABLE, IMAGE, AUDIO = "plot", "bar", "table", "image", "audio"
+KINDS = (PLOT, BAR, TABLE, IMAGE, AUDIO)
 MAX_BAR_VALUES = 40
 
 
@@ -48,32 +49,43 @@ class ChartOptions:
     smooth: float = 0.0  # exponential moving average weight, 0 = off (as in W&B: 0.9 is heavy smoothing)
     logy: bool = False
     logx: bool = False
+    xmin: float | None = None  # fixed x-range ends (None: automatic); plots only
+    xmax: float | None = None
+    grid: bool = False  # grid lines behind the data; plots only
 
     @property
     def is_default(self) -> bool:
         return self == ChartOptions()
 
-    def range_text(self) -> str:
-        """The fixed value range, e.g. "0…1" or "auto…5" ("" if it is automatic)."""
-        if self.ymin is None and self.ymax is None:
+    def range_text(self, axis: str = "y") -> str:
+        """The fixed range of an axis, e.g. "0…1" or "auto…5" ("" if it is automatic)."""
+        low, high = (self.xmin, self.xmax) if axis == "x" else (self.ymin, self.ymax)
+        if low is None and high is None:
             return ""
-        lo = "auto" if self.ymin is None else f"{self.ymin:g}"
-        hi = "auto" if self.ymax is None else f"{self.ymax:g}"
+        lo = "auto" if low is None else f"{low:g}"
+        hi = "auto" if high is None else f"{high:g}"
         return f"{lo}…{hi}"
 
     def describe(self) -> str:
         """The non-default settings in a few words, for a chart's subtitle."""
         parts = []
+        if self.range_text("x"):
+            parts.append(f"x {self.range_text('x')}")
         if self.range_text():
             parts.append(f"y {self.range_text()}")
         if self.smooth:
             parts.append(f"smoothed {self.smooth:g}")
         if self.logy or self.logx:
             parts.append("log " + " & ".join(a for a, on in (("x", self.logx), ("y", self.logy)) if on))
+        if self.grid:
+            parts.append("grid")
         return ", ".join(parts)
 
     def to_json(self) -> dict[str, Any]:
-        return {"ymin": self.ymin, "ymax": self.ymax, "smooth": self.smooth, "logy": self.logy, "logx": self.logx}
+        return {
+            "ymin": self.ymin, "ymax": self.ymax, "smooth": self.smooth, "logy": self.logy, "logx": self.logx,
+            "xmin": self.xmin, "xmax": self.xmax, "grid": self.grid,
+        }
 
     @staticmethod
     def from_json(data: Any) -> "ChartOptions":
@@ -89,13 +101,19 @@ class ChartOptions:
         out = ChartOptions(
             number("ymin"), number("ymax"), min(max(smooth, 0.0), MAX_SMOOTHING),
             data.get("logy") is True, data.get("logx") is True,
+            number("xmin"), number("xmax"), data.get("grid") is True,
         )
         if out.ymin is not None and out.ymax is not None and out.ymin >= out.ymax:
             out = replace(out, ymin=None, ymax=None)
+        if out.xmin is not None and out.xmax is not None and out.xmin >= out.xmax:
+            out = replace(out, xmin=None, xmax=None)
         return out
 
 
-def parse_options(ymin: str, ymax: str, smooth: str, logy: bool, logx: bool) -> ChartOptions | str:
+def parse_options(
+    ymin: str, ymax: str, smooth: str, logy: bool, logx: bool,
+    xmin: str = "", xmax: str = "", grid: bool = False,
+) -> ChartOptions | str:
     """Options from what the user typed, or a message saying what is wrong. Blank = off/automatic."""
 
     def number(text: str, what: str) -> float | None | str:
@@ -109,14 +127,17 @@ def parse_options(ymin: str, ymax: str, smooth: str, logy: bool, logx: bool) -> 
         return value if math.isfinite(value) else f"{what} must be a finite number."
 
     lo, hi, weight = number(ymin, "Y min"), number(ymax, "Y max"), number(smooth, "Smoothing")
-    for v in (lo, hi, weight):
+    xlo, xhi = number(xmin, "X min"), number(xmax, "X max")
+    for v in (lo, hi, weight, xlo, xhi):
         if isinstance(v, str):
             return v
     if lo is not None and hi is not None and lo >= hi:
         return "Y min must be smaller than Y max."
+    if xlo is not None and xhi is not None and xlo >= xhi:
+        return "X min must be smaller than X max."
     if weight is not None and not 0 <= weight <= MAX_SMOOTHING:
         return f"Smoothing must be between 0 (off) and {MAX_SMOOTHING}."
-    return ChartOptions(lo, hi, weight or 0.0, logy, logx)  # type: ignore[arg-type]
+    return ChartOptions(lo, hi, weight or 0.0, logy, logx, xlo, xhi, grid)  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True)
@@ -128,6 +149,7 @@ class ChartSpec:
            `opts.ymin`/`ymax` fix the ends of the value axis.
     table: y is the key of a wandb.Table the run logged.
     image: y is a key under which the run logged wandb.Images (browsed with a step slider).
+    audio: y is a key under which the run logged wandb.Audio (step slider, waveform, player).
     `opts` (plots only) are the y-range, smoothing and log axes."""
 
     y: str
@@ -147,6 +169,8 @@ class ChartSpec:
             return f"Table: {self.y}"
         if self.kind == IMAGE:
             return f"Images: {self.y}"
+        if self.kind == AUDIO:
+            return f"Audio: {self.y}"
         names = ", ".join(display_names(self.series, self.system and self.kind == PLOT))
         return f"Bar: {names}" if self.kind == BAR else names
 
@@ -178,8 +202,9 @@ def build_panels(
     system_metrics: list[str],
     tables: Sequence[str] = (),
     images: Sequence[str] = (),
+    audio: Sequence[str] = (),
 ) -> list[Panel]:
-    """System first, then metric-prefix panels (alphabetical), "Other", "Tables" and "Images"."""
+    """System first, then metric-prefix panels (alphabetical), "Other", "Tables", "Images" and "Audio"."""
     groups: dict[str, list[ChartSpec]] = {}
     for key in metrics:
         groups.setdefault(panel_name(key), []).append(ChartSpec(key))
@@ -189,6 +214,7 @@ def build_panels(
     system.charts.extend(groups.pop(SYSTEM_PANEL, []))  # a user panel named "System" merges
     tables_extra = groups.pop(TABLES_PANEL, []) if tables else []
     images_extra = groups.pop(IMAGES_PANEL, []) if images else []
+    audio_extra = groups.pop(AUDIO_PANEL, []) if audio else []
     other = groups.pop(OTHER_PANEL, None)
     panels = [system, *(Panel(n, c) for n, c in sorted(groups.items()))]
     if other:
@@ -197,6 +223,8 @@ def build_panels(
         panels.append(Panel(TABLES_PANEL, [ChartSpec(k, kind=TABLE) for k in tables] + tables_extra))
     if images:
         panels.append(Panel(IMAGES_PANEL, [ChartSpec(k, kind=IMAGE) for k in images] + images_extra))
+    if audio:
+        panels.append(Panel(AUDIO_PANEL, [ChartSpec(k, kind=AUDIO) for k in audio] + audio_extra))
     return panels
 
 
@@ -234,7 +262,7 @@ def _spec_from_json(c: Any) -> ChartSpec | None:
     kind, more = c.get("kind", PLOT), c.get("more", [])
     if kind not in KINDS or not (isinstance(more, list) and all(isinstance(m, str) for m in more)):
         return None
-    limit = {PLOT: MAX_SERIES, BAR: MAX_BAR_VALUES, TABLE: 1, IMAGE: 1}[kind]
+    limit = {PLOT: MAX_SERIES, BAR: MAX_BAR_VALUES, TABLE: 1, IMAGE: 1, AUDIO: 1}[kind]
     if 1 + len(more) > limit:
         return None
     return ChartSpec(c["y"], c["x"], c["system"], kind, tuple(more), ChartOptions.from_json(c.get("opts")))

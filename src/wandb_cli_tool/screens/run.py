@@ -220,8 +220,6 @@ class RunScreen(Screen):
         if action == "run_f":
             if tab == "logs":
                 return self.logs_pane.check_action("toggle_follow", ())
-            if tab == "charts":
-                return self.charts_pane.check_action("cycle_refresh", ())
             return False
         if action in CHARTS_ACTIONS:
             return self.charts_pane.check_action(action, parameters) if tab == "charts" else False
@@ -236,7 +234,7 @@ class RunScreen(Screen):
         if action == "run_o":
             return "Chart options" if tab == "charts" else "Open in browser"
         if action == "run_f":
-            return self.charts_pane.key_label("cycle_refresh") if tab == "charts" else "Follow"
+            return "Follow"
         return None
 
     def toggle_state(self, action: str) -> bool | None:
@@ -293,8 +291,6 @@ class RunScreen(Screen):
     def action_run_f(self) -> None:
         if self.active_tab == "logs":
             self.logs_pane.action_toggle_follow()
-        elif self.active_tab == "charts":
-            self.charts_pane.action_cycle_refresh()
 
     def action_new_panel(self) -> None:
         if self.active_tab == "charts":

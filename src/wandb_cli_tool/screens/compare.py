@@ -25,12 +25,13 @@ from textual.widgets.option_list import Option
 
 from ..api import RunInfo, RunMetadata, RunRef
 from ..charts import (
-    BAR, IMAGE, RUNTIME, STEP, TABLE, WALL_TIME, ChartLayout, ChartSpec, Panel, build_panels, display_names,
+    AUDIO, BAR, IMAGE, RUNTIME, STEP, TABLE, WALL_TIME, ChartLayout, ChartSpec, Panel, build_panels, display_names,
 )
 from ..compare import (
     MAX_OVERVIEW_LINES, CompareChart, ConfigDiff, compare_charts, diff_config, is_single_value, metric_rows,
     overview_column_widths, overview_rows, run_labels,
 )
+from ..audio import AudioInfo
 from ..images import ImageInfo, ImageSeries, ImageStep
 from ..tables import TableData, TableInfo
 from ..layout_store import project_key
@@ -42,8 +43,9 @@ from .chart_widgets import CHART_CLASS, is_dark
 from .charts import SERIES_BATCH, SERIES_WORKERS, _or_default
 from .chart_editing import EDIT_ACTIONS, ChartEditing
 from .compare_widgets import (
-    CompareBarView, CompareBase, CompareImageView, ComparePlotView, CompareTableView,
+    CompareAudioView, CompareBarView, CompareBase, CompareImageView, ComparePlotView, CompareTableView,
 )
+from .audiofetch import fetch_audio
 from .imagefetch import fetch_image
 from .filterinput import FilterInput
 from .keybar import KeyBar
@@ -92,6 +94,7 @@ class RunData:
     system_rows: list[dict] = field(default_factory=list)
     tables: list[TableInfo] = field(default_factory=list)
     images: list[ImageInfo] = field(default_factory=list)
+    audios: list[AudioInfo] = field(default_factory=list)
     error: str = ""
 
     def __post_init__(self) -> None:
@@ -131,7 +134,8 @@ def fetch_run(client, ref: RunRef, name: str, pool: ThreadPoolExecutor | None = 
         values = _or_default(partial(client.metric_values, ref), {})
         tables = _or_default(partial(client.run_tables, ref), [])
         images = _or_default(partial(client.run_images, ref), [])
-        return config, metrics, values, tables, images
+        audios = _or_default(partial(client.run_audios, ref), [])
+        return config, metrics, values, tables, images, audios
 
     own = pool is None
     pool = pool or ThreadPoolExecutor(max_workers=4)
@@ -140,9 +144,9 @@ def fetch_run(client, ref: RunRef, name: str, pool: ThreadPoolExecutor | None = 
         meta_job = pool.submit(_or_default, partial(client.run_metadata, ref), RunMetadata())  # no file: dashes
         rows_job = pool.submit(_or_default, partial(client.system_rows, ref), [])
         summary_job = pool.submit(summary)
-        config, metrics, values, tables, images = summary_job.result()
+        config, metrics, values, tables, images, audios = summary_job.result()
         return RunData(info_job.result(), meta_job.result(), config, metrics, values, rows_job.result(),
-                       tables, images, "; ".join(errors))
+                       tables, images, audios, "; ".join(errors))
     finally:
         if own:
             pool.shutdown()
@@ -203,6 +207,7 @@ class CompareScreen(ChartEditing, Screen):
         self.system_metrics: list[str] = []
         self.tables: list[TableInfo] = []
         self.images: list[ImageInfo] = []
+        self.audios: list[AudioInfo] = []
         self.selected = 0
         self._panel_labels: list[str] = []
         self._shown_panel: int | None = None
@@ -622,7 +627,7 @@ class CompareScreen(ChartEditing, Screen):
         self._update_status()
 
     # ---- charts ----------------------------------------------------------------------
-    empty_note = "None of these runs has metrics, tables or images to chart."
+    empty_note = "None of these runs has metrics, tables, images or audio to chart."
 
     @property
     def panels(self) -> list[Panel]:
@@ -639,8 +644,12 @@ class CompareScreen(ChartEditing, Screen):
         self.system_metrics = sorted({m for d in self.data for m in d.system_metrics})
         self.tables = sorted({t.key: t for d in self.data for t in d.tables}.values(), key=lambda t: t.key)
         self.images = sorted({i.key: i for d in self.data for i in d.images}.values(), key=lambda i: i.key)
+        self.audios = sorted({a.key: a for d in self.data for a in d.audios}.values(), key=lambda a: a.key)
         self.chart_layout = ChartLayout(
-            build_panels(self.metrics, self.system_metrics, [t.key for t in self.tables], [i.key for i in self.images]),
+            build_panels(
+                self.metrics, self.system_metrics, [t.key for t in self.tables],
+                [i.key for i in self.images], [a.key for a in self.audios],
+            ),
             self.app.layout_store.load(self._layout_key),
         )
         self.selected = self.chart_layout.index_of(keep_panel) if keep_panel and self.panels else 0
@@ -666,6 +675,8 @@ class CompareScreen(ChartEditing, Screen):
         for view in views:
             if isinstance(view, CompareImageView):
                 self._load_images(view, keep_position=keep_position)
+            elif isinstance(view, CompareAudioView):
+                self._load_audio(view, keep_position=keep_position)
             elif not isinstance(view, ComparePlotView):
                 self._load_chart(view)
 
@@ -704,7 +715,7 @@ class CompareScreen(ChartEditing, Screen):
         self.action_focus_chart(0)
 
     def _make_view(self, chart: CompareChart, index: int) -> CompareBase:
-        kinds = {BAR: CompareBarView, TABLE: CompareTableView, IMAGE: CompareImageView}
+        kinds = {BAR: CompareBarView, TABLE: CompareTableView, IMAGE: CompareImageView, AUDIO: CompareAudioView}
         return kinds.get(chart.kind, ComparePlotView)(chart, index, self.labels)
 
     def _load_chart(self, view: CompareBase) -> None:
@@ -714,6 +725,9 @@ class CompareScreen(ChartEditing, Screen):
             return
         if chart.kind == IMAGE:
             self._load_images(view)
+            return
+        if chart.kind == AUDIO:
+            self._load_audio(view)
             return
         if chart.kind == BAR:
             names = display_names(chart.metrics, chart.system)
@@ -883,6 +897,52 @@ class CompareScreen(ChartEditing, Screen):
             self.app.call_from_thread(view.fail, run, str(exc), token)
             return
         self.app.call_from_thread(view.show_image, run, thumb, token, original)
+
+    def _load_audio(self, view: CompareAudioView, keep_position: bool = False) -> None:
+        key = view.chart.metric
+        have = [i for i, d in enumerate(self.data) if any(a.key == key for a in d.audios)]
+        if not have:
+            view.show_unavailable(f"No compared run logged audio called “{key}”.")
+        else:
+            self._fetch_audio_steps(view, key, have, keep_position)
+
+    @work(thread=True)
+    def _fetch_audio_steps(self, view: CompareAudioView, key: str, have: list[int], keep_position: bool = False) -> None:
+        def one(i: int) -> ImageSeries:
+            return self.app.client.audio_steps(self.runs[i][0], key)
+
+        try:
+            with ThreadPoolExecutor(max_workers=min(len(have), SERIES_WORKERS)) as pool:
+                found = dict(zip(have, pool.map(one, have)))
+        except Exception as exc:
+            self.app.call_from_thread(view.show_unavailable, f"Could not read the audio: {exc}")
+            return
+        series = [found.get(i) for i in range(len(self.runs))]
+        self.app.call_from_thread(self._audio_steps_ready, view, series, keep_position)
+
+    def _audio_steps_ready(self, view: CompareAudioView, series: list[ImageSeries | None], keep_position: bool = False) -> None:
+        if view.is_attached:
+            view.set_series(series, keep_position=keep_position)
+
+    def on_compare_audio_view_wanted(self, event: CompareAudioView.Wanted) -> None:
+        event.stop()
+        view = event.view
+        if not view.is_attached:
+            return
+        token = view.token()
+        for run in range(len(self.runs)):
+            step = view.step_for(run)
+            if step is not None:
+                self._fetch_clip(view, run, step, min(view.sub, len(step.paths) - 1), token)
+
+    @work(thread=True, group="audio")
+    def _fetch_clip(self, view: CompareAudioView, run: int, step: ImageStep, sub: int, token: tuple[int, int]) -> None:
+        try:
+            path, waveform, note = fetch_audio(self.app, self.runs[run][0], step, sub)
+        except Exception as exc:
+            self.app.call_from_thread(view.fail, run, str(exc), token)
+            return
+        self.app.call_from_thread(view.show_clip, run, path, waveform, token, note)
 
     # ---- focus -----------------------------------------------------------------------
     def action_focus_chart(self, delta: int) -> None:

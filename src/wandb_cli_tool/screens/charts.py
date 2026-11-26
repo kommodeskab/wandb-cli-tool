@@ -16,19 +16,22 @@ from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 from ..api import RunRef
+from ..audio import AudioInfo
 from ..charts import (
-    BAR, IMAGE, PLOT, RUNTIME, STEP, TABLE, WALL_TIME, ChartLayout, ChartSpec, Panel, axis_label, build_panels,
+    AUDIO, BAR, IMAGE, PLOT, RUNTIME, STEP, TABLE, WALL_TIME, ChartLayout, ChartSpec, Panel, axis_label, build_panels,
 )
 from ..images import ImageInfo, ImageSeries, ImageStep
 from ..layout_store import project_key
 from ..plain import plain
-from ..refresh import PREF_KEY, interval_from_pref, label as interval_label, next_choice, to_pref
+from ..refresh import AUTO_REFRESH_SECONDS, label as interval_label
 from ..series import Point, batches, extract_points, is_number, last_values
 from ..tables import TableData, TableInfo
 from .chart_editing import EDIT_ACTIONS, ChartEditing
 from .chart_widgets import (  # noqa: F401
     CHART_CLASS, BarView, ChartBase, ChartView, ImageChartView, TableView, make_chart_widget,
 )
+from .audio_widgets import AudioChartView
+from .audiofetch import fetch_audio
 from .imagefetch import fetch_image
 
 if TYPE_CHECKING:
@@ -58,6 +61,7 @@ class ChartData:
     tables: list[TableInfo]
     state: str  # the run's state ("running", "finished", ...), "" if unknown
     images: list[ImageInfo] = field(default_factory=list)
+    audios: list[AudioInfo] = field(default_factory=list)
 
 
 class ChartsPane(ChartEditing, Vertical):
@@ -87,6 +91,7 @@ class ChartsPane(ChartEditing, Vertical):
         self.system_last: dict[str, float] = {}
         self.tables: list[TableInfo] = []
         self.images: list[ImageInfo] = []
+        self.audios: list[AudioInfo] = []
         self._table_cache: dict[str, TableData] = {}
         self.chart_layout: ChartLayout | None = None
         self._status_base = ""
@@ -98,7 +103,7 @@ class ChartsPane(ChartEditing, Vertical):
         # periodic refresh
         self.state = ""
         self.live = False  # the run is still running, so new data may arrive
-        self.interval: float | None = None
+        self.interval: float | None = AUTO_REFRESH_SECONDS
         self._timer = None
         self._refreshing = False
         self._last_refresh: datetime | None = None
@@ -118,9 +123,6 @@ class ChartsPane(ChartEditing, Vertical):
         with Horizontal():
             yield OptionList(id="panels")
             yield VerticalScroll(id="charts")
-
-    def on_mount(self) -> None:
-        self.interval = interval_from_pref(self.app.preferences.get(PREF_KEY))
 
     def activate(self) -> None:
         if not self._started:
@@ -142,13 +144,14 @@ class ChartsPane(ChartEditing, Vertical):
             values = _or_default(partial(client.metric_values, ref), {})  # these read the loaded run: cheap
             tables = _or_default(partial(client.run_tables, ref), [])
             images = _or_default(partial(client.run_images, ref), [])
+            audios = _or_default(partial(client.run_audios, ref), [])
             note = ""
             try:
                 rows = rows_job.result()
             except Exception as exc:  # the run can still be browsed without system data
                 rows, note = [], f" (system metrics unavailable: {exc})"
             state = _or_default(state_job.result, "")
-        return ChartData(metrics, rows, note, values, tables, state, images)
+        return ChartData(metrics, rows, note, values, tables, state, images, audios)
 
     @work(thread=True, exclusive=True, group="load")
     def load(self) -> None:
@@ -165,6 +168,7 @@ class ChartsPane(ChartEditing, Vertical):
         self.values = data.values
         self.tables = data.tables
         self.images = data.images
+        self.audios = data.audios
         self.system_rows = data.rows
         self.system_last = last_values(data.rows)
         self.system_metrics = sorted(
@@ -176,14 +180,18 @@ class ChartsPane(ChartEditing, Vertical):
         self._status_base = (
             f"{len(data.metrics)} metrics, {len(self.system_metrics)} system metrics, "
             f"{len(data.tables)} table{'s' * (len(data.tables) != 1)}, "
-            f"{len(data.images)} image key{'s' * (len(data.images) != 1)}{data.note}"
+            f"{len(data.images)} image key{'s' * (len(data.images) != 1)}, "
+            f"{len(data.audios)} audio key{'s' * (len(data.audios) != 1)}{data.note}"
         )
 
     async def _loaded(self, data: ChartData) -> None:
         self._apply_data(data)
         # the generated panels, plus whatever the user customized in an earlier session
         self.chart_layout = ChartLayout(
-            build_panels(self.metrics, self.system_metrics, [t.key for t in self.tables], [i.key for i in self.images]),
+            build_panels(
+                self.metrics, self.system_metrics, [t.key for t in self.tables],
+                [i.key for i in self.images], [a.key for a in self.audios],
+            ),
             self.app.layout_store.load(self._layout_key),
         )
         self.ready = True
@@ -235,7 +243,10 @@ class ChartsPane(ChartEditing, Vertical):
         self._table_cache.clear()
         # defaults are rebuilt from the new metrics; the user's customizations are kept as they are
         self.chart_layout = ChartLayout(
-            build_panels(self.metrics, self.system_metrics, [t.key for t in self.tables], [i.key for i in self.images]),
+            build_panels(
+                self.metrics, self.system_metrics, [t.key for t in self.tables],
+                [i.key for i in self.images], [a.key for a in self.audios],
+            ),
             self.chart_layout.custom,
         )
         self.selected = self.chart_layout.index_of(panel) if panel and self.panels else 0
@@ -273,22 +284,11 @@ class ChartsPane(ChartEditing, Vertical):
         if self.is_attached and self.app.screen is self.screen and self.screen.active_tab == "charts":  # not while a dialog is open on top
             self.refresh_now()
 
-    def key_label(self, action: str) -> str | None:
-        """The key shows the interval in use (it cycles through the choices)."""
-        return f"Auto-refresh: {interval_label(self.interval)}" if action == "cycle_refresh" else None
-
     def set_refresh_interval(self, seconds: float | None) -> None:
+        """Only tests change the interval (to something short); the app always uses 30 seconds."""
         self.interval = seconds or None
         self._apply_timer()
         self._update_status()
-
-    def action_cycle_refresh(self) -> None:
-        self.set_refresh_interval(next_choice(self.interval))
-        self.app.preferences.set(PREF_KEY, to_pref(self.interval))
-        if self.interval and not self.live and self.ready:
-            self.notify(f"Auto-refresh set to {interval_label(self.interval)}; it only runs while the run is running.")
-        else:
-            self.notify(f"Auto-refresh: {interval_label(self.interval)}")
 
     def _status(self, text: str) -> None:
         self.query_one("#status", Static).update(plain(text))
@@ -313,8 +313,6 @@ class ChartsPane(ChartEditing, Vertical):
             return self.check_chart_action(action)
         if action == "cycle_focus":
             return bool(self.ready and self.panels and self.panels[self.selected].charts)
-        if action == "cycle_refresh":
-            return self.live
         return True
 
     def _focused_chart(self) -> tuple[ChartSpec, int] | None:
@@ -381,6 +379,8 @@ class ChartsPane(ChartEditing, Vertical):
             self._load_bars(view)
         elif kind == IMAGE:
             self._load_images(view, quiet)
+        elif kind == AUDIO:
+            self._load_audio(view, quiet)
         elif kind == TABLE:
             self._load_table(view, quiet)
         else:
@@ -530,6 +530,39 @@ class ChartsPane(ChartEditing, Vertical):
             self.app.call_from_thread(view.fail, str(exc), token)
             return
         self.app.call_from_thread(view.show_image, thumb, token, original)
+
+    def _load_audio(self, view: AudioChartView, quiet: bool = False) -> None:
+        if view.spec.y not in {a.key for a in self.audios}:
+            view.show_unavailable(f"This run has no logged audio called “{view.spec.y}”.")
+        else:
+            self._fetch_audio_steps(view, quiet)
+
+    @work(thread=True)
+    def _fetch_audio_steps(self, view: AudioChartView, quiet: bool) -> None:
+        self._deliver(
+            view, quiet, partial(self.app.client.audio_steps, self.ref, view.spec.y), partial(self._audio_steps_ready, view, quiet)
+        )
+
+    def _audio_steps_ready(self, view: AudioChartView, quiet: bool, series: ImageSeries) -> None:
+        if view.is_attached:
+            view.set_steps(series, keep_position=quiet)
+
+    def on_audio_chart_view_wanted(self, event: AudioChartView.Wanted) -> None:
+        """A slider settled on a step: fetch that clip and read its waveform."""
+        event.stop()
+        view = event.view
+        step, sub = view.current_step, view.sub
+        if step is not None and view.is_attached:
+            self._fetch_clip(view, step, sub, (step.step, sub))
+
+    @work(thread=True, group="audio")
+    def _fetch_clip(self, view: AudioChartView, step: ImageStep, sub: int, token: tuple[int, int]) -> None:
+        try:
+            path, waveform, note = fetch_audio(self.app, self.ref, step, sub)
+        except Exception as exc:
+            self.app.call_from_thread(view.fail, str(exc), token)
+            return
+        self.app.call_from_thread(view.show_clip, path, waveform, token, note)
 
     def _load_bars(self, view: BarView) -> None:
         items = [(name, self.values.get(name, self.system_last.get(name))) for name in view.spec.series]

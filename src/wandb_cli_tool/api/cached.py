@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from ..series import Point
+from ..audio import AudioInfo
 from ..images import ImageInfo, ImageSeries, ImageStep
 from ..tables import TableData, TableInfo
 from .cache import DiskCache
@@ -131,12 +132,22 @@ class CachedClient:
         data = self._memo(ref, "images", lambda: [asdict(i) for i in self._inner.run_images(ref)])
         return [ImageInfo(**d) for d in data]
 
+    def run_audios(self, ref: RunRef) -> list[AudioInfo]:
+        data = self._memo(ref, "audios", lambda: [asdict(i) for i in self._inner.run_audios(ref)])
+        return [AudioInfo(**d) for d in data]
+
     def image_steps(self, ref: RunRef, key: str) -> ImageSeries:
+        return self._steps(ref, f"imgsteps:{key}", lambda: self._inner.image_steps(ref, key))
+
+    def audio_steps(self, ref: RunRef, key: str) -> ImageSeries:
+        return self._steps(ref, f"audiosteps:{key}", lambda: self._inner.audio_steps(ref, key))
+
+    def _steps(self, ref: RunRef, name: str, load) -> ImageSeries:
         def fetch():
-            series = self._inner.image_steps(ref, key)
+            series = load()
             return {"steps": [asdict(s) for s in series.steps], "total": series.total}
 
-        d = self._memo(ref, f"imgsteps:{key}", fetch)
+        d = self._memo(ref, name, fetch)
         steps = tuple(
             ImageStep(s["step"], tuple(s["paths"]), tuple(s["sha256s"]), tuple(s["sizes"]), tuple(s["captions"]))
             for s in d["steps"]

@@ -3,16 +3,16 @@
 screen is seen on the other.
 
 A screen using this provides: `ready`, `chart_layout`, `selected`, `panels`, `metrics`,
-`system_metrics`, `tables`, `images`, `_layout_key`, `empty_note`, `_focused_chart()`,
+`system_metrics`, `tables`, `images`, `audios`, `_layout_key`, `empty_note`, `_focused_chart()`,
 `_refresh_panel_list()`, `_show_panel(focus)`, `_update_status()` and `action_focus_panels()`.
 `focus` and the chart indexes used here are positions in the LAYOUT's panel (not in what is drawn:
 a comparison draws a multi-metric plot as several charts)."""
 
 from __future__ import annotations
 
-from ..charts import BAR, IMAGE, PLOT, TABLE, ChartSpec
+from ..charts import AUDIO, BAR, IMAGE, PLOT, TABLE, ChartSpec
 from .chart_dialogs import (
-    BarDialog, ChartKindDialog, ChartOptionsDialog, ImageDialog, PlotDialog, TableDialog,
+    AudioDialog, BarDialog, ChartKindDialog, ChartOptionsDialog, ImageDialog, PlotDialog, TableDialog,
 )
 from .dialogs import ConfirmDialog, NewPanelDialog
 
@@ -20,7 +20,8 @@ EDIT_ACTIONS = ("new_panel", "add_chart", "chart_options", "delete_item", "reset
 
 
 class ChartEditing:
-    empty_note = "This run has no metrics, tables or images to chart."
+    empty_note = "This run has no metrics, tables, images or audio to chart."
+    audios: tuple = ()  # a comparison does not show audio
 
     def _panel_list_focused(self) -> bool:
         try:
@@ -47,7 +48,7 @@ class ChartEditing:
             return None
         focused = self._focused_chart()
         if focused is not None:
-            return {TABLE: "Delete table", IMAGE: "Delete images"}.get(focused[0].kind, "Delete chart")
+            return {TABLE: "Delete table", IMAGE: "Delete images", AUDIO: "Delete audio"}.get(focused[0].kind, "Delete chart")
         if self.ready and self.panels and self._panel_list_focused():
             return "Delete panel"
         return "Delete chart"
@@ -75,7 +76,7 @@ class ChartEditing:
         if not self.ready or not self.panels:
             return
         values = len(self.metrics) + len(self.system_metrics)
-        if not (values or self.tables or self.images):
+        if not (values or self.tables or self.images or self.audios):
             self.notify(self.empty_note, severity="warning")
             return
         self.app.push_screen(
@@ -84,6 +85,7 @@ class ChartEditing:
                 bar_ok=values >= 2,
                 table_ok=bool(self.tables),
                 image_ok=bool(self.images),
+                audio_ok=bool(self.audios),
             ),
             self._on_kind,
         )
@@ -97,6 +99,8 @@ class ChartEditing:
             self.app.push_screen(TableDialog(self.tables), self._on_add_chart)
         elif kind == IMAGE:
             self.app.push_screen(ImageDialog(self.images), self._on_add_chart)
+        elif kind == AUDIO:
+            self.app.push_screen(AudioDialog(self.audios), self._on_add_chart)
 
     async def _on_add_chart(self, spec: ChartSpec | None) -> None:
         if not spec:
@@ -112,7 +116,7 @@ class ChartEditing:
             return
         spec, index = focused
         self.app.push_screen(
-            ChartOptionsDialog(spec, self.metrics, self.system_metrics, self.tables, self.images),
+            ChartOptionsDialog(spec, self.metrics, self.system_metrics, self.tables, self.images, self.audios),
             lambda new: self._on_edit_chart(index, new),
         )
 
@@ -131,7 +135,7 @@ class ChartEditing:
         focused = self._focused_chart()
         if focused is not None:
             spec, index = focused
-            heading = {TABLE: "Delete this table?", IMAGE: "Delete these images?"}.get(spec.kind, "Delete this chart?")
+            heading = {TABLE: "Delete this table?", IMAGE: "Delete these images?", AUDIO: "Delete this audio?"}.get(spec.kind, "Delete this chart?")
             self.app.push_screen(
                 ConfirmDialog(heading, f"“{spec.title}”", yes="Yes, delete", no="No"),
                 lambda yes: self._on_delete_chart(index, yes),

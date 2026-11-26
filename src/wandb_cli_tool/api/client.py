@@ -11,6 +11,7 @@ from typing import Any, Iterator, Protocol
 
 from ..formatting import parse_time
 from ..series import Point, extract_points, numeric_values, plottable_keys
+from ..audio import AudioInfo, audio_entries, parse_audio_steps
 from ..images import MAX_SCAN_ROWS, ImageInfo, ImageSeries, image_entries, parse_image_steps
 from ..tables import MAX_TABLE_BYTES, TableData, TableInfo, parse_table, table_entries
 from .models import (  # noqa: F401  (safe_relative_path is re-exported)
@@ -130,6 +131,14 @@ class WandbClient(Protocol):
 
     def image_steps(self, ref: RunRef, key: str) -> ImageSeries:
         """The steps at which `key` logged images (files are fetched with `download_file`)."""
+        ...
+
+    def run_audios(self, ref: RunRef) -> list[AudioInfo]:
+        """The keys under which the run logged wandb.Audio."""
+        ...
+
+    def audio_steps(self, ref: RunRef, key: str) -> ImageSeries:
+        """The steps at which `key` logged audio (files are fetched with `download_file`)."""
         ...
 
     def system_rows(self, ref: RunRef) -> list[dict[str, Any]]:
@@ -312,14 +321,20 @@ class WandbApiClient:
     def run_images(self, ref: RunRef) -> list[ImageInfo]:
         return image_entries(self._run(ref).summary_metrics)
 
-    def image_steps(self, ref: RunRef, key: str) -> ImageSeries:
-        def rows():
-            for n, row in enumerate(self._run(ref).scan_history(keys=[key], page_size=500)):
-                if n >= MAX_SCAN_ROWS:  # a bound, so one huge run cannot stall the screen
-                    return
-                yield row
+    def _key_rows(self, ref: RunRef, key: str):
+        for n, row in enumerate(self._run(ref).scan_history(keys=[key], page_size=500)):
+            if n >= MAX_SCAN_ROWS:  # a bound, so one huge run cannot stall the screen
+                return
+            yield row
 
-        return parse_image_steps(rows(), key)
+    def image_steps(self, ref: RunRef, key: str) -> ImageSeries:
+        return parse_image_steps(self._key_rows(ref, key), key)
+
+    def run_audios(self, ref: RunRef) -> list[AudioInfo]:
+        return audio_entries(self._run(ref).summary_metrics)
+
+    def audio_steps(self, ref: RunRef, key: str) -> ImageSeries:
+        return parse_audio_steps(self._key_rows(ref, key), key)
 
     def table_data(self, ref: RunRef, path: str) -> TableData:
         if not (safe_relative_path(path) and path.endswith(".table.json")):

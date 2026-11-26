@@ -119,6 +119,16 @@ class FakeClient:
         steps = list(self.IMAGE_STEPS.get(key, []))
         return ImageSeries(tuple(steps), getattr(self, "image_total", len(steps)))
 
+    AUDIOS: list = []  # none by default, so existing panels are unchanged; tests that want audio set it
+    AUDIO_STEPS: dict = {}
+
+    def run_audios(self, ref):
+        return list(self.AUDIOS)
+
+    def audio_steps(self, ref, key):
+        steps = list(self.AUDIO_STEPS.get(key, []))
+        return ImageSeries(tuple(steps), len(steps))
+
     def metric_values(self, ref):
         return dict(self.VALUES)
 
@@ -282,6 +292,12 @@ def utc_timezone(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_auto_refresh(monkeypatch):
+    """Charts never refresh by themselves unless a test turns the timer on (production: always 30 s)."""
+    monkeypatch.setattr("wandb_cli_tool.screens.charts.AUTO_REFRESH_SECONDS", 0)
+
+
+@pytest.fixture(autouse=True)
 def config_dir(tmp_path, monkeypatch):
     """Never touch the real user config."""
     monkeypatch.setenv(config.CONFIG_DIR_ENV, str(tmp_path / "cfg"))
@@ -297,24 +313,57 @@ def make_app():
 
 
 class FakePlayer:
-    """Stands in for AudioPlayer: records plays instead of making sound."""
+    """Stands in for AudioPlayer: records plays instead of making sound. `position` is whatever a test sets."""
+
+    can_pause = True
 
     def __init__(self, available=True):
         self.available = available
         self.playing = False
+        self.paused = False
         self.played = []
         self.stops = 0
+        self.pauses = 0
+        self.resumes = 0
+        self.path = None
+        self.position = 0.0
+        self.failure = None
+        self.finish_next = False  # a test sets this to make the clip end by itself on the next check
+
+    def check_finished(self):
+        if self.finish_next and self.playing:
+            self.finish_next = False
+            self.playing = self.paused = False
+            return True
+        return False
+
+    def is_playing(self, path):
+        return self.playing and path is not None and self.path == path
 
     def play(self, path):
         if not self.available:
             return False
         self.played.append(path)
-        self.playing = True
+        self.playing, self.paused, self.path, self.position = True, False, path, 0.0
+        return True
+
+    def pause(self):
+        if not self.playing or self.paused:
+            return False
+        self.pauses += 1
+        self.paused = True
+        return True
+
+    def resume(self):
+        if not self.paused:
+            return False
+        self.resumes += 1
+        self.paused = False
         return True
 
     def stop(self):
         self.stops += 1
-        self.playing = False
+        self.playing = self.paused = False
 
 
 class FakeJob:

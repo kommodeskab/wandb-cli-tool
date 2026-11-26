@@ -9,10 +9,7 @@ from test_run_screens import open_charts, panel_labels
 from wandb_cli_tool import config
 from wandb_cli_tool.app import WandbCliApp
 from wandb_cli_tool.config import Credentials
-from wandb_cli_tool.preferences import Preferences
-from wandb_cli_tool.refresh import (
-    DEFAULT_REFRESH, PREF_KEY, REFRESH_CHOICES, interval_from_pref, label, next_choice, to_pref,
-)
+from wandb_cli_tool.refresh import AUTO_REFRESH_SECONDS, label
 from wandb_cli_tool.screens.chart_widgets import BarView, ChartView, TableView
 from wandb_cli_tool.screens.charts import ChartsPane
 from wandb_cli_tool.screens.dialogs import ConfirmDialog
@@ -25,27 +22,13 @@ PREDS = "media/table/preds_3_ab12cd34ef56ab78cd90.table.json"
 # ---- pure: the interval choices -----------------------------------------------------------
 
 
-def test_the_key_cycles_through_the_choices_and_back_to_off():
-    seen, current = [], None
-    for _ in range(len(REFRESH_CHOICES) + 1):
-        current = next_choice(current)
-        seen.append(current)
-    assert seen == [10, 30, 60, 300, None, 10]
-    assert next_choice(20) == 30 and next_choice(0.2) == 10 and next_choice(400) is None  # unusual values move on
-
-
 @pytest.mark.parametrize("seconds, text", [(None, "off"), (0, "off"), (10, "10 s"), (60, "1 min"), (300, "5 min"), (0.2, "0.2 s")])
 def test_labels(seconds, text):
     assert label(seconds) == text
 
 
-@pytest.mark.parametrize("saved, expected", [
-    (None, DEFAULT_REFRESH), (0, None), (10, 10), (300, 300),
-    (45, DEFAULT_REFRESH), (-5, DEFAULT_REFRESH), (True, DEFAULT_REFRESH), ("x", DEFAULT_REFRESH), (1.5, DEFAULT_REFRESH),
-])
-def test_a_saved_interval_is_used_only_if_it_is_a_known_choice(saved, expected):
-    assert interval_from_pref(saved) == expected
-    assert to_pref(None) == 0 and to_pref(30) == 30
+def test_the_interval_is_always_30_seconds():
+    assert AUTO_REFRESH_SECONDS == 30
 
 
 # ---- a run that keeps changing -----------------------------------------------------------------
@@ -89,10 +72,8 @@ class Live(FakeClient):
         return replace(info, state=self.state) if ref.id == "id1" else info  # only run-1 is the live one
 
 
-async def start(make_app=None, client=Live, interval=None):
+async def start(make_app=None, client=Live):
     config.save(Credentials("k", "me"))
-    if interval is not None:
-        Preferences().set(PREF_KEY, interval)
     app = WandbCliApp(client_factory=client, audio_player=FakePlayer())
     return app, app.run_test(size=SIZE)
 
@@ -113,7 +94,7 @@ def status(screen):
 
 
 async def test_refresh_now_updates_the_charts_where_they_are_and_reports_the_time():
-    app, ctx = await start(interval=0)
+    app, ctx = await start()
     async with ctx as pilot:
         screen = await charts_of(pilot)
         await select_trainer(pilot)
@@ -131,7 +112,7 @@ async def test_refresh_now_updates_the_charts_where_they_are_and_reports_the_tim
 
 
 async def test_a_new_metric_adds_a_chart_without_losing_the_panel_or_focus():
-    app, ctx = await start(interval=0)
+    app, ctx = await start()
     async with ctx as pilot:
         screen = await charts_of(pilot)
         await select_trainer(pilot)
@@ -151,7 +132,7 @@ async def test_a_new_metric_adds_a_chart_without_losing_the_panel_or_focus():
 
 
 async def test_a_new_panel_appearing_before_the_selected_one_does_not_change_what_is_shown():
-    app, ctx = await start(interval=0)
+    app, ctx = await start()
     async with ctx as pilot:
         screen = await charts_of(pilot)
         await select_trainer(pilot)
@@ -168,7 +149,7 @@ async def test_a_new_panel_appearing_before_the_selected_one_does_not_change_wha
 
 
 async def test_bars_and_tables_update_and_the_table_keeps_its_cursor():
-    app, ctx = await start(interval=0)
+    app, ctx = await start()
     async with ctx as pilot:
         screen = await charts_of(pilot)
         await new_panel(pilot, "mine")
@@ -190,7 +171,7 @@ async def test_bars_and_tables_update_and_the_table_keeps_its_cursor():
 
 
 async def test_user_customizations_survive_a_refresh():
-    app, ctx = await start(interval=0)
+    app, ctx = await start()
     async with ctx as pilot:
         screen = await charts_of(pilot)
         await new_panel(pilot, "mine")
@@ -205,7 +186,7 @@ async def test_user_customizations_survive_a_refresh():
 
 
 async def test_a_running_run_refreshes_by_itself_and_stops_when_it_finishes():
-    app, ctx = await start(interval=0)
+    app, ctx = await start()
     async with ctx as pilot:
         screen = await charts_of(pilot)
         assert screen._timer is None  # interval off: nothing is scheduled
@@ -223,8 +204,9 @@ async def test_a_running_run_refreshes_by_itself_and_stops_when_it_finishes():
         assert app.client.calls["keys"] == settled  # no more requests for a finished run
 
 
-async def test_a_finished_run_gets_no_timer_but_can_still_be_refreshed_by_hand():
-    app, ctx = await start(interval=30)
+async def test_a_finished_run_gets_no_timer_but_can_still_be_refreshed_by_hand(monkeypatch):
+    monkeypatch.setattr("wandb_cli_tool.screens.charts.AUTO_REFRESH_SECONDS", 30)
+    app, ctx = await start()
     async with ctx as pilot:
         await settle(pilot, 4)
         await pilot.press("enter")  # alpha
@@ -242,29 +224,30 @@ async def test_a_finished_run_gets_no_timer_but_can_still_be_refreshed_by_hand()
         assert app.client.calls["keys"] == before + 1
 
 
-async def test_the_f_key_cycles_the_interval_and_it_is_remembered():
-    app, ctx = await start(interval=None)  # nothing saved: the default
+async def test_there_is_no_key_to_change_the_refresh_interval():
+    from wandb_cli_tool.screens.keybar import KeyBar
+
+    app, ctx = await start()
     async with ctx as pilot:
         screen = await charts_of(pilot)
-        assert screen.interval == DEFAULT_REFRESH and screen._timer is not None
-        seen = []
-        for _ in range(5):
-            await pilot.press("f")
-            await settle(pilot, 2)
-            seen.append((screen.interval, screen._timer is not None))
-            assert Preferences().get(PREF_KEY) == to_pref(screen.interval)
-        assert seen == [(60, True), (300, True), (None, False), (10, True), (30, True)]  # off means no timer
-        assert any("Auto-refresh: off" in n.message for n in app._notifications)
-        await pilot.press("f", "f", "f")  # 60, 300, off
-        await settle(pilot, 3)
-    app2, ctx2 = await start(interval=None)  # next time: off is remembered
-    async with ctx2 as pilot:
+        bar = app.screen.query_one(KeyBar).query_one("KeyLine").render().plain.replace("\xa0", " ")
+        assert "Auto-refresh" not in bar and "Follow" not in bar
+        await pilot.press("f")
+        await settle(pilot, 2)
+        assert not screen.interval  # the conftest fixture turned the timer off; the key changes nothing
+        assert not any("Auto-refresh" in n.message for n in app._notifications)
+
+
+async def test_a_running_run_is_refreshed_every_30_seconds_by_default(monkeypatch):
+    monkeypatch.setattr("wandb_cli_tool.screens.charts.AUTO_REFRESH_SECONDS", 30)
+    app, ctx = await start()
+    async with ctx as pilot:
         screen = await charts_of(pilot)
-        assert screen.interval is None and screen._timer is None and "auto-refresh off" in status(screen) and "(f" not in status(screen)
+        assert screen.interval == 30 and screen._timer is not None and "auto-refresh 30 s" in status(screen)
 
 
 async def test_leaving_the_screen_stops_refreshing():
-    app, ctx = await start(interval=0)
+    app, ctx = await start()
     async with ctx as pilot:
         screen = await charts_of(pilot)
         screen.set_refresh_interval(0.2)
@@ -277,7 +260,7 @@ async def test_leaving_the_screen_stops_refreshing():
 
 
 async def test_the_timer_does_not_refresh_while_a_dialog_is_open_and_refreshes_never_overlap():
-    app, ctx = await start(interval=0)
+    app, ctx = await start()
     async with ctx as pilot:
         screen = await charts_of(pilot)
         await pilot.press("d")  # nothing customized: a notice, not a dialog
@@ -300,7 +283,7 @@ async def test_the_timer_does_not_refresh_while_a_dialog_is_open_and_refreshes_n
 
 
 async def test_a_failed_refresh_keeps_the_charts_and_the_next_one_recovers():
-    app, ctx = await start(interval=0)
+    app, ctx = await start()
     async with ctx as pilot:
         screen = await charts_of(pilot)
         await select_trainer(pilot)
@@ -323,7 +306,7 @@ async def test_a_failed_refresh_keeps_the_charts_and_the_next_one_recovers():
 
 
 async def test_a_failed_table_refresh_keeps_the_rows():
-    app, ctx = await start(interval=0)
+    app, ctx = await start()
     async with ctx as pilot:
         screen = await charts_of(pilot)
         await new_panel(pilot, "mine")
@@ -344,32 +327,12 @@ async def test_a_failed_table_refresh_keeps_the_rows():
         assert [tuple(str(c) for c in table.get_row_at(i)) for i in range(table.row_count)] == rows
 
 
-async def test_the_auto_refresh_key_shows_the_interval_in_use():
-    from wandb_cli_tool.screens.keybar import KeyBar
-
-    app, ctx = await start(interval=30)
-    async with ctx as pilot:
-        screen = await charts_of(pilot)
-
-        def bar():
-            return app.screen.query_one(KeyBar).query_one("KeyLine").render().plain.replace("\xa0", " ")
-
-        assert "f Auto-refresh: 30 s" in bar()
-        await pilot.press("f")  # the next choice
-        await settle(pilot, 3)
-        assert f"f Auto-refresh: {label(screen.interval)}" in bar() and "30 s" not in bar()
-        while screen.interval is not None:  # cycle on to "off"
-            await pilot.press("f")
-            await settle(pilot, 2)
-        assert "f Auto-refresh: off" in bar()
-
-
 async def test_a_new_metric_sorting_before_the_focused_chart_keeps_focus_on_the_same_chart():
     class SortedLive(Live):
         def metric_keys(self, ref):
             return sorted(super().metric_keys(ref))
 
-    app, ctx = await start(client=SortedLive, interval=0)
+    app, ctx = await start(client=SortedLive)
     async with ctx as pilot:
         screen = await charts_of(pilot)
         await select_trainer(pilot)

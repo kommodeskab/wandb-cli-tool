@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Any, Collection, Iterable, Sequence
 
 from .api import RunInfo, RunMetadata
-from .charts import BAR, IMAGE, PLOT, TABLE, ChartOptions, ChartSpec, Panel, display_names
+from .charts import AUDIO, BAR, IMAGE, PLOT, TABLE, ChartOptions, ChartSpec, Panel, display_names
 from .images import ImageSeries, ImageStep
 from .palette import MAX_SERIES
 from .runfacts import summary_fields
@@ -207,7 +207,7 @@ def compare_charts(panel: Panel) -> list[CompareChart]:
             ]
         elif spec.kind == BAR:
             out.append(CompareChart(BAR, spec.series, title=spec.title, opts=spec.opts, source=spec, index=index))
-        elif spec.kind in (TABLE, IMAGE):
+        elif spec.kind in (TABLE, IMAGE, AUDIO):
             out.append(CompareChart(spec.kind, (spec.y,), title=spec.title, source=spec, index=index))
     return out
 

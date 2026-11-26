@@ -563,24 +563,25 @@ async def test_invalid_json_oversized_text_and_long_text_are_handled(make_app, m
         assert "row 199" not in text
 
 
-async def test_audio_file_can_be_played_and_stopped(make_app):
+async def test_audio_file_shows_a_waveform_and_can_be_played_paused_and_continued(make_app):
     player = FakePlayer()
     app = make(player)
     async with app.run_test(size=SIZE) as pilot:
         await to_files(pilot)
         await open_file(pilot, "sample.wav")
-        assert "sample.wav" in screen_text(app) and "space Play" in screen_text(app)  # the key bar says what it will do
+        text = screen_text(app)
+        assert "sample.wav" in text and "space Play" in text  # the key bar says what it will do
+        assert "■ 0:00 / 0:00" in text and "♪" not in text  # a player line, not a music note
         await pilot.press("space")
         await settle(pilot)
         assert [p.name for p in player.played] == ["sample.wav"] and player.playing
-        assert "Playing" in screen_text(app) and "space Stop" in screen_text(app)  # the key now offers to stop
-        assert "Space to stop" not in screen_text(app)
+        assert "▶" in screen_text(app) and "space Pause" in screen_text(app)
         await pilot.press("space")
         await settle(pilot)
-        assert not player.playing and "space Play" in screen_text(app)
+        assert player.paused and player.pauses == 1 and "⏸" in screen_text(app) and "space Continue" in screen_text(app)
         await pilot.press("space")
         await settle(pilot)
-        assert player.playing
+        assert player.playing and not player.paused and player.resumes == 1 and player.played.count(player.played[0]) == 1
         stops = player.stops
         await pilot.press("escape")  # leaving the screen silences it
         await settle(pilot)
@@ -745,7 +746,7 @@ def test_in_a_sixel_terminal_auto_mode_is_the_dedicated_sixel_widget():
     assert is_sixel == "True"  # AutoImage would not be the sixel widget (blank area)
 
 
-async def test_a_clip_that_ends_by_itself_turns_the_key_back_to_play(make_app):
+async def test_a_clip_that_ends_by_itself_turns_the_key_back_to_play(make_app):  # (it says Pause while playing)
     player = FakePlayer()
     app = make(player)
     async with app.run_test(size=SIZE) as pilot:
@@ -753,7 +754,7 @@ async def test_a_clip_that_ends_by_itself_turns_the_key_back_to_play(make_app):
         await open_file(pilot, "sample.wav")
         await pilot.press("space")
         await settle(pilot)
-        assert "space Stop" in screen_text(app)
+        assert "space Pause" in screen_text(app)
         player.playing = False  # the clip finished on its own
         for _ in range(20):
             await pilot.pause(0.1)

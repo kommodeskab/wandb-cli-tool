@@ -53,9 +53,10 @@ def is_dark(widget: Widget) -> bool:
         return True
 
 
-def apply_axis_options(plt, opts, ys: list[float]) -> None:
-    """Log axes and a fixed y-range on a plotext figure. `ys` are the values drawn, used to fill in
-    the end of the range the user left automatic."""
+def apply_axis_options(plt, opts, ys: list[float], xs: list[float] = ()) -> None:
+    """Grid, log axes and fixed ranges on a plotext figure. `ys` are the values drawn, used to fill in
+    the end of the y-range the user left automatic; `xs` the same for the x-range."""
+    plt.grid(opts.grid, opts.grid)
     if opts.logx:
         plt.xscale("log")
     if opts.logy:
@@ -65,6 +66,11 @@ def apply_axis_options(plt, opts, ys: list[float]) -> None:
         hi = opts.ymax if opts.ymax is not None else max(ys)
         if lo < hi:
             plt.ylim(lo, hi)
+    if (opts.xmin is not None or opts.xmax is not None) and xs:
+        lo = opts.xmin if opts.xmin is not None else min(xs)
+        hi = opts.xmax if opts.xmax is not None else max(xs)
+        if lo < hi:
+            plt.xlim(lo, hi)
 
 
 def plot_note(opts, dropped: int) -> str:
@@ -197,7 +203,7 @@ class ChartView(ChartBase, PlotextPlot):
                     options["label"] = label
                 plt.plot([p[0] for p in points], [p[1] for p in points], **options)
             plt.xlabel(axis_label(spec.x))
-            apply_axis_options(plt, opts, [p[1] for n in drawn for p in series[n]])
+            apply_axis_options(plt, opts, [p[1] for n in drawn for p in series[n]], [p[0] for n in drawn for p in series[n]])
             no_data = [lab for n, lab in zip(names, labels) if n not in absent and not series.get(n)]
             not_here = [lab for n, lab in zip(names, labels) if n in absent]
             note = (f"  ·  no data: {', '.join(no_data)}" if no_data else "") + (
@@ -670,6 +676,7 @@ class ImageChartView(ChartBase, Vertical):
 
 
 def make_chart_widget(spec: ChartSpec, index: int) -> Widget:
-    from ..charts import BAR, IMAGE, TABLE
+    from ..charts import AUDIO, BAR, IMAGE, TABLE
+    from .audio_widgets import AudioChartView
 
-    return {BAR: BarView, TABLE: TableView, IMAGE: ImageChartView}.get(spec.kind, ChartView)(spec, index)
+    return {BAR: BarView, TABLE: TableView, IMAGE: ImageChartView, AUDIO: AudioChartView}.get(spec.kind, ChartView)(spec, index)

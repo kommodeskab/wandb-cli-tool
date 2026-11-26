@@ -22,7 +22,6 @@ from wandb_cli_tool.charts import (
 from wandb_cli_tool.config import Credentials
 from wandb_cli_tool.layout_store import LayoutStore, project_key
 from wandb_cli_tool.preferences import Preferences
-from wandb_cli_tool.refresh import PREF_KEY
 from wandb_cli_tool.screens.chart_widgets import (
     IMAGE_CHART_HEIGHT, NOTE_HEIGHT, PLOT_HEIGHT, BarView, ChartView, ImageChartView, TableView,
 )
@@ -79,7 +78,6 @@ class Multi(FakeClient):
 
 async def start():
     config.save(Credentials("k", "me"))
-    Preferences().set(PREF_KEY, 0)  # no automatic refresh: the tests refresh by hand
     app = WandbCliApp(client_factory=Multi, audio_player=FakePlayer())
     return app, app.run_test(size=SIZE)
 

@@ -167,7 +167,7 @@ from wandb_cli_tool.screens.chart_widgets import ChartView
 async def test_options_dialog_changes_the_focused_plot_and_is_shared_by_the_project(make_app):
     config.save(Credentials("k", "me"))
     app = make_app()
-    async with app.run_test(size=(130, 45)) as pilot:
+    async with app.run_test(size=(130, 55)) as pilot:
         screen = await open_charts(pilot)
         assert screen.check_action("chart_options", ()) is False  # nothing focused
         await pilot.press("down", "down")  # a panel with plots ("trainer")
@@ -201,7 +201,7 @@ async def test_options_dialog_changes_the_focused_plot_and_is_shared_by_the_proj
 async def test_a_log_axis_says_how_many_points_it_could_not_show(make_app):
     config.save(Credentials("k", "me"))
     app = make_app()
-    async with app.run_test(size=(130, 45)) as pilot:
+    async with app.run_test(size=(130, 55)) as pilot:
         screen = await open_charts(pilot)
         await pilot.press("down", "down")
         await settle(pilot, 6)
@@ -217,7 +217,7 @@ async def test_a_log_axis_says_how_many_points_it_could_not_show(make_app):
 async def test_reset_button_goes_back_to_defaults(make_app):
     config.save(Credentials("k", "me"))
     app = make_app()
-    async with app.run_test(size=(130, 45)) as pilot:
+    async with app.run_test(size=(130, 55)) as pilot:
         screen = await open_charts(pilot)
         await pilot.press("down", "down")
         await settle(pilot, 6)
@@ -288,7 +288,7 @@ async def test_options_dialog_for_a_bar_chart_only_asks_for_the_axis(make_app):
 
     config.save(Credentials("k", "me"))
     app = make_app()
-    async with app.run_test(size=(130, 45)) as pilot:
+    async with app.run_test(size=(130, 55)) as pilot:
         screen = await open_charts(pilot)
         await add_bar(pilot, (False, "acc"), (False, "trainer/loss"))
         view = app.focused
@@ -420,3 +420,59 @@ async def test_editing_a_plot_shows_and_reorders_y_values_with_taller_lists(make
         await pilot.click("#ok")
         await settle(pilot, 8)
         assert app.focused.spec.series == ("acc", "trainer/global_steps")
+
+
+# ---- x limits and grid -------------------------------------------------------------------------
+
+
+def test_x_limits_and_grid_are_parsed_saved_and_described():
+    from wandb_cli_tool.charts import parse_options
+
+    opts = parse_options("", "", "", False, False, "10", "100", True)
+    assert (opts.xmin, opts.xmax, opts.grid) == (10.0, 100.0, True)
+    assert opts.describe() == "x 10…100, grid" and ChartOptions.from_json(opts.to_json()) == opts
+    assert parse_options("", "", "", False, False, "", "5").describe() == "x auto…5"
+    assert "X min" in parse_options("", "", "", False, False, "5", "5")
+    assert "X max" in parse_options("", "", "", False, False, "", "abc")
+    assert ChartOptions.from_json({"xmin": 5, "xmax": 1}).xmin is None  # an impossible range is dropped
+    assert ChartOptions.from_json({"ymin": 0}).grid is False  # files from before these options load
+
+
+def test_the_axis_helper_applies_x_limits_and_the_grid():
+    from wandb_cli_tool.screens.chart_widgets import apply_axis_options
+
+    class Plt:
+        def __init__(self):
+            self.calls = []
+
+        def __getattr__(self, name):
+            return lambda *a: self.calls.append((name, a))
+
+    plt = Plt()
+    apply_axis_options(plt, ChartOptions(xmin=2.0, grid=True), [1.0, 2.0], [0.0, 10.0])
+    assert ("xlim", (2.0, 10.0)) in plt.calls and ("grid", (True, True)) in plt.calls
+    plt = Plt()
+    apply_axis_options(plt, ChartOptions(), [1.0], [1.0])
+    assert ("grid", (False, False)) in plt.calls and not any(c[0] == "xlim" for c in plt.calls)
+
+
+async def test_the_options_dialog_sets_x_limits_and_grid(make_app):
+    config.save(Credentials("k", "me"))
+    app = make_app()
+    async with app.run_test(size=(130, 40)) as pilot:
+        screen = await open_charts(pilot)
+        await pilot.press("down", "down")
+        await settle(pilot, 6)
+        await pilot.press("right")
+        await settle(pilot)
+        await pilot.press("o")
+        await settle(pilot)
+        dialog = app.screen
+        dialog.query_one("#xmin", Input).value = "1"
+        dialog.query_one("#xmax", Input).value = "3"
+        dialog.query_one("#grid", Checkbox).value = True
+        await pilot.click("#ok")  # reachable even in a short terminal: only the fields scroll
+        await settle(pilot, 8)
+        shown = app.focused
+        assert isinstance(shown, ChartView) and (shown.spec.opts.xmin, shown.spec.opts.xmax, shown.spec.opts.grid) == (1.0, 3.0, True)
+        assert "x 1…3, grid" in str(shown.border_subtitle)

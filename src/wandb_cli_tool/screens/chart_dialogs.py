@@ -12,7 +12,8 @@ from textual.widgets import Button, Checkbox, Input, Label, OptionList, Select, 
 from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
 
-from ..charts import BAR, IMAGE, MAX_BAR_VALUES, PLOT, TABLE, ChartOptions, ChartSpec, parse_options, x_options
+from ..audio import AudioInfo
+from ..charts import AUDIO, BAR, IMAGE, MAX_BAR_VALUES, PLOT, TABLE, ChartOptions, ChartSpec, parse_options, x_options
 from ..images import ImageInfo
 from ..palette import MAX_SERIES
 from ..plain import plain
@@ -52,7 +53,7 @@ def _x_choices_with(metrics: Sequence[str], system: bool, current: str) -> list[
     return choices
 
 
-def _key_choices(items: Sequence[TableInfo] | Sequence[ImageInfo], current: str) -> list[tuple[object, str]]:
+def _key_choices(items: Sequence[TableInfo] | Sequence[ImageInfo] | Sequence[AudioInfo], current: str) -> list[tuple[object, str]]:
     choices = [(plain(item.label), item.key) for item in items]
     if current not in {value for _, value in choices}:
         choices.append((plain(current), current))
@@ -82,9 +83,9 @@ class ChartKindDialog(CancellableDialog):
     ChartKindDialog OptionList { height: auto; margin-top: 1; }
     """
 
-    def __init__(self, plot_ok: bool, bar_ok: bool, table_ok: bool, image_ok: bool = False) -> None:
+    def __init__(self, plot_ok: bool, bar_ok: bool, table_ok: bool, image_ok: bool = False, audio_ok: bool = False) -> None:
         super().__init__()
-        self.available = {PLOT: plot_ok, BAR: bar_ok, TABLE: table_ok, IMAGE: image_ok}
+        self.available = {PLOT: plot_ok, BAR: bar_ok, TABLE: table_ok, IMAGE: image_ok, AUDIO: audio_ok}
 
     def compose(self) -> ComposeResult:
         def option(kind: str, text: str, why_not: str) -> Option:
@@ -98,13 +99,14 @@ class ChartKindDialog(CancellableDialog):
                 option(BAR, "Bar chart — the latest value of several metrics, in the order you choose", "needs two or more metrics"),
                 option(TABLE, "Table — a wandb.Table logged by this run", "this run logged no tables"),
                 option(IMAGE, "Images — wandb.Images logged by this run, with a step slider", "this run logged no images"),
+                option(AUDIO, "Audio — wandb.Audio logged by this run, with a waveform and a player", "this run logged no audio"),
                 id="kinds",
             )
 
     def on_mount(self) -> None:
         options = self.query_one("#kinds", OptionList)
         options.focus()
-        options.highlighted = next((i for i, k in enumerate((PLOT, BAR, TABLE, IMAGE)) if self.available[k]), 0)
+        options.highlighted = next((i for i, k in enumerate((PLOT, BAR, TABLE, IMAGE, AUDIO)) if self.available[k]), 0)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         event.stop()
@@ -374,6 +376,16 @@ class ImageDialog(KeyPickerDialog):
         super().__init__([(plain(i.label), i.key) for i in images])
 
 
+class AudioDialog(KeyPickerDialog):
+    """Pick one of the keys under which the run logged audio."""
+
+    heading = "Add audio (browse the steps with a slider; the newest step is shown first):"
+    ok_label, select_id, kind = "Add audio", "audio-key", AUDIO
+
+    def __init__(self, audios: list[AudioInfo]) -> None:
+        super().__init__([(plain(a.label), a.key) for a in audios])
+
+
 class ChartOptionsDialog(CancellableDialog):
     """Edit how a chart is built and drawn (metrics, x-axis / order / key, and axis options)."""
 
@@ -382,10 +394,14 @@ class ChartOptionsDialog(CancellableDialog):
         ("ctrl+down", "move(1)", "Move down"),
     ]
     DEFAULT_CSS = """
-    ChartOptionsDialog > VerticalScroll { width: 82; height: auto; max-height: 100%; border: round $accent; padding: 1 2; background: $surface; }
+    ChartOptionsDialog > Vertical { width: 82; height: auto; max-height: 100%; border: round $accent; padding: 1 2; background: $surface; }
+    ChartOptionsDialog .tall { height: 100%; }
+    ChartOptionsDialog #fields { height: auto; max-height: 100%; }
+    ChartOptionsDialog .tall #fields { height: 1fr; }
+    ChartOptionsDialog #buttons { height: auto; }
     ChartOptionsDialog MetricPicker SelectionList { height: 10; }
     ChartOptionsDialog #order { height: 8; margin-bottom: 0; }
-    ChartOptionsDialog #opts-row { height: auto; margin-top: 0; }
+    ChartOptionsDialog #opts-row, ChartOptionsDialog #x-row { height: auto; margin-top: 0; }
     ChartOptionsDialog .opt-col { width: 1fr; height: auto; margin-right: 1; }
     ChartOptionsDialog #log-row { height: auto; margin-bottom: 0; }
     ChartOptionsDialog #log-row Checkbox { width: 1fr; }
@@ -400,9 +416,11 @@ class ChartOptionsDialog(CancellableDialog):
         system_metrics: Sequence[str] = (),
         tables: Sequence[TableInfo] = (),
         images: Sequence[ImageInfo] = (),
+        audios: Sequence[AudioInfo] = (),
     ) -> None:
         super().__init__()
         self.spec = spec
+        self.audios = list(audios)
         self.kind = spec.kind
         self.is_bar = spec.kind == BAR
         self.metrics = list(metrics)
@@ -432,8 +450,10 @@ class ChartOptionsDialog(CancellableDialog):
             BAR: f"Bar chart options: {', '.join(self.spec.series)}",
             TABLE: f"Table options: {self.spec.y}",
             IMAGE: f"Image options: {self.spec.y}",
+            AUDIO: f"Audio options: {self.spec.y}",
         }[self.kind]
-        with VerticalScroll():
+        with Vertical():
+          with VerticalScroll(id="fields"):
             yield Label(heading, markup=False)
             if self.kind == TABLE:
                 yield Label("Table:")
@@ -441,6 +461,9 @@ class ChartOptionsDialog(CancellableDialog):
             elif self.kind == IMAGE:
                 yield Label("Image key:")
                 yield Select(_key_choices(self.images, self.spec.y), value=self.spec.y, allow_blank=False, id="image-key")
+            elif self.kind == AUDIO:
+                yield Label("Audio key:")
+                yield Select(_key_choices(self.audios, self.spec.y), value=self.spec.y, allow_blank=False, id="audio-key")
             elif self.kind == PLOT:
                 yield MetricPicker(self._picker_options, limit=MAX_SERIES, initial=self._initial, id="picker")
                 yield Label("Plot order (top draws on top; Ctrl+↑ / Ctrl+↓ moves):")
@@ -450,6 +473,13 @@ class ChartOptionsDialog(CancellableDialog):
                     _x_choices_with(self.metrics, self.spec.system, self.spec.x),
                     value=self.spec.x, allow_blank=False, id="x",
                 )
+                with Horizontal(id="x-row"):
+                    with Vertical(classes="opt-col"):
+                        yield Label("X min (empty = auto)")
+                        yield Input(text(o.xmin), id="xmin")
+                    with Vertical(classes="opt-col"):
+                        yield Label("X max (empty = auto)")
+                        yield Input(text(o.xmax), id="xmax")
                 with Horizontal(id="opts-row"):
                     with Vertical(classes="opt-col"):
                         yield Label("Y min (empty = auto)")
@@ -463,6 +493,7 @@ class ChartOptionsDialog(CancellableDialog):
                 with Horizontal(id="log-row"):
                     yield Checkbox("Logarithmic y-axis", o.logy, id="logy")
                     yield Checkbox("Logarithmic x-axis", o.logx, id="logx")
+                yield Checkbox("Grid", o.grid, id="grid")
             else:  # BAR
                 yield MetricPicker(self._picker_options, limit=MAX_BAR_VALUES, initial=self._initial, id="picker")
                 yield Label("Bar order (Ctrl+↑ / Ctrl+↓ moves the highlighted one):")
@@ -474,18 +505,19 @@ class ChartOptionsDialog(CancellableDialog):
                     with Vertical(classes="opt-col"):
                         yield Label("Axis max (empty = auto)")
                         yield Input(text(o.ymax), id="ymax")
-            if self.kind in (PLOT, BAR):
-                yield Static("", id="options-error")
-            with Horizontal():
-                yield Button("Apply", variant="primary", id="ok")
-                if self.kind in (PLOT, BAR):
-                    yield Button("Back to defaults", id="reset")
-                yield Button("Cancel", id="cancel")
+          if self.kind in (PLOT, BAR):
+              yield Static("", id="options-error")
+          with Horizontal(id="buttons"):
+              yield Button("Apply", variant="primary", id="ok")
+              if self.kind in (PLOT, BAR):
+                  yield Button("Back to defaults", id="reset")
+              yield Button("Cancel", id="cancel")
 
     def on_mount(self) -> None:
         if self.kind in (PLOT, BAR):
+            self.query_one(Vertical).add_class("tall")  # the fields scroll, the buttons stay in view
             self._refresh_order()
-        target = {TABLE: "#table", IMAGE: "#image-key"}.get(self.kind, "#ymin")
+        target = {TABLE: "#table", IMAGE: "#image-key", AUDIO: "#audio-key"}.get(self.kind, "#ymin")
         self.query_one(target).focus()
 
     def _error(self, message: str) -> None:
@@ -532,7 +564,7 @@ class ChartOptionsDialog(CancellableDialog):
             self.dismiss(replace(self.spec, opts=ChartOptions()))
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id in ("ymin", "ymax", "smooth"):
+        if event.input.id in ("xmin", "xmax", "ymin", "ymax", "smooth"):
             event.stop()
             self._submit()
 
@@ -542,6 +574,9 @@ class ChartOptionsDialog(CancellableDialog):
             return
         if self.kind == IMAGE:
             self.dismiss(ChartSpec(str(self.query_one("#image-key", Select).value), kind=IMAGE))
+            return
+        if self.kind == AUDIO:
+            self.dismiss(ChartSpec(str(self.query_one("#audio-key", Select).value), kind=AUDIO))
             return
         chosen = self.query_one("#picker", MetricPicker).chosen
         if self.kind == PLOT:
@@ -555,6 +590,8 @@ class ChartOptionsDialog(CancellableDialog):
             logy, logx = self.query_one("#logy", Checkbox).value, self.query_one("#logx", Checkbox).value
             result = parse_options(
                 self.query_one("#ymin", Input).value, self.query_one("#ymax", Input).value, smooth, logy, logx,
+                self.query_one("#xmin", Input).value, self.query_one("#xmax", Input).value,
+                self.query_one("#grid", Checkbox).value,
             )
             if isinstance(result, str):
                 self._error(result)

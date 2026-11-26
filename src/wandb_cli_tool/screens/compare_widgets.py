@@ -29,6 +29,7 @@ from ..tables import TableData
 from .chart_widgets import (
     CHART_CLASS, DEBOUNCE, NOTE_HEIGHT, StepSlider, table_height, PLOT_HEIGHT, _NAV_BINDINGS, apply_axis_options, is_dark, note_renderable, plot_note,
 )
+from .audio_widgets import AudioPlayerView, play_label, toggle_playback
 from .chart_viewer import ChartViewerScreen
 from .image_viewer import ImageViewerScreen, ZoomableImage
 
@@ -245,18 +246,19 @@ class ComparePlotView(CompareBase, PlotextPlot):
         if not self.full_screen:
             self.styles.height = PLOT_HEIGHT
         colors = self._colors()
-        dropped, drawn = 0, []
+        dropped, drawn, drawn_x = 0, [], []
         for i, points in sorted(series.items()):
             points, gone = prepare_points(points, chart.opts)  # smoothing / log axes, per run
             dropped += gone
             if points:
                 drawn += [p[1] for p in points]
+                drawn_x += [p[0] for p in points]
                 plt.plot(
                     [p[0] for p in points], [p[1] for p in points],
                     marker="braille", color=hex_to_rgb(colors[i]), label=self.run_labels[i],
                 )
         plt.xlabel(axis_label(chart.x))
-        apply_axis_options(plt, chart.opts, drawn)
+        apply_axis_options(plt, chart.opts, drawn, drawn_x)
         self.border_subtitle = plain_title(f"x: {axis_label(chart.x)}{plot_note(chart.opts, dropped)}{note}")
         self.refresh()
         if self.is_attached:
@@ -562,6 +564,245 @@ class CompareImageView(CompareBase, Vertical):
         self.app.push_screen(
             ImageViewerScreen(items, title=self.chart.title, subtitle=sub, viewport=self.viewport)
         )
+
+    def fail(self, run: int, message: str, token: tuple[int, int]) -> None:
+        if token == self.token():
+            self.errors[run] = message
+            self._labels()
+
+    # ---- keys ----------------------------------------------------------------------------------------
+    def action_step(self, delta: int) -> None:
+        if self.cursor.move(delta):
+            self.sub = 0
+            self._sync()
+
+    def action_jump_to(self, index: int) -> None:
+        if self.cursor.jump(self.cursor.n - 1 if index < 0 else index):
+            self.sub = 0
+            self._sync()
+
+    def action_sub(self, delta: int) -> None:
+        most = max((len(s.paths) for r in range(len(self.run_labels)) if (s := self.step_for(r))), default=1)
+        if 0 <= self.sub + delta < most:
+            self.sub += delta
+            self._sync()
+
+    def on_step_slider_jumped(self, event: StepSlider.Jumped) -> None:
+        event.stop()
+        if self.cursor.jump(event.index):
+            self.sub = 0
+            self._sync()
+
+
+# ---- audio ---------------------------------------------------------------------------------------
+AUDIO_COMPARE_HEIGHT = 16
+
+
+class CompareAudioView(CompareBase, Vertical):
+    """The audio logged under one key by every run: the waveforms side by side at the same step, one
+    slider for all. Only one clip plays at a time, the one of the run being listened to (`l` changes it)."""
+
+    can_focus = True
+    BINDINGS = [
+        Binding("space", "toggle_play", "Play"),
+        Binding("l", "listen_next", "Listen to"),
+        Binding("left", "step(-1)", "Previous step"),
+        Binding("right", "step(1)", "Next step"),
+        Binding("shift+left", "step(-10)", "10 steps back", show=False),
+        Binding("shift+right", "step(10)", "10 steps on", show=False),
+        Binding("home", "jump_to(0)", "First step", show=False),
+        Binding("end", "jump_to(-1)", "Last step", show=False),
+        Binding("left_square_bracket", "sub(-1)", "Previous clip", key_display="["),
+        Binding("right_square_bracket", "sub(1)", "Next clip", key_display="]"),
+        Binding("up", "screen.focus_chart(-1)", "Prev chart", show=False),
+        Binding("down", "screen.focus_chart(1)", "Next chart", show=False),
+    ]
+    DEFAULT_CSS = """
+    CompareAudioView { height: 16; border: round $primary; margin-bottom: 1; }
+    CompareAudioView:focus { border: round $accent; }
+    CompareAudioView #cells { height: 1fr; }
+    CompareAudioView .cell { width: 1fr; height: 1fr; }
+    CompareAudioView .cell-sep { border-left: solid $primary; margin-left: 1; padding-left: 1; }
+    CompareAudioView .cell-label { height: 1; padding: 0 1; }
+    CompareAudioView AudioPlayerView { padding: 0 1; }
+    CompareAudioView #audio-info { height: 1; color: $text-muted; padding: 0 1; }
+    """
+
+    class Wanted(Message):
+        """The clips for the current step should be fetched and shown."""
+
+        def __init__(self, view: "CompareAudioView") -> None:
+            super().__init__()
+            self.view = view
+
+    def __init__(self, chart: CompareChart, index: int, run_labels: Sequence[str]) -> None:
+        super().__init__()
+        self._init_compare(chart, index, run_labels)
+        self.series: list[ImageSeries | None] = []
+        self.steps: list[int] = []  # every step any run has, ascending: the slider's positions
+        self.cursor = StepCursor(0)
+        self.sub = 0
+        self.listen = 0  # the run whose clip Space plays
+        self.unavailable: str | None = None
+        self.errors: dict[int, str] = {}
+        self._debounce = None
+
+    def compose(self):
+        with Horizontal(id="cells"):
+            for i, _ in enumerate(self.run_labels):
+                with Vertical(classes="cell cell-sep" if i else "cell"):
+                    yield Static("", classes="cell-label")
+                    yield AudioPlayerView()
+        yield StepSlider(id="slider")
+        yield Static("loading…", id="audio-info")
+
+    # ---- keys ----------------------------------------------------------------------------------------
+    def players(self) -> list[AudioPlayerView]:
+        return list(self.query(AudioPlayerView))
+
+    def runs_with_clips(self) -> list[int]:
+        return [r for r in range(len(self.run_labels)) if self.step_for(r) is not None]
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "sub":
+            return any((s := self.step_for(r)) is not None and len(s.paths) > 1 for r in range(len(self.run_labels)))
+        if action == "toggle_play":
+            return self.unavailable is None and self._listened().path is not None if self.players() else False
+        if action == "listen_next":
+            return len(self.runs_with_clips()) > 1 and self.unavailable is None
+        return True
+
+    def key_label(self, action: str) -> str | None:
+        if action == "toggle_play":
+            return play_label(self._listened().state) if self.players() else "Play"
+        if action == "listen_next":
+            return f"Listen to: {self.run_labels[self.listen]}" if self.listen < len(self.run_labels) else "Listen to"
+        return None
+
+    def _listened(self) -> AudioPlayerView:
+        return self.players()[min(self.listen, len(self.run_labels) - 1)]
+
+    def on_audio_player_view_state_changed(self, event: AudioPlayerView.StateChanged) -> None:
+        event.stop()
+        self.refresh_bindings()
+        self._labels()
+
+    def action_toggle_play(self) -> None:
+        message = toggle_playback(self.app, self._listened())
+        if message:
+            self.notify(message, severity="warning")
+        for view in self.players():
+            view.refresh()
+        self.refresh_bindings()
+
+    def action_listen_next(self) -> None:
+        """Listen to the next run that has a clip here. If something is playing, that clip takes over
+        at once (one clip plays at a time)."""
+        candidates = self.runs_with_clips()
+        if len(candidates) < 2:
+            return
+        after = [r for r in candidates if r > self.listen]
+        new = after[0] if after else candidates[0]
+        was_playing = self._listened().state != "stopped"
+        if was_playing:
+            self.app.audio_player.stop()
+        self.listen = new
+        if was_playing and self._listened().path is not None:
+            message = toggle_playback(self.app, self._listened())
+            if message:
+                self.notify(message, severity="warning")
+        self._labels()
+        self.refresh_bindings()
+
+    def on_unmount(self) -> None:
+        player = self.app.audio_player
+        if any(v.path is not None and player.is_playing(v.path) for v in self.players()):
+            player.stop()
+
+    # ---- state -----------------------------------------------------------------------------------
+    @property
+    def target(self) -> int | None:
+        return self.steps[self.cursor.index] if self.steps else None
+
+    def step_for(self, run: int) -> ImageStep | None:
+        series = self.series[run] if run < len(self.series) else None
+        return nearest_step(series.steps, self.target) if series and self.target is not None else None
+
+    def token(self) -> tuple[int, int]:
+        return (self.target if self.target is not None else -1, self.sub)
+
+    def _leave_unavailable(self) -> None:
+        if self.unavailable is not None:
+            self.unavailable = None
+            self.query_one("#cells").display = True
+            self.query_one("#slider").display = True
+            self.styles.height = AUDIO_COMPARE_HEIGHT
+
+    def set_series(self, series: list[ImageSeries | None], keep_position: bool = False) -> None:
+        self._leave_unavailable()
+        previous = self.target
+        was_end = self.cursor.at_end
+        self.series, self.steps = series, union_steps(series)
+        n = len(self.steps)
+        if not keep_position or was_end or previous is None:
+            self.cursor = StepCursor(n, n - 1)
+        else:
+            nearest = min(range(n), key=lambda i: abs(self.steps[i] - previous)) if n else 0
+            self.cursor = StepCursor(n, nearest)
+        have = self.runs_with_clips()
+        if have and self.listen not in have:
+            self.listen = have[0]
+        self._sync(immediate=True)
+
+    def show_unavailable(self, message: str) -> None:
+        self.unavailable = message
+        self.query_one("#cells").display = False
+        self.query_one("#slider").display = False
+        self.styles.height = NOTE_HEIGHT
+        self.query_one("#audio-info", Static).update(plain(message))
+
+    # ---- showing -----------------------------------------------------------------------------------
+    def _labels(self) -> None:
+        colors = self._colors()
+        for run, cell in enumerate(self.query(".cell-label")):
+            step = self.step_for(run)
+            marker = "♪ " if run == self.listen and step is not None else "■ "
+            text = Text.assemble((marker, colors[run]), self.run_labels[run])
+            if step is None:
+                text.append("  not logged", style="dim")
+            else:
+                text.append(f"  step {step.step}", style="dim" if step.step == self.target else "yellow")
+                if step.caption(min(self.sub, len(step.paths) - 1)):
+                    text.append(f"  {step.caption(min(self.sub, len(step.paths) - 1))}", style="dim")
+            if run in self.errors:
+                text.append(f"  {self.errors[run]}", style="red")
+            cell.update(text)
+
+    def _sync(self, immediate: bool = False) -> None:
+        self.query_one("#slider", StepSlider).set_position(self.cursor.index, len(self.steps))
+        self.errors = {}
+        for run, view in enumerate(self.players()):  # a new step: whatever played stops, the old waveforms go
+            if view.path is not None and self.app.audio_player.is_playing(view.path):
+                self.app.audio_player.stop()
+            view.clear("" if self.step_for(run) else "not logged")
+        info = f"step {self.target} · {self.cursor.index + 1}/{len(self.steps)}" if self.steps else "No audio was logged."
+        self.query_one("#audio-info", Static).update(plain(info))
+        self._labels()
+        self.refresh_bindings()
+        if self.steps:
+            if self._debounce is not None:
+                self._debounce.stop()
+                self._debounce = None
+            if immediate:
+                self.post_message(self.Wanted(self))
+            else:
+                self._debounce = self.set_timer(DEBOUNCE, lambda: self.post_message(self.Wanted(self)))
+
+    def show_clip(self, run: int, path: Path, waveform, token: tuple[int, int], note: str = "") -> None:
+        if token != self.token():  # the slider has moved on since this was requested
+            return
+        self.players()[run].set_clip(path, waveform, note)
+        self.refresh_bindings()
 
     def fail(self, run: int, message: str, token: tuple[int, int]) -> None:
         if token == self.token():

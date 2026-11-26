@@ -24,8 +24,10 @@ from ..api import FileInfo, RunRef
 from ..formatting import fmt_size
 from ..imageview import FIT, ZOOMS, ImageViewport
 from .image_viewer import ZoomableImage
+from .audio_widgets import AudioPlayerView, play_label, toggle_playback
 from .keybar import KeyBar
 from ..plain import plain
+from ..audio import Waveform, read_waveform
 from ..media import MAX_AUDIO_BYTES, MAX_IMAGE_BYTES, MAX_TEXT_BYTES, file_kind
 from ..player import INSTALL_HINT
 
@@ -201,6 +203,7 @@ class FileScreen(Screen):
         self.title = self.info.name
         self.sub_title = fmt_size(self.info.size)
         self._was_playing = False
+        self.waveform: Waveform | None = None
         if self.kind == "audio":
             self.set_interval(0.5, self._watch_playback)
         limit = {
@@ -222,7 +225,8 @@ class FileScreen(Screen):
     def key_label(self, action: str) -> str | None:
         """What the key will do / is set to, shown in the key bar."""
         if action == "toggle_play":
-            return "Stop" if self.app.audio_player.playing else "Play"
+            views = list(self.query(AudioPlayerView))
+            return play_label(views[0].state) if views else "Play"
         if action == "next_mode":
             return f"Render mode: {self.mode_name}"
         return None
@@ -267,6 +271,8 @@ class FileScreen(Screen):
                 path = self.app.client.download_file(self.ref, self.info.name, target)
             if self.kind == "text":
                 text, note = self._read_text(path)
+            elif self.kind == "audio":
+                text, note = "", self._read_audio(path)
             else:
                 text, note = "", self._inspect_image(path) if self.kind == "image" else ""
         except Exception as exc:
@@ -281,6 +287,15 @@ class FileScreen(Screen):
             im.verify()  # raises on corrupt/unsupported data
         with PILImage.open(path) as im:
             return f"{im.format} {im.width}×{im.height}"
+
+    def _read_audio(self, path: Path) -> str:
+        """Reads the waveform (kept in `self.waveform`); the note says why there is none."""
+        try:
+            self.waveform = read_waveform(path)
+            return ""
+        except ValueError as exc:
+            self.waveform = None
+            return str(exc)
 
     def _read_text(self, path: Path) -> tuple[str, str]:
         """Contents, and a note about any transformation (e.g. 'pretty-printed')."""
@@ -304,9 +319,10 @@ class FileScreen(Screen):
         elif self.kind == "text":
             await self._show_text(preview, path, text, note)
         else:
-            hint = "" if self.app.audio_player.available else INSTALL_HINT
-            self._status("")
-            await preview.mount(Static(Text(f"♪  {self.info.name}" + (f"\n\n{hint}" if hint else "")), id="audio-info"))
+            self._status("" if self.app.audio_player.available else INSTALL_HINT)
+            view = AudioPlayerView(id="audio-view")
+            await preview.mount(view)
+            view.set_clip(path, self.waveform, note)
         self.refresh_bindings()
 
     # ---- text ----------------------------------------------------------
@@ -415,13 +431,15 @@ class FileScreen(Screen):
 
     # ---- audio ---------------------------------------------------------
     def action_toggle_play(self) -> None:
-        player = self.app.audio_player
-        if player.playing:
-            player.stop()
-            self._status("Stopped.")
-        elif self.path is not None and player.play(self.path):
-            self._status("Playing…")
-        else:
-            self._status(INSTALL_HINT)
-        self._was_playing = player.playing
-        self.refresh_bindings()  # the key now says Play or Stop
+        views = list(self.query(AudioPlayerView))
+        if not views:
+            return
+        message = toggle_playback(self.app, views[0])
+        self._status(message or "")
+        self._was_playing = self.app.audio_player.playing
+        views[0].refresh()
+        self.refresh_bindings()  # the key now says Play, Pause or Continue
+
+    def on_audio_player_view_state_changed(self, event: AudioPlayerView.StateChanged) -> None:
+        event.stop()
+        self.refresh_bindings()

@@ -41,7 +41,10 @@ def of(screen, cls):
 # ---- choosing the kind ---------------------------------------------------------------------
 
 
-async def test_the_kind_dialog_offers_plot_bar_and_table(make_app):
+async def test_the_kind_dialog_offers_plot_bar_and_table(make_app, monkeypatch):
+    from wandb_cli_tool.audio import AudioInfo
+
+    monkeypatch.setattr(FakeClient, "AUDIOS", [AudioInfo("clips")])
     app, ctx = await start(make_app)
     async with ctx as pilot:
         screen = await open_charts(pilot)
@@ -50,7 +53,7 @@ async def test_the_kind_dialog_offers_plot_bar_and_table(make_app):
         assert isinstance(app.screen, ChartKindDialog)
         options = app.screen.query_one("#kinds", OptionList)
         labels = [str(options.get_option_at_index(i).prompt) for i in range(options.option_count)]
-        assert [l.split(" — ")[0] for l in labels] == ["Plot", "Bar chart", "Table", "Images"]
+        assert [l.split(" — ")[0] for l in labels] == ["Plot", "Bar chart", "Table", "Images", "Audio"]
         assert all("not available" not in l for l in labels)
         await pilot.press("escape")
         await settle(pilot)
@@ -83,7 +86,7 @@ async def test_nothing_to_chart_gives_a_message_instead_of_an_empty_dialog(make_
         await pilot.press("a")
         await settle(pilot)
         assert not isinstance(app.screen, ChartKindDialog)
-        assert any("no metrics, tables or images" in n.message for n in app._notifications)
+        assert any("no metrics, tables, images or audio" in n.message for n in app._notifications)
 
 
 # ---- plots with several values -----------------------------------------------------------------
