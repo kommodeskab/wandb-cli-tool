@@ -63,9 +63,9 @@ In a run's Charts tab (`3`), `n` creates a panel and `a` adds a chart to the sel
 - **Bar chart**: tick two or more metrics; each bar is that metric's latest value. They are drawn top to bottom in the order you pick them; to rearrange, focus the order list in the dialog and press `Ctrl+↑` / `Ctrl+↓`.
 - **Table**: show a `wandb.Table` that the run logged (the latest version of the one you pick). Use the arrow keys inside the table and `Tab` to move to the next chart.
 
-Series colors come from a fixed palette in a fixed order. The kind and its settings are saved with the rest of the layout.
+Series colors come from a fixed palette in a fixed order. The kind and its settings are saved with the rest of the layout. Press `Enter` on any focused plot, bar chart, table, or image to open it full-screen (`Esc` goes back).
 
-- **Images**: browse images logged with `wandb.Image` (one or several per step) with a step slider. The newest step is shown first. `←` / `→` change step (`Shift` for ±10, `Home` / `End` for the first and last), you can also click the slider, and `[` / `]` switch between images logged together at one step. Images are downloaded as you go and shown as a screen-sized copy, so even very large pictures step quickly. See the VS Code note below for sharp images.
+- **Images**: browse images logged with `wandb.Image` (one or several per step) with a step slider. The newest step is shown first. `←` / `→` change step (`Shift` for ±10, `Home` / `End` for the first and last), you can also click the slider, and `[` / `]` switch between images logged together at one step. The image is shown fitted to the chart; `Enter` opens it full-screen (in a comparison: all runs side by side), where you can zoom (`+` / `-` / `0`, up to 1000%) and drag it with the mouse (in a comparison every image follows), and `Esc` goes back. Images are downloaded as you go and cropped to the visible area with fast low-resolution drag frames, so stepping and panning stay smooth. See the VS Code note below for sharp images.
 
 **Refreshing.** `r` refreshes the charts now. While a run is still running they also refresh on their own (every 30 s by default; `f` cycles 10 s / 30 s / 1 min / 5 min / off, and the choice is remembered). Charts update in place, so your focus, scroll position and table cursor stay, new metrics appear, and a slider that was at the newest step follows new images. A failed refresh keeps what is on screen and says so in the status line. Finished runs are not refreshed automatically.
 
@@ -98,7 +98,7 @@ Images in the Files screen are drawn with real pixels (sixel graphics) only if t
 
 Other terminals with sixel or kitty graphics support (kitty, WezTerm, foot, iTerm2, Windows Terminal, …) work without these settings.
 
-Inside the image view: `+` / `-` / `0` zoom, `m` cycles the render mode.
+Inside the full-screen image view (or Files preview): `+` / `-` / `0` (or scroll wheel) zoom up to 1000%, drag with the mouse or use arrow keys to pan, `m` cycles the render mode.
 
 ## Development
 

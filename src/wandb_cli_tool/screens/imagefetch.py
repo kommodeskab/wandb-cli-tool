@@ -15,9 +15,9 @@ if TYPE_CHECKING:
     from ..app import WandbCliApp
 
 
-def fetch_thumbnail(app: "WandbCliApp", ref: RunRef, step: ImageStep, sub: int) -> Path:
-    """The image `sub` of `step` of the run, as a file a widget can draw. Raises if it is too large
-    to display, cannot be downloaded or is not a readable image."""
+def fetch_image(app: "WandbCliApp", ref: RunRef, step: ImageStep, sub: int) -> tuple[Path, Path]:
+    """Return `(thumbnail_path, original_path)` for `step[sub]`. Raises if too large,
+    impossible to download, or unreadable."""
     path = step.paths[sub]
     size = step.size(sub)
     if size is not None and size > MAX_IMAGE_BYTES:
@@ -27,4 +27,10 @@ def fetch_thumbnail(app: "WandbCliApp", ref: RunRef, step: ImageStep, sub: int) 
     if not (target.is_file() and (size is None or target.stat().st_size == size)):
         app.cache.prune_dir_sometimes(DOWNLOAD_NAMESPACE, DOWNLOAD_CACHE_BYTES)
         app.client.download_file(ref, path, folder)
-    return make_thumbnail(target)  # a screen-sized copy: huge images are slow to decode
+    return make_thumbnail(target), target
+
+
+def fetch_thumbnail(app: "WandbCliApp", ref: RunRef, step: ImageStep, sub: int) -> Path:
+    """The image `sub` of `step` of the run, as a file a widget can draw. Raises if it is too large
+    to display, cannot be downloaded or is not a readable image."""
+    return fetch_image(app, ref, step, sub)[0]

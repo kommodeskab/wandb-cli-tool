@@ -444,6 +444,36 @@ async def test_images_of_all_runs_share_one_slider():
         assert sorted(app.client.downloads)[:2] == ["media/images/id1_20.png", "media/images/id1_30.png"] or "media/images/id3_20.png" in app.client.downloads
         assert "media/images/id1_20.png" in app.client.downloads and "media/images/id3_20.png" in app.client.downloads
 
+        # No zoom/fit in the chart; Enter opens ImageViewerScreen, where zoom and drag are synchronized
+        from textual.events import MouseDown, MouseMove, MouseUp
+        from wandb_cli_tool.screens.image_viewer import ImageViewerScreen, ZoomableImage
+
+        assert view.check_action("open_images", ()) is True
+        await pilot.press("plus", "plus")
+        await settle(pilot)
+        assert view.viewport.zoom == 1.0 and "zoom" not in str(view.query_one("#img-info").render())
+        assert all(p.interactive is False for p in view.query(ZoomableImage))
+
+        await pilot.press("enter")
+        await settle(pilot, 4)
+        viewer = app.screen
+        assert isinstance(viewer, ImageViewerScreen) and viewer.viewport.zoom == 1.0
+        await pilot.press("plus", "plus")
+        await settle(pilot)
+        panes = list(viewer.query(ZoomableImage))
+        assert len(panes) == 2 and panes[0].viewport is panes[1].viewport is viewer.viewport
+        panes[0].on_mouse_down(MouseDown(panes[0], 10, 10, 0, 0, 1, False, False, False, screen_x=10, screen_y=10))
+        panes[0].on_mouse_move(MouseMove(panes[0], 2, 2, -8, -8, 1, False, False, False, screen_x=2, screen_y=2))
+        panes[0].on_mouse_up(MouseUp(panes[0], 2, 2, 0, 0, 1, False, False, False, screen_x=2, screen_y=2))
+        await settle(pilot)
+        assert viewer.viewport.pan_x > 0.5 and viewer.viewport.pan_y > 0.5  # dragged to bottom-right
+        await pilot.press(*["plus"] * 8)  # 1000% max zoom in full-screen viewer too
+        await settle(pilot)
+        assert viewer.viewport.zoom == 10.0 and "zoom 1000%" in str(viewer.query_one("#viewer-status").render())
+        await pilot.press("escape")
+        await settle(pilot)
+        assert app.screen is screen
+
 
 async def test_media_missing_from_every_run_is_a_short_note():
     class NoMedia(CompareClient):
@@ -940,3 +970,108 @@ async def test_overview_refits_columns_when_terminal_resizes():
         narrow_widths = [c.width for c in list(table.columns.values())[1:]]
         assert all(n < w for n, w in zip(narrow_widths, wide_widths))
         assert table.show_horizontal_scrollbar is False
+
+
+# ---- image dividers and full-screen plot / bar / table viewer -----------------------------------------
+
+
+async def test_compared_images_have_vertical_dividers_both_inline_and_fullscreen():
+    from wandb_cli_tool.screens.image_viewer import ImageViewerScreen, ZoomableImage
+
+    app = make(MediaClient)
+    media_layout(app)
+    async with app.run_test(size=(150, 50)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        await show_panel(pilot, screen, "Media")
+        [view] = screen.query(CompareImageView)
+        inline_cells = list(view.query(".cell"))
+        assert len(inline_cells) == 3
+        assert not inline_cells[0].has_class("cell-sep")
+        assert all(c.has_class("cell-sep") for c in inline_cells[1:])
+        inline_panes = list(view.query(ZoomableImage))
+        assert inline_panes[1].region.x - inline_panes[0].region.right >= 3
+
+        view.focus()
+        await pilot.press("enter")
+        await settle(pilot, 4)
+        viewer = app.screen
+        assert isinstance(viewer, ImageViewerScreen)
+        viewer_cells = list(viewer.query(".viewer-cell"))
+        assert len(viewer_cells) == 3
+        assert not viewer_cells[0].has_class("viewer-cell-sep")
+        assert all(c.has_class("viewer-cell-sep") for c in viewer_cells[1:])
+        viewer_panes = list(viewer.query(ZoomableImage))
+        assert viewer_panes[1].region.x - viewer_panes[0].region.right >= 3
+
+
+async def test_compare_plot_bar_and_table_open_fullscreen():
+    from wandb_cli_tool.charts import BAR, ChartSpec, Customization
+    from wandb_cli_tool.layout_store import project_key
+    from wandb_cli_tool.screens.chart_viewer import ChartViewerScreen
+    from wandb_cli_tool.screens.chart_widgets import PLOT_HEIGHT, TABLE_MAX_HEIGHT
+
+    app = make(MediaClient)
+    custom = Customization(
+        panels=["View"],
+        added={
+            "View": [
+                ChartSpec("trainer/loss"),
+                ChartSpec("acc", kind=BAR, more=("val/loss",)),
+                ChartSpec("preds", kind="table"),
+            ]
+        },
+    )
+    app.layout_store.save(project_key("me", "alpha"), custom)
+    async with app.run_test(size=(150, 50)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        await show_panel(pilot, screen, "View")
+
+        # 1. Plot -> full-screen plot
+        [plot] = screen.query(ComparePlotView)
+        plot.focus()
+        await settle(pilot)
+        assert "Open plot" in keys_of(screen)
+        await pilot.press("enter")
+        await settle(pilot, 4)
+        assert isinstance(app.screen, ChartViewerScreen)
+        assert isinstance(app.screen.viewer_widget, ComparePlotView)
+        assert app.screen.viewer_widget.full_screen is True
+        assert app.screen.viewer_widget.size.height > PLOT_HEIGHT
+        assert "run-1" in app.screen.query_one("#viewer-legend").render().plain
+        assert "Open plot" not in keys_of(app.screen)
+        await pilot.press("escape")
+        await settle(pilot)
+        assert app.screen is screen
+
+        # 2. Bar chart -> full-screen bar chart
+        [bar] = screen.query(CompareBarView)
+        bar.focus()
+        await settle(pilot)
+        assert "Open bar chart" in keys_of(screen)
+        await pilot.press("enter")
+        await settle(pilot, 4)
+        assert isinstance(app.screen, ChartViewerScreen)
+        assert isinstance(app.screen.viewer_widget, CompareBarView)
+        assert app.screen.viewer_widget.full_screen is True
+        await pilot.press("escape")
+        await settle(pilot)
+        assert app.screen is screen
+
+        # 3. Table -> full-screen table (v toggles row grouping and updates status)
+        [table] = screen.query(CompareTableView)
+        table.focus()
+        await settle(pilot)
+        assert "Open table" in keys_of(screen)
+        await pilot.press("enter")
+        await settle(pilot, 4)
+        assert isinstance(app.screen, ChartViewerScreen)
+        full_table = app.screen.viewer_widget
+        assert isinstance(full_table, CompareTableView) and full_table.full_screen is True
+        assert full_table.size.height > TABLE_MAX_HEIGHT
+        assert "grouped by run" in app.screen.query_one("#viewer-status").render().plain
+        await pilot.press("v")
+        await settle(pilot)
+        assert "lined up by first column" in app.screen.query_one("#viewer-status").render().plain
+        await pilot.press("escape")
+        await settle(pilot)
+        assert app.screen is screen

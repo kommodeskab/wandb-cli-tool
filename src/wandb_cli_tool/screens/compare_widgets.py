@@ -15,13 +15,13 @@ from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import DataTable, Static
-from textual_image.widget import Image as BestImage
 from textual_plotext import PlotextPlot
 
 from ..barchart import layout_bars
 from ..charts import axis_label
 from ..compare import MAX_COMPARE_ROWS, CompareChart, latest, merge_tables, nearest_step, union_steps
 from ..images import ImageSeries, ImageStep, StepCursor
+from ..imageview import ImageViewport
 from ..palette import hex_to_rgb, series_color
 from ..plain import plain, plain_title
 from ..series import Point, prepare_points
@@ -29,6 +29,8 @@ from ..tables import TableData
 from .chart_widgets import (
     CHART_CLASS, DEBOUNCE, NOTE_HEIGHT, StepSlider, table_height, PLOT_HEIGHT, _NAV_BINDINGS, apply_axis_options, is_dark, note_renderable, plot_note,
 )
+from .chart_viewer import ChartViewerScreen
+from .image_viewer import ImageViewerScreen, ZoomableImage
 
 Group = tuple[str, Sequence["float | None"]]  # a metric and its value in each run (None = no value)
 
@@ -91,33 +93,63 @@ class CompareBarView(CompareBase, Widget):
     """Bars side by side: for each metric, one bar per run."""
 
     can_focus = True
-    BINDINGS = _NAV_BINDINGS
+    BINDINGS = [Binding("enter", "open_chart", "Open bar chart"), *_NAV_BINDINGS]
     DEFAULT_CSS = """
     CompareBarView { height: 8; border: round $primary; margin-bottom: 1; padding: 0 1; }
     CompareBarView:focus { border: round $accent; }
     """
 
-    def __init__(self, chart: CompareChart, index: int, run_labels: Sequence[str]) -> None:
+    def __init__(
+        self, chart: CompareChart, index: int, run_labels: Sequence[str], *, full_screen: bool = False
+    ) -> None:
         super().__init__()
         self._init_compare(chart, index, run_labels)
+        self.full_screen = full_screen
         self.groups: list[Group] | None = None
         self.note: str | None = None
         self.error = ""
+        if full_screen:
+            self.can_focus = False
+            self.add_class("viewer-bars")
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "open_chart":
+            return not self.full_screen and self.groups is not None and self.note is None and not self.error
+        return True
+
+    def action_open_chart(self) -> None:
+        if self.full_screen or self.groups is None or self.note is not None or self.error:
+            return
+        full = CompareBarView(self.chart, 0, self.run_labels, full_screen=True)
+        groups = list(self.groups)
+        legend = list(zip(self.run_labels, self._colors()))
+        self.app.push_screen(
+            ChartViewerScreen(
+                full, title=self.chart.title, legend=legend, scrollable=True, populate=lambda: full.show(groups)
+            )
+        )
 
     def show(self, groups: list[Group]) -> None:
         self.groups, self.note, self.error = groups, None, ""
         self.styles.height = grouped_bars_height(groups)
         self.border_subtitle = plain_title(f"axis {self.chart.opts.range_text()}") if self.chart.opts.range_text() else ""
         self.refresh()
+        if self.is_attached:
+            self.refresh_bindings()
 
     def show_unavailable(self, message: str) -> None:
         self.note, self.groups, self.error = message, None, ""
-        self.styles.height = NOTE_HEIGHT
+        if not self.full_screen:
+            self.styles.height = NOTE_HEIGHT
         self.refresh()
+        if self.is_attached:
+            self.refresh_bindings()
 
     def fail(self, message: str) -> None:
         self.error = message
         self.refresh()
+        if self.is_attached:
+            self.refresh_bindings()
 
     def render(self) -> RenderableType:
         if self.note is not None:
@@ -134,18 +166,44 @@ class ComparePlotView(CompareBase, PlotextPlot):
     """One metric's curves, one per run, overlaid. If every run logged a single value it becomes bars."""
 
     can_focus = True
-    BINDINGS = _NAV_BINDINGS
+    BINDINGS = [Binding("enter", "open_chart", "Open plot"), *_NAV_BINDINGS]
     DEFAULT_CSS = """
     ComparePlotView { height: 20; border: round $primary; margin-bottom: 1; }
     ComparePlotView:focus { border: round $accent; }
     """
 
-    def __init__(self, chart: CompareChart, index: int, run_labels: Sequence[str]) -> None:
+    def __init__(
+        self, chart: CompareChart, index: int, run_labels: Sequence[str], *, full_screen: bool = False
+    ) -> None:
         super().__init__()
         self._init_compare(chart, index, run_labels)
+        self.full_screen = full_screen
         self.border_subtitle = self.border_subtitle or "loading…"
         self.bars: list[Group] | None = None  # set when every run has a single value
         self.note: str | None = None
+        self._series: dict[int, list[Point]] | None = None
+        self._single = False
+        if full_screen:
+            self.can_focus = False
+            self.add_class("viewer-full")
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "open_chart":
+            return not self.full_screen and self._series is not None and self.note is None
+        return True
+
+    def action_open_chart(self) -> None:
+        if self.full_screen or self._series is None or self.note is not None:
+            return
+        full = ComparePlotView(self.chart, 0, self.run_labels, full_screen=True)
+        series, single = self._series, self._single
+        legend = list(zip(self.run_labels, self._colors()))
+        sub = f"in “{self.chart.subtitle}”" if self.chart.subtitle else ""
+        self.app.push_screen(
+            ChartViewerScreen(
+                full, title=self.chart.title, subtitle=sub, legend=legend, populate=lambda: full.show(series, single)
+            )
+        )
 
     def render(self) -> RenderableType:
         if self.note is not None:
@@ -155,26 +213,37 @@ class ComparePlotView(CompareBase, PlotextPlot):
         return super().render()
 
     def show_unavailable(self, message: str) -> None:
-        self.note, self.bars = message, None
-        self.styles.height = NOTE_HEIGHT
+        self.note, self.bars, self._series = message, None, None
+        if not self.full_screen:
+            self.styles.height = NOTE_HEIGHT
         self.border_subtitle = ""
         self.refresh()
+        if self.is_attached:
+            self.refresh_bindings()
 
     def show(self, series: Mapping[int, list[Point]], single: bool) -> None:
         """`series` maps a run's position to its points (runs without data are left out)."""
         chart, plt = self.chart, self.plt
+        self._series = {k: list(v) for k, v in series.items()}
+        self._single = single
         self.note = None
         plt.clear_figure()
         missing = [self.run_labels[i] for i in range(len(self.run_labels)) if not series.get(i)]
         note = f"  ·  no data: {', '.join(missing)}" if missing else ""
         if single:  # one number per run: a bar each, not a line
             self.bars = [(chart.title, [latest(series.get(i, [])) for i in range(len(self.run_labels))])]
-            self.styles.height = grouped_bars_height(self.bars)
+            if self.full_screen:
+                self.styles.padding = (1, 2)
+            else:
+                self.styles.height = grouped_bars_height(self.bars)
             self.border_subtitle = plain_title(note.removeprefix("  ·  "))
             self.refresh()
+            if self.is_attached:
+                self.refresh_bindings()
             return
         self.bars = None
-        self.styles.height = PLOT_HEIGHT
+        if not self.full_screen:
+            self.styles.height = PLOT_HEIGHT
         colors = self._colors()
         dropped, drawn = 0, []
         for i, points in sorted(series.items()):
@@ -190,13 +259,18 @@ class ComparePlotView(CompareBase, PlotextPlot):
         apply_axis_options(plt, chart.opts, drawn)
         self.border_subtitle = plain_title(f"x: {axis_label(chart.x)}{plot_note(chart.opts, dropped)}{note}")
         self.refresh()
+        if self.is_attached:
+            self.refresh_bindings()
 
     def fail(self, message: str) -> None:
         self.bars = None
+        self._series = None
         self.plt.clear_figure()
         self.plt.title(f"Error: {message}")
         self.border_subtitle = ""
         self.refresh()
+        if self.is_attached:
+            self.refresh_bindings()
 
 
 # ---- tables --------------------------------------------------------------------------------------
@@ -205,18 +279,53 @@ class CompareTableView(CompareBase, DataTable):
     `v` switches between keeping each run's rows together and lining up rows with the same first column."""
 
     can_focus = True
-    BINDINGS = [Binding("v", "toggle_group", "Line up rows by first column")]
+    BINDINGS = [
+        Binding("enter", "open_chart", "Open table"),
+        Binding("v", "toggle_group", "Line up rows by first column"),
+    ]
     DEFAULT_CSS = """
     CompareTableView { height: 8; border: round $primary; margin-bottom: 1; }
     CompareTableView:focus { border: round $accent; }
     """
 
-    def __init__(self, chart: CompareChart, index: int, run_labels: Sequence[str]) -> None:
+    def __init__(
+        self, chart: CompareChart, index: int, run_labels: Sequence[str], *, full_screen: bool = False
+    ) -> None:
         DataTable.__init__(self, cursor_type="cell", zebra_stripes=True)
         self._init_compare(chart, index, run_labels)
+        self.full_screen = full_screen
         self.border_subtitle = "loading…"
         self.tables: list[TableData | None] | None = None
         self.by_key = False
+        if full_screen:
+            self.add_class("viewer-full")
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "open_chart":
+            return not self.full_screen and self.tables is not None
+        return True
+
+    def action_open_chart(self) -> None:
+        if self.full_screen or self.tables is None:
+            return
+        full = CompareTableView(self.chart, 0, self.run_labels, full_screen=True)
+        full.by_key = self.by_key
+        tables = list(self.tables)
+        coord = self.cursor_coordinate if self.row_count else None
+        legend = list(zip(self.run_labels, self._colors()))
+
+        def populate() -> None:
+            full.show_tables(tables)
+            if coord is not None and full.row_count and full.columns:
+                full.move_cursor(
+                    row=min(coord.row, full.row_count - 1),
+                    column=min(coord.column, len(full.columns) - 1),
+                    animate=False,
+                )
+
+        self.app.push_screen(
+            ChartViewerScreen(full, title=self.chart.title, legend=legend, focus_widget=True, populate=populate)
+        )
 
     def show_tables(self, tables: list[TableData | None]) -> None:
         self.tables = tables
@@ -232,7 +341,8 @@ class CompareTableView(CompareBase, DataTable):
         self.add_columns("Run", *[plain(c) for c in merged.columns])
         for run, cells in merged.rows:
             self.add_row(Text.assemble(("■ ", colors[run]), self.run_labels[run]), *[plain(c) for c in cells])
-        self.styles.height = table_height(len(merged.rows))
+        if not self.full_screen:
+            self.styles.height = table_height(len(merged.rows))
         if cursor is not None and merged.rows:
             self.move_cursor(
                 row=min(cursor.row, len(merged.rows) - 1),
@@ -245,8 +355,13 @@ class CompareTableView(CompareBase, DataTable):
         if merged.missing:
             notes.append("not in: " + ", ".join(self.run_labels[i] for i in merged.missing))
         notes.append("lined up by first column" if self.by_key else "grouped by run")
-        self.border_subtitle = plain_title(" · ".join(notes))
+        subtitle = " · ".join(notes)
+        self.border_subtitle = plain_title(subtitle)
         self.refresh()
+        if self.full_screen and self.is_attached and hasattr(self.screen, "set_status"):
+            self.screen.set_status(subtitle)
+        if self.is_attached:
+            self.refresh_bindings()
 
     def toggle_state(self, action: str) -> bool | None:
         return self.by_key if action == "toggle_group" else None
@@ -261,16 +376,22 @@ class CompareTableView(CompareBase, DataTable):
         self.clear(columns=True)
         self.add_column("Not in the compared runs")
         self.add_row(plain(message))
-        self.styles.height = table_height(1)
+        if not self.full_screen:
+            self.styles.height = table_height(1)
         self.border_subtitle = ""
+        if self.is_attached:
+            self.refresh_bindings()
 
     def fail(self, message: str) -> None:
         self.tables = None
         self.clear(columns=True)
         self.add_column("Error")
         self.add_row(plain(message))
-        self.styles.height = table_height(1)
+        if not self.full_screen:
+            self.styles.height = table_height(1)
         self.border_subtitle = ""
+        if self.is_attached:
+            self.refresh_bindings()
 
 
 # ---- images --------------------------------------------------------------------------------------
@@ -283,6 +404,7 @@ class CompareImageView(CompareBase, Vertical):
 
     can_focus = True
     BINDINGS = [
+        Binding("enter", "open_images", "Open images"),
         Binding("left", "step(-1)", "Previous step"),
         Binding("right", "step(1)", "Next step"),
         Binding("shift+left", "step(-10)", "10 steps back", show=False),
@@ -299,6 +421,7 @@ class CompareImageView(CompareBase, Vertical):
     CompareImageView:focus { border: round $accent; }
     CompareImageView #cells { height: 1fr; }
     CompareImageView .cell { width: 1fr; height: 1fr; }
+    CompareImageView .cell-sep { border-left: solid $primary; margin-left: 1; padding-left: 1; }
     CompareImageView .cell-label { height: 1; padding: 0 1; }
     CompareImageView .cell-img { height: 1fr; align: center middle; }
     CompareImageView #img-info { height: 1; color: $text-muted; padding: 0 1; }
@@ -322,23 +445,24 @@ class CompareImageView(CompareBase, Vertical):
         self.errors: dict[int, str] = {}
         self._debounce = None
         self._shown: dict[int, Path] = {}
+        self._full_paths: dict[int, Path] = {}
+        self.viewport = ImageViewport()
 
     def compose(self):
         with Horizontal(id="cells"):
-            for _ in self.run_labels:
-                with Vertical(classes="cell"):
+            for i, _ in enumerate(self.run_labels):
+                with Vertical(classes="cell cell-sep" if i else "cell"):
                     yield Static("", classes="cell-label")
                     with Vertical(classes="cell-img"):
-                        image = BestImage(None)
-                        image.styles.width = "auto"
-                        image.styles.height = "auto"
-                        yield image
+                        yield ZoomableImage(viewport=self.viewport, interactive=False)
         yield StepSlider(id="slider")
         yield Static("loading…", id="img-info")
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action == "sub":  # only offered when some run's step has several images
             return any((s := self.step_for(r)) is not None and len(s.paths) > 1 for r in range(len(self.run_labels)))
+        if action == "open_images":
+            return bool(self._shown) and self.unavailable is None
         return True
 
     # ---- state -----------------------------------------------------------------------------------
@@ -396,13 +520,18 @@ class CompareImageView(CompareBase, Vertical):
                 text.append(f"  {self.errors[run]}", style="red")
             cell.update(text)
 
+    def _update_img_info(self) -> None:
+        info = f"step {self.target} · {self.cursor.index + 1}/{len(self.steps)}" if self.steps else "No images were logged."
+        self.query_one("#img-info", Static).update(plain(info))
+
     def _sync(self, immediate: bool = False) -> None:
         self.query_one("#slider", StepSlider).set_position(self.cursor.index, len(self.steps))
         self.errors = {}
+        self._shown = {}
+        self._full_paths = {}
         self._labels()
         self.refresh_bindings()
-        info = f"step {self.target} · {self.cursor.index + 1}/{len(self.steps)}" if self.steps else "No images were logged."
-        self.query_one("#img-info", Static).update(plain(info))
+        self._update_img_info()
         if self.steps:
             if self._debounce is not None:
                 self._debounce.stop()
@@ -412,11 +541,27 @@ class CompareImageView(CompareBase, Vertical):
             else:
                 self._debounce = self.set_timer(DEBOUNCE, lambda: self.post_message(self.Wanted(self)))
 
-    def show_image(self, run: int, path: Path, token: tuple[int, int]) -> None:
+    def show_image(self, run: int, path: Path, token: tuple[int, int], original: Path | None = None) -> None:
         if token != self.token():  # the slider has moved on since this was requested
             return
         self._shown[run] = path
-        self.query(BestImage)[run].image = path
+        self._full_paths[run] = original or path
+        self.query(ZoomableImage)[run].set_image(path, self._full_paths[run])
+        self.refresh_bindings()
+
+    def action_open_images(self) -> None:
+        if not self._shown or self.unavailable is not None:
+            return
+        colors = self._colors()
+        items = []
+        for run, label in enumerate(self.run_labels):
+            step = self.step_for(run)
+            tag = f"{label}  step {step.step}" if step is not None else f"{label}  not logged"
+            items.append((tag, self._full_paths.get(run) or self._shown.get(run), colors[run]))
+        sub = f"step {self.target} · {self.cursor.index + 1}/{len(self.steps)}" if self.steps else ""
+        self.app.push_screen(
+            ImageViewerScreen(items, title=self.chart.title, subtitle=sub, viewport=self.viewport)
+        )
 
     def fail(self, run: int, message: str, token: tuple[int, int]) -> None:
         if token == self.token():

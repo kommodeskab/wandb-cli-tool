@@ -391,3 +391,46 @@ async def test_the_image_keys_are_in_the_key_bar_only_for_steps_with_several_ima
         assert view.check_action("sub", ()) is True
         bar = app.screen.query_one(KeyBar).query_one("KeyLine").render().plain.replace("\xa0", " ")
         assert "[ Previous image" in bar and "] Next image" in bar
+
+
+async def test_image_chart_offers_zoom_only_once_the_image_is_opened(make_app):
+    from textual.events import MouseDown, MouseMove, MouseUp
+    from wandb_cli_tool.screens.image_viewer import ImageViewerScreen, ZoomableImage
+    from wandb_cli_tool.screens.keybar import KeyBar
+    from wandb_cli_tool.screens.run import RunScreen
+
+    app, ctx = await start(make_app)
+    async with ctx as pilot:
+        screen, view = await with_images(pilot)
+        assert view.check_action("open_image", ()) is True
+        bar = app.screen.query_one(KeyBar).query_one("KeyLine").render().plain
+        assert "Open" in bar and "Zoom" not in bar and "Fit" not in bar
+        await pilot.press("plus", "0")  # not bound in the chart: nothing changes
+        await settle(pilot)
+        assert view.viewport.zoom == 1.0 and "zoom" not in info(view)
+        pane = view.query_one("#zoom-img", ZoomableImage)
+        assert pane.interactive is False
+        view.viewport.zoom_index += 2  # even when zoomed, the preview cannot be dragged
+        pane.on_mouse_down(MouseDown(pane, 10, 10, 0, 0, 1, False, False, False, screen_x=10, screen_y=10))
+        pane.on_mouse_move(MouseMove(pane, 20, 4, 10, -6, 1, False, False, False, screen_x=20, screen_y=4))
+        pane.on_mouse_up(MouseUp(pane, 20, 4, 0, 0, 1, False, False, False, screen_x=20, screen_y=4))
+        assert (view.viewport.pan_x, view.viewport.pan_y) == (0.5, 0.5)
+        view.viewport.reset()
+
+        await pilot.press("enter")
+        await settle(pilot, 4)
+        viewer = app.screen
+        assert isinstance(viewer, ImageViewerScreen) and viewer.viewport.zoom == 1.0
+        await pilot.press(*["plus"] * 12)
+        await settle(pilot)
+        assert viewer.viewport.zoom == 10.0 and "zoom 1000%" in screen_text(app)
+        await pilot.press("right")
+        await settle(pilot)
+        assert viewer.viewport.pan_x > 0.5
+        await pilot.press("m")
+        await settle(pilot)
+        assert "Render mode: half-cell" in screen_text(app)
+        await pilot.press("escape")
+        await settle(pilot)
+        assert isinstance(app.screen, RunScreen) and app.screen.active_tab == "charts"
+        assert view.viewport.zoom == 1.0  # the chart's preview stays fitted

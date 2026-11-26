@@ -15,6 +15,7 @@ import sys
 import time
 
 CELL_SIZE_REPLY = re.compile(rb"\x1b\[6;(\d+);(\d+)t")  # reply to CSI 16 t: height;width
+WINSIZE_KNOWN_TIMEOUT = 0.4  # wait for the terminal's answer when the ioctl gave a fallback
 
 
 def cell_size_from_winsize(rows: int, cols: int, xpixel: int, ypixel: int) -> tuple[int, int] | None:
@@ -37,8 +38,11 @@ def detect_cell_size(
 ) -> tuple[int, int] | None:
     """(width, height) of a terminal cell in pixels, or None if it can't be determined.
 
-    Tries the window-size ioctl first, then asks the terminal (CSI 16 t) and waits up to
-    `timeout` seconds. Must run before the Textual app starts.
+    Asks the terminal first (CSI 16 t): its answer is the scale it draws sixel/kitty pixels at.
+    The window-size ioctl is only the fallback, because some terminals report it in other units
+    (VS Code on a high-DPI screen: CSS pixels, while sixels are drawn in device pixels, which made
+    images half as wide and high as their area, stuck in its top-left corner). Must run before
+    the Textual app starts.
     """
     try:
         import fcntl
@@ -52,15 +56,16 @@ def detect_cell_size(
     if in_fd is None or out_fd is None or not (os.isatty(in_fd) and os.isatty(out_fd)):
         return None
 
+    from_winsize = None
     try:
         rows, cols, xpixel, ypixel = struct.unpack(
             "HHHH", fcntl.ioctl(out_fd, termios.TIOCGWINSZ, struct.pack("HHHH", 0, 0, 0, 0))
         )
-        size = cell_size_from_winsize(rows, cols, xpixel, ypixel)
-        if size:
-            return size
+        from_winsize = cell_size_from_winsize(rows, cols, xpixel, ypixel)
     except OSError:
         pass
+    if from_winsize:  # a fallback exists: don't hold up the start for long
+        timeout = min(timeout, WINSIZE_KNOWN_TIMEOUT)
 
     saved = termios.tcgetattr(in_fd)
     try:
@@ -72,21 +77,29 @@ def detect_cell_size(
         while not reply.endswith(b"t"):
             left = deadline - time.monotonic()
             if left <= 0 or not select.select([in_fd], [], [], left)[0]:
-                return None
+                return from_winsize
             reply += os.read(in_fd, 64)
-        return parse_cell_size_reply(reply)
+        return parse_cell_size_reply(reply) or from_winsize
     except OSError:
-        return None
+        return from_winsize
     finally:
         termios.tcsetattr(in_fd, termios.TCSADRAIN, saved)
 
 
 def apply_cell_size(size: tuple[int, int]) -> None:
     """Give textual-image the measured size so it never has to guess."""
-    from textual_image._terminal import CellSize, get_cell_size
+    from textual_image import _terminal
 
-    # get_cell_size caches its answer in this attribute and skips the query once it is set.
-    get_cell_size._result = CellSize(*size)  # type: ignore[attr-defined]
+    cell = _terminal.CellSize(*size)
+    # textual-image <= 0.12 caches in get_cell_size._result; >= 0.14 caches in probe_terminal._result.
+    _terminal.get_cell_size._result = cell  # type: ignore[attr-defined]
+    if (probe := getattr(_terminal, "probe_terminal", None)) is not None:
+        caps = getattr(probe, "_result", None)
+        probe._result = (
+            caps._replace(cell_size=cell)
+            if caps is not None
+            else _terminal.TerminalCapabilities(cell, sixel=False, tgp=False)
+        )
 
 
 def setup_cell_size() -> tuple[int, int] | None:

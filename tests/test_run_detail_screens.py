@@ -1,3 +1,4 @@
+from textual.geometry import Region
 from textual.widgets import DataTable, Input, OptionList, Select, SelectionList, Static, Tree
 from textual_image.widget import AutoImage, HalfcellImage, UnicodeImage
 
@@ -428,28 +429,50 @@ async def test_image_file_is_downloaded_once_and_displayed(make_app):
 
 
 async def test_image_zoom_changes_displayed_size_and_fit_restores_it(make_app):
+    from textual.events import MouseDown, MouseMove, MouseUp
+
     app = make()
     async with app.run_test(size=SIZE) as pilot:
         await to_files(pilot)
         await open_file(pilot, "pred_0.png")
         screen = app.screen
+        pane = screen.query_one("#image-scroll")
         image = screen.image_widget
-        assert image.styles.width.is_auto
-        fit_width = image.size.width
+        vp_w, vp_h = pane.content_size.width, pane.content_size.height
+        # Fit fills the viewport preserving aspect ratio (no 25% top-left thumbnail)
+        assert max(image.size.width / vp_w, image.size.height / vp_h) > 0.8
+        assert image.size.width <= vp_w and image.size.height <= vp_h
+
         await pilot.press("plus")
         await settle(pilot)
         assert "zoom 150%" in screen_text(app)
-        assert not image.styles.width.is_auto and image.styles.width.value == round(fit_width * 1.5)
-        await pilot.press("plus", "plus", "plus", "plus", "plus", "plus")  # clamps at 400%
+        assert image.size.width <= vp_w and image.size.height <= vp_h  # cropped to viewport
+
+        # Clamps at 1000%
+        await pilot.press(*["plus"] * 12)
         await settle(pilot)
-        assert "zoom 400%" in screen_text(app) and image.styles.width.value == round(fit_width * 4)
-        await pilot.press("minus", "minus", "minus", "minus", "minus", "minus", "minus", "minus", "minus")
+        assert "zoom 1000%" in screen_text(app)
+        assert image.size.width <= vp_w and image.size.height <= vp_h
+
+        # Mouse drag pans toward bottom-left (drag right + up) and arrow keys pan too
+        before = (screen.viewport.pan_x, screen.viewport.pan_y)
+        pane.on_mouse_down(MouseDown(pane, 10, 10, 0, 0, 1, False, False, False, screen_x=10, screen_y=10))
+        pane.on_mouse_move(MouseMove(pane, 25, 2, -15, -8, 1, False, False, False, screen_x=25, screen_y=2))
+        pane.on_mouse_up(MouseUp(pane, 25, 2, 0, 0, 1, False, False, False, screen_x=25, screen_y=2))
         await settle(pilot)
-        assert "zoom 25%" in screen_text(app)  # clamps at 25%
-        assert image.styles.width.value == max(2, round(fit_width * 0.25))
+        assert screen.viewport.pan_x < before[0] and screen.viewport.pan_y > before[1]
+        await pilot.press("right")
+        await settle(pilot)
+        assert "pan " in screen_text(app)
+
+        # Clamps at 25%
+        await pilot.press(*["minus"] * 15)
+        await settle(pilot)
+        assert "zoom 25%" in screen_text(app)
+
         await pilot.press("0")
         await settle(pilot)
-        assert image.styles.width.is_auto and "zoom 100%" in screen_text(app)
+        assert "zoom 100%" in screen_text(app) and not screen.viewport.is_panned
 
 
 async def test_status_names_the_renderer_auto_resolved_to(make_app):
@@ -597,21 +620,75 @@ async def test_unsupported_oversized_and_corrupt_files_get_placeholders(make_app
 
 def test_auto_mode_uses_the_librarys_best_widget_not_autoimage():
     """`AutoImage` wraps the plain sixel renderer, which Textual drops, leaving a blank (dark)
-    area on sixel terminals. The library's `Image` picks the dedicated sixel widget there."""
+    area on sixel terminals. "auto" is the dedicated sixel widget there (our fixed subclass)."""
     import textual_image.widget as tiw
     from wandb_cli_tool.screens import files as files_mod
+    from wandb_cli_tool.screens.sixelimage import SafeSixelImage
 
-    assert files_mod.RENDER_MODES[0] == ("auto", tiw.Image)
+    expected = SafeSixelImage if tiw.Image is tiw.SixelImage else tiw.Image
+    assert files_mod.RENDER_MODES[0] == ("auto", expected)
+
+
+def _set_cell_size(monkeypatch, width: int, height: int) -> None:
+    from textual_image import _terminal
+
+    cell = _terminal.CellSize(width, height)
+    monkeypatch.setattr(_terminal.get_cell_size, "_result", cell, raising=False)
+    if (probe := getattr(_terminal, "probe_terminal", None)) is not None:
+        caps = getattr(probe, "_result", None)
+        updated = (
+            caps._replace(cell_size=cell)
+            if caps is not None
+            else _terminal.TerminalCapabilities(cell, sixel=False, tgp=False)
+        )
+        monkeypatch.setattr(probe, "_result", updated, raising=False)
+
+
+async def test_the_sixel_widget_never_draws_outside_its_cells(make_app, monkeypatch):
+    """textual-image 0.12.0 left the cursor one row below the image (Textual then wrote the rest of
+    that line there: the key bar was blanked, or the terminal scrolled and showed the bars twice),
+    left the image's rows uncleared (old images lingered after zooming) and its last 6-pixel sixel
+    band could run into the next row."""
+    import re
+
+    from wandb_cli_tool.screens import files as files_mod
+    from wandb_cli_tool.screens.sixelimage import SafeSixelImage, _SafeSixelImpl
+
+    monkeypatch.setattr(files_mod, "RENDER_MODES", (("auto", SafeSixelImage),) + files_mod.RENDER_MODES[1:])
+    _set_cell_size(monkeypatch, 7, 17)
+    app = make()
+    async with app.run_test(size=SIZE) as pilot:
+        await to_files(pilot)
+        await open_file(pilot, "pred_0.png")
+        await settle(pilot, 8)
+        for zoom in ("", "plus"):  # fitted, then zoomed
+            if zoom:
+                await pilot.press(zoom)
+                await settle(pilot, 6)
+            image = app.screen.image_widget
+            assert isinstance(image, SafeSixelImage)
+            impl = image.query_one(_SafeSixelImpl)
+            region = app.screen.find_widget(impl).visible_region
+            assert impl.region == image.region  # fills the (centred) widget
+            lines = impl.render_lines(Region(0, 0, region.width, region.height))
+            assert len(lines) == region.height
+            assert all(line.cell_length == region.width for line in lines)  # every row cleared
+            assert all(line.text.strip() == "" for line in lines[:-1])
+            segments = [s.text for s in lines[-1] if "\x1b" in s.text]
+            assert segments[0] == f"\x1b[{region.y + 1};{region.x + 1}H"  # its own top-left cell
+            assert not segments[1].endswith("-\x1b\\")
+            assert segments[-1] == f"\x1b[{region.bottom};{region.right + 1}H"  # its own LAST row
+            px_w, px_h = map(int, re.search(r'"1;1;(\d+);(\d+)', segments[1]).groups())
+            assert px_w == region.width * 7 and px_h % 6 == 0 and region.height * 17 - 6 < px_h <= region.height * 17
 
 
 async def test_sixel_widget_really_renders_at_the_measured_cell_size(make_app, monkeypatch):
-    from textual_image._terminal import CellSize, get_cell_size
     from textual_image.widget import SixelImage
     from textual_image.widget import sixel as sixel_mod
     from wandb_cli_tool.screens import files as files_mod
 
     monkeypatch.setattr(files_mod, "RENDER_MODES", (("auto", SixelImage),) + files_mod.RENDER_MODES[1:])
-    monkeypatch.setattr(get_cell_size, "_result", CellSize(7, 17), raising=False)
+    _set_cell_size(monkeypatch, 7, 17)
     encoded = []
     original = sixel_mod._ImageSixelImpl._image_to_sixels
 
@@ -641,8 +718,9 @@ def test_in_a_sixel_terminal_auto_mode_is_the_dedicated_sixel_widget():
     import fcntl, os, pty, select, struct, sys, termios, time
 
     code = (
-        "import wandb_cli_tool.screens.files as f; c = f.RENDER_MODES[0][1];"
-        "print('RESULT', c.__module__, f.DETECTED, flush=True)"
+        "import wandb_cli_tool.screens.files as f; from textual_image.widget import SixelImage;"
+        "c = f.RENDER_MODES[0][1];"
+        "print('RESULT', issubclass(c, SixelImage), f.DETECTED, flush=True)"
     )
     pid, fd = pty.fork()
     if pid == 0:
@@ -662,9 +740,9 @@ def test_in_a_sixel_terminal_auto_mode_is_the_dedicated_sixel_widget():
     os.close(fd)
     os.waitpid(pid, 0)
     line = next(l for l in out.decode(errors="replace").splitlines() if "RESULT" in l)
-    _, module, detected = line.split()[-3:]
+    _, is_sixel, detected = line.split()[-3:]
     assert detected == "sixel"
-    assert module == "textual_image.widget.sixel"  # AutoImage would be textual_image.widget (blank area)
+    assert is_sixel == "True"  # AutoImage would not be the sixel widget (blank area)
 
 
 async def test_a_clip_that_ends_by_itself_turns_the_key_back_to_play(make_app):

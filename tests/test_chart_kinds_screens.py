@@ -601,3 +601,70 @@ async def test_batches_of_one_panel_are_fetched_at_the_same_time(make_app, monke
         await show(pilot, screen, "trainer")  # two batches of one metric
         views = list(screen.query(ChartView))
         assert len(views) == 2 and all(v.border_subtitle != "loading…" for v in views)  # a broken barrier would show errors
+
+
+# ---- full-screen viewer for single-run plots, bars and tables -----------------------------------------
+
+
+async def test_single_run_plot_bar_and_table_open_fullscreen(make_app):
+    from wandb_cli_tool.screens.chart_viewer import ChartViewerScreen
+    from wandb_cli_tool.screens.chart_widgets import PLOT_HEIGHT, TABLE_MAX_HEIGHT
+    from wandb_cli_tool.screens.keybar import KeyBar
+    from wandb_cli_tool.screens.run import RunScreen
+
+    def bar_plain(scr):
+        return scr.query_one(KeyBar).query_one("KeyLine").render().plain.replace("\xa0", " ")
+
+    app, ctx = await start(make_app)
+    async with ctx as pilot:
+        screen = await mine(pilot)
+        await add_plot(pilot, (False, "trainer/loss"), (False, "val/loss"))
+        await add_bar(pilot, (False, "val/loss"), (False, "acc"))
+        await add_table(pilot, "preds")
+
+        # 1. Plot -> full-screen plot
+        (plot,) = of(screen, ChartView)
+        plot.focus()
+        await settle(pilot)
+        assert "Open plot" in bar_plain(app.screen)
+        await pilot.press("enter")
+        await settle(pilot, 4)
+        assert isinstance(app.screen, ChartViewerScreen)
+        assert isinstance(app.screen.viewer_widget, ChartView) and app.screen.viewer_widget.full_screen is True
+        assert app.screen.viewer_widget.size.height > PLOT_HEIGHT
+        assert "Open plot" not in bar_plain(app.screen)
+        await pilot.press("escape")
+        await settle(pilot)
+        assert isinstance(app.screen, RunScreen) and app.screen.active_tab == "charts"
+
+        # 2. Bar chart -> full-screen bar chart
+        (bar,) = of(screen, BarView)
+        bar.focus()
+        await settle(pilot)
+        assert "Open bar chart" in bar_plain(app.screen)
+        await pilot.press("enter")
+        await settle(pilot, 4)
+        assert isinstance(app.screen, ChartViewerScreen)
+        assert isinstance(app.screen.viewer_widget, BarView) and app.screen.viewer_widget.full_screen is True
+        await pilot.press("escape")
+        await settle(pilot)
+
+        # 3. Table -> full-screen table (preserves cursor and expands past inline max height)
+        (table,) = of(screen, TableView)
+        table.focus()
+        await settle(pilot)
+        await pilot.press("down", "right")
+        await settle(pilot)
+        assert (table.cursor_coordinate.row, table.cursor_coordinate.column) == (1, 1)
+        assert "Open table" in bar_plain(app.screen)
+        await pilot.press("enter")
+        await settle(pilot, 4)
+        assert isinstance(app.screen, ChartViewerScreen)
+        full_table = app.screen.viewer_widget
+        assert isinstance(full_table, TableView) and full_table.full_screen is True
+        assert full_table.size.height > TABLE_MAX_HEIGHT
+        assert (full_table.cursor_coordinate.row, full_table.cursor_coordinate.column) == (1, 1)
+        assert "3 rows" in app.screen.query_one("#viewer-status").render().plain
+        await pilot.press("escape")
+        await settle(pilot)
+        assert isinstance(app.screen, RunScreen) and app.screen.active_tab == "charts"

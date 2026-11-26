@@ -29,7 +29,7 @@ from .chart_editing import EDIT_ACTIONS, ChartEditing
 from .chart_widgets import (  # noqa: F401
     CHART_CLASS, BarView, ChartBase, ChartView, ImageChartView, TableView, make_chart_widget,
 )
-from .imagefetch import fetch_thumbnail
+from .imagefetch import fetch_image
 
 if TYPE_CHECKING:
     from ..app import WandbCliApp
@@ -525,11 +525,11 @@ class ChartsPane(ChartEditing, Vertical):
     @work(thread=True, group="images")
     def _fetch_image(self, view: ImageChartView, step: ImageStep, sub: int, token: tuple[int, int]) -> None:
         try:
-            shown = fetch_thumbnail(self.app, self.ref, step, sub)
+            thumb, original = fetch_image(self.app, self.ref, step, sub)
         except Exception as exc:
             self.app.call_from_thread(view.fail, str(exc), token)
             return
-        self.app.call_from_thread(view.show_image, shown, token)
+        self.app.call_from_thread(view.show_image, thumb, token, original)
 
     def _load_bars(self, view: BarView) -> None:
         items = [(name, self.values.get(name, self.system_last.get(name))) for name in view.spec.series]

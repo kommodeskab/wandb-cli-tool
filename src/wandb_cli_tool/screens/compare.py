@@ -44,7 +44,7 @@ from .chart_editing import EDIT_ACTIONS, ChartEditing
 from .compare_widgets import (
     CompareBarView, CompareBase, CompareImageView, ComparePlotView, CompareTableView,
 )
-from .imagefetch import fetch_thumbnail
+from .imagefetch import fetch_image
 from .filterinput import FilterInput
 from .keybar import KeyBar
 
@@ -878,11 +878,11 @@ class CompareScreen(ChartEditing, Screen):
     @work(thread=True, group="images")
     def _fetch_image(self, view: CompareImageView, run: int, step: ImageStep, sub: int, token: tuple[int, int]) -> None:
         try:
-            shown = fetch_thumbnail(self.app, self.runs[run][0], step, sub)
+            thumb, original = fetch_image(self.app, self.runs[run][0], step, sub)
         except Exception as exc:
             self.app.call_from_thread(view.fail, run, str(exc), token)
             return
-        self.app.call_from_thread(view.show_image, run, shown, token)
+        self.app.call_from_thread(view.show_image, run, thumb, token, original)
 
     # ---- focus -----------------------------------------------------------------------
     def action_focus_chart(self, delta: int) -> None:

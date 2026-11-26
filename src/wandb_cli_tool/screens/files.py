@@ -12,15 +12,18 @@ from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import ScrollableContainer, Vertical
+from textual.containers import Vertical
 from textual.screen import Screen
 from textual.widgets import Header, RichLog, Static, Tree
 from textual.widgets.tree import TreeNode
 from textual_image.widget import AutoImage, HalfcellImage, UnicodeImage
-from textual_image.widget import Image as BestImage
+
+from .sixelimage import BEST_IMAGE
 
 from ..api import FileInfo, RunRef
 from ..formatting import fmt_size
+from ..imageview import FIT, ZOOMS, ImageViewport
+from .image_viewer import ZoomableImage
 from .keybar import KeyBar
 from ..plain import plain
 from ..media import MAX_AUDIO_BYTES, MAX_IMAGE_BYTES, MAX_TEXT_BYTES, file_kind
@@ -34,17 +37,15 @@ DOWNLOAD_CACHE_BYTES = 500 * 1024 * 1024
 MAX_TEXT_LINES = 20_000  # shown per file; more would freeze the UI
 MAX_HIGHLIGHT_BYTES = 200 * 1024  # JSON syntax colouring above this is plain text
 MAX_PRETTY_BYTES = 1024 * 1024  # JSON re-indenting above this is skipped
-ZOOMS = (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0)
-FIT = ZOOMS.index(1.0)
 # How images are drawn. "auto" uses sixel/kitty graphics where the terminal supports them.
 # What "auto" resolved to when the app started: sixel / tgp (real pixels) or halfcell /
 # unicode (character blocks, low resolution). Class names are all "Image"; the module differs.
 DETECTED = AutoImage._Renderable.__module__.rsplit(".", 1)[-1]
-# IMPORTANT: the widget for "auto" must be textual_image's `Image`, NOT `AutoImage`. For sixel
-# terminals `Image` is a dedicated widget that injects the sixel data into Textual's rendering;
-# `AutoImage` wraps the plain sixel renderer, which Textual drops, leaving a blank (dark) area.
+# IMPORTANT: the widget for "auto" must be the dedicated sixel widget on sixel terminals (our
+# `SafeSixelImage`, a fixed subclass of textual_image's), NOT `AutoImage`: that wraps the plain
+# sixel renderer, which Textual drops, leaving a blank (dark) area.
 LOW_RES = DETECTED in ("halfcell", "unicode")
-RENDER_MODES = (("auto", BestImage), ("half-cell", HalfcellImage), ("unicode", UnicodeImage))
+RENDER_MODES = (("auto", BEST_IMAGE), ("half-cell", HalfcellImage), ("unicode", UnicodeImage))
 
 
 # ---- file tree (pure) ----------------------------------------------------------------
@@ -167,10 +168,14 @@ class FileScreen(Screen):
         Binding("minus", "zoom(-1)", "Zoom out"),
         Binding("0", "zoom_fit", "Fit"),
         Binding("m", "next_mode", "Render mode"),
+        Binding("left", "pan(-0.15, 0)", "Pan left", show=False),
+        Binding("right", "pan(0.15, 0)", "Pan right", show=False),
+        Binding("up", "pan(0, -0.15)", "Pan up", show=False),
+        Binding("down", "pan(0, 0.15)", "Pan down", show=False),
     ]
     DEFAULT_CSS = """
     #preview { height: 1fr; padding: 0 1; }
-    #image-scroll { height: 1fr; }
+    #image-scroll { height: 1fr; width: 1fr; }
     #text { height: 1fr; }
     #file-status { padding: 0 1; color: $text-muted; }
     """
@@ -182,10 +187,9 @@ class FileScreen(Screen):
         self.info = info
         self.kind = file_kind(info.name, info.mimetype)
         self.path: Path | None = None
-        self.zoom_index = FIT
+        self.viewport = ImageViewport()
         self.mode_index = 0
         self.image_detail = ""
-        self._fit_cells: tuple[int, int] | None = None  # image size in cells at "fit"
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -239,6 +243,8 @@ class FileScreen(Screen):
             return ready and self.kind == "audio"
         if action in ("zoom", "zoom_fit", "next_mode"):
             return ready and self.kind == "image"
+        if action == "pan":
+            return ready and self.kind == "image" and self.viewport.zoom > 1.0
         return True
 
     def _status(self, text: str) -> None:
@@ -326,8 +332,16 @@ class FileScreen(Screen):
 
     # ---- image ---------------------------------------------------------
     @property
+    def zoom_index(self) -> int:
+        return self.viewport.zoom_index
+
+    @zoom_index.setter
+    def zoom_index(self, value: int) -> None:
+        self.viewport.zoom_index = value
+
+    @property
     def zoom(self) -> float:
-        return ZOOMS[self.zoom_index]
+        return self.viewport.zoom
 
     @property
     def mode_name(self) -> str:
@@ -336,39 +350,24 @@ class FileScreen(Screen):
     async def _mount_image(self) -> None:
         preview = self.query_one("#preview", Vertical)
         await preview.remove_children()
-        widget = RENDER_MODES[self.mode_index][1](self.path)
-        widget.styles.width = "auto"
-        widget.styles.height = "auto"
-        scroll = ScrollableContainer(widget, id="image-scroll")
-        await preview.mount(scroll)
-        scroll.focus()
-        self._fit_cells = None
-        self.call_after_refresh(self._after_layout)
+        pane = ZoomableImage(
+            viewport=self.viewport,
+            widget_cls=RENDER_MODES[self.mode_index][1],
+            allow_wheel_zoom=True,
+            id="image-scroll",
+        )
+        pane.can_focus = True
+        await preview.mount(pane)
+        pane.focus()
+        pane.set_image(self.path, self.path)
+        self._update_image_status()
 
     @property
     def image_widget(self):
-        found = list(self.query("#image-scroll > *"))
-        return found[0] if found else None
+        found = list(self.query("#image-scroll"))
+        return found[0].image_widget if found else None
 
-    def _after_layout(self) -> None:
-        widget = self.image_widget
-        if widget is None:
-            return
-        if self._fit_cells is None and self.zoom_index == FIT:
-            self._fit_cells = (widget.size.width, widget.size.height)
-        self._apply_zoom()
-
-    def _apply_zoom(self) -> None:
-        widget = self.image_widget
-        if widget is None:
-            return
-        if self.zoom_index == FIT or not self._fit_cells or not self._fit_cells[0]:
-            widget.styles.width = "auto"
-            widget.styles.height = "auto"
-        else:
-            widget.styles.width = max(2, round(self._fit_cells[0] * self.zoom))
-            widget.styles.height = "auto"  # keeps the aspect ratio
-        widget.refresh(layout=True)
+    def _update_image_status(self) -> None:
         render = f"auto → {DETECTED}" if self.mode_name == "auto" else self.mode_name
         hint = " · no terminal graphics detected, so this is low resolution" if self.mode_name == "auto" and LOW_RES else ""
         cell = ""
@@ -376,27 +375,42 @@ class FileScreen(Screen):
             from textual_image._terminal import get_cell_size
 
             cell = f" · cell {get_cell_size().width}×{get_cell_size().height}px"
-        self._status(f"{self.image_detail} · zoom {round(self.zoom * 100)}% · render: {render}{cell}{hint}")
+        pan = (
+            f" · pan {round(self.viewport.pan_x * 100)}%,{round(self.viewport.pan_y * 100)}%"
+            if self.viewport.zoom > 1.0
+            else ""
+        )
+        self._status(f"{self.image_detail} · zoom {round(self.zoom * 100)}%{pan} · render: {render}{cell}{hint}")
+
+    def _redraw_image(self, draft: bool = False) -> None:
+        found = list(self.query("#image-scroll"))
+        if found:
+            found[0].render_view(draft=draft)
+        self._update_image_status()
+        self.refresh_bindings()
+
+    def on_zoomable_image_viewport_changed(self, event: ZoomableImage.ViewportChanged) -> None:
+        event.stop()
+        self._redraw_image(draft=event.draft)
 
     def action_zoom(self, step: int) -> None:
-        new = max(0, min(len(ZOOMS) - 1, self.zoom_index + step))
-        if new != self.zoom_index:
-            if self._fit_cells is None or self.zoom_index == FIT:  # measure the fit size as it is now:
-                # the layout can still have changed since it was first recorded (e.g. the key bar grew)
-                self._fit_cells = (self.image_widget.size.width, self.image_widget.size.height)
-            self.zoom_index = new
-        self._apply_zoom()
+        if self.viewport.step_zoom(step):
+            self._redraw_image()
 
     def action_zoom_fit(self) -> None:
-        self.zoom_index = FIT
-        self._apply_zoom()
+        if self.viewport.reset():
+            self._redraw_image()
+
+    def action_pan(self, dx: float, dy: float) -> None:
+        if self.viewport.pan_by_fraction(dx, dy):
+            self._redraw_image()
 
     async def action_next_mode(self) -> None:
         self.mode_index = (self.mode_index + 1) % len(RENDER_MODES)
-        keep = self._fit_cells
-        await self._mount_image()
-        self._fit_cells = keep  # same image, same fit size: keep the current zoom
-        self._apply_zoom()
+        found = list(self.query("#image-scroll"))
+        if found:
+            await found[0].set_widget_cls(RENDER_MODES[self.mode_index][1])
+        self._redraw_image()
         self.refresh_bindings()  # the key shows the mode now in use
 
     # ---- audio ---------------------------------------------------------

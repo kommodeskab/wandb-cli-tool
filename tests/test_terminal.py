@@ -29,26 +29,43 @@ def _pty_with_size(rows, cols, xpix, ypix):
     return master, slave
 
 
-def test_detect_prefers_the_window_size_when_pixels_are_reported():
+def _answering(master, reply, delay=0.0):
+    """Plays the terminal: answers CSI 16 t with `reply` after `delay` seconds."""
+    def terminal():
+        data = b""
+        while b"\x1b[16t" not in data:
+            data += os.read(master, 64)
+        threading.Event().wait(delay)
+        os.write(master, reply)
+
+    thread = threading.Thread(target=terminal)
+    thread.start()
+    return thread
+
+
+def test_the_terminals_answer_wins_over_the_window_size():
+    """VS Code on a high-DPI screen reports CSS pixels in the window size but draws sixels in
+    device pixels; its CSI 16 t answer is what sixels are drawn at."""
+    master, slave = _pty_with_size(40, 100, 800, 720)  # 8x18 per cell by the ioctl
+    thread = _answering(master, b"\x1b[6;36;16t")
+    try:
+        assert detect_cell_size(slave, slave, timeout=2.0) == (16, 36)
+    finally:
+        thread.join()
+        os.close(master), os.close(slave)
+
+
+def test_the_window_size_is_the_fallback_when_the_terminal_does_not_answer():
     master, slave = _pty_with_size(40, 100, 800, 720)
     try:
-        assert detect_cell_size(slave, slave, timeout=0.5) == (8, 18)
+        assert detect_cell_size(slave, slave, timeout=0.2) == (8, 18)
     finally:
         os.close(master), os.close(slave)
 
 
 def test_detect_asks_the_terminal_and_tolerates_a_slow_reply():
     master, slave = _pty_with_size(40, 100, 0, 0)  # no pixel info: must query
-
-    def terminal():  # plays the terminal: answers CSI 16 t after 0.3 s (> the library's 0.1 s)
-        data = b""
-        while b"\x1b[16t" not in data:
-            data += os.read(master, 64)
-        threading.Event().wait(0.3)
-        os.write(master, b"\x1b[6;18;8t")
-
-    thread = threading.Thread(target=terminal)
-    thread.start()
+    thread = _answering(master, b"\x1b[6;18;8t", delay=0.3)  # > the library's 0.1 s
     try:
         assert detect_cell_size(slave, slave, timeout=2.0) == (8, 18)
     finally:
@@ -75,14 +92,21 @@ def test_detect_returns_none_without_a_terminal(tmp_path):
 
 
 def test_apply_cell_size_is_used_by_the_image_library():
-    from textual_image._terminal import get_cell_size
+    from textual_image import _terminal
 
-    saved = getattr(get_cell_size, "_result", None)
+    saved_cell = getattr(_terminal.get_cell_size, "_result", None)
+    probe = getattr(_terminal, "probe_terminal", None)
+    saved_probe = getattr(probe, "_result", None) if probe is not None else None
     try:
         apply_cell_size((8, 18))
-        assert tuple(get_cell_size()) == (8, 18)
+        assert tuple(_terminal.get_cell_size()) == (8, 18)
     finally:
-        if saved is None:
-            del get_cell_size._result
+        if saved_cell is None:
+            _terminal.get_cell_size.__dict__.pop("_result", None)
         else:
-            get_cell_size._result = saved
+            _terminal.get_cell_size._result = saved_cell
+        if probe is not None:
+            if saved_probe is None:
+                probe.__dict__.pop("_result", None)
+            else:
+                probe._result = saved_probe

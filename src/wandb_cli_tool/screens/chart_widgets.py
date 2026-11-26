@@ -14,16 +14,18 @@ from textual.events import Click
 from textual.message import Message
 from textual.widget import Widget
 from textual.widgets import DataTable, Static
-from textual_image.widget import Image as BestImage
 from textual_plotext import PlotextPlot
 
 from ..barchart import layout_bars
 from ..charts import ChartSpec, axis_label, display_names
 from ..images import ImageSeries, StepCursor, index_at, slider_geometry
+from ..imageview import ImageViewport
 from ..palette import hex_to_rgb, series_color
 from ..plain import plain, plain_title
 from ..series import Point, prepare_points
 from ..tables import TableData
+from .chart_viewer import ChartViewerScreen
+from .image_viewer import ImageViewerScreen, ZoomableImage
 
 PLOT_HEIGHT = 20
 NOTE_HEIGHT = 5  # a chart with nothing to show in this run collapses to a short note
@@ -97,18 +99,24 @@ class ChartView(ChartBase, PlotextPlot):
     """One or more series against an x-axis. One series with one point is shown as a number."""
 
     can_focus = True
-    BINDINGS = _NAV_BINDINGS
+    BINDINGS = [Binding("enter", "open_chart", "Open plot"), *_NAV_BINDINGS]
     DEFAULT_CSS = """
     ChartView { height: 20; border: round $primary; margin-bottom: 1; }
     ChartView:focus { border: round $accent; }
     """
 
-    def __init__(self, spec: ChartSpec, index: int) -> None:
+    def __init__(self, spec: ChartSpec, index: int, *, full_screen: bool = False) -> None:
         super().__init__()
         self._init_chart(spec, index)
+        self.full_screen = full_screen
         self.border_subtitle = "loading…"
         self.single: Point | None = None  # one data point: shown as a number
         self.note: str | None = None  # nothing to plot in this run: say why instead
+        self._series: dict[str, list[Point]] | None = None
+        self._absent: tuple[str, ...] = ()
+        if full_screen:
+            self.can_focus = False
+            self.add_class("viewer-full")
 
     def render(self) -> RenderableType:
         if self.note is not None:
@@ -121,12 +129,30 @@ class ChartView(ChartBase, PlotextPlot):
             return Align.center(body, vertical="middle")
         return super().render()
 
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "open_chart":
+            return not self.full_screen and self._series is not None and self.note is None
+        return True
+
+    def action_open_chart(self) -> None:
+        if self.full_screen or self._series is None or self.note is not None:
+            return
+        full = ChartView(self.spec, 0, full_screen=True)
+        series, absent = self._series, self._absent
+        self.app.push_screen(
+            ChartViewerScreen(full, title=self.spec.title, populate=lambda: full.show(series, absent))
+        )
+
     def show_unavailable(self, message: str) -> None:
         """This run has none of what the chart needs (e.g. its metrics were never logged here)."""
         self.note, self.single = message, None
-        self.styles.height = NOTE_HEIGHT
+        self._series, self._absent = None, ()
+        if not self.full_screen:
+            self.styles.height = NOTE_HEIGHT
         self.border_subtitle = ""
         self.refresh()
+        if self.is_attached:
+            self.refresh_bindings()
 
     def show(self, series: Mapping[str, list[Point]], absent: tuple[str, ...] = ()) -> None:
         """`series` maps each series name of the spec to its points. `absent` names are series
@@ -134,6 +160,8 @@ class ChartView(ChartBase, PlotextPlot):
         plt, spec = self.plt, self.spec
         opts = spec.opts
         names = list(spec.series)
+        self._series = {k: list(v) for k, v in series.items()}
+        self._absent = tuple(absent)
         self.note = None
         plt.clear_figure()
         dropped = 0
@@ -144,10 +172,13 @@ class ChartView(ChartBase, PlotextPlot):
         series = prepared
         first = series.get(names[0], []) if names else []
         self.single = first[0] if len(names) == 1 and len(first) == 1 else None
-        self.styles.height = SINGLE_HEIGHT if self.single else PLOT_HEIGHT
+        if not self.full_screen:
+            self.styles.height = SINGLE_HEIGHT if self.single else PLOT_HEIGHT
         if self.single:
             self.border_subtitle = ""
             self.refresh()
+            if self.is_attached:
+                self.refresh_bindings()
             return
         drawn = [n for n in names if series.get(n)]
         if not drawn:
@@ -174,47 +205,78 @@ class ChartView(ChartBase, PlotextPlot):
             )
             self.border_subtitle = plain_title(f"x: {axis_label(spec.x)}{plot_note(opts, dropped)}{note}")
         self.refresh()
+        if self.is_attached:
+            self.refresh_bindings()
 
     def fail(self, message: str) -> None:
         self.single = None
+        self._series, self._absent = None, ()
         self.plt.clear_figure()
         self.plt.title(f"Error: {message}")
         self.border_subtitle = ""
         self.refresh()
+        if self.is_attached:
+            self.refresh_bindings()
 
 
 class BarView(ChartBase, Widget):
     """The latest value of each chosen metric as horizontal bars, in the chosen order."""
 
     can_focus = True
-    BINDINGS = _NAV_BINDINGS
+    BINDINGS = [Binding("enter", "open_chart", "Open bar chart"), *_NAV_BINDINGS]
     DEFAULT_CSS = """
     BarView { height: 8; border: round $primary; margin-bottom: 1; padding: 0 1; }
     BarView:focus { border: round $accent; }
     """
 
-    def __init__(self, spec: ChartSpec, index: int) -> None:
+    def __init__(self, spec: ChartSpec, index: int, *, full_screen: bool = False) -> None:
         super().__init__()
         self._init_chart(spec, index)
+        self.full_screen = full_screen
         self.items: list[tuple[str, float | None]] | None = None  # None until loaded
         self.error = ""
         self.note: str | None = None
-        self.styles.height = min(len(spec.series) + 2, 42)
+        if full_screen:
+            self.can_focus = False
+            self.add_class("viewer-bars")
+        else:
+            self.styles.height = min(len(spec.series) + 2, 42)
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "open_chart":
+            return not self.full_screen and self.items is not None and self.note is None and not self.error
+        return True
+
+    def action_open_chart(self) -> None:
+        if self.full_screen or self.items is None or self.note is not None or self.error:
+            return
+        full = BarView(self.spec, 0, full_screen=True)
+        items = list(self.items)
+        self.app.push_screen(
+            ChartViewerScreen(full, title=self.spec.title, scrollable=len(items) > 1, populate=lambda: full.show(items))
+        )
 
     def show(self, values: list[tuple[str, float | None]]) -> None:
         self.items, self.error, self.note = values, "", None
-        self.styles.height = min(len(self.spec.series) + 2, 42)
+        self.styles.height = ("1fr" if len(values) == 1 else len(values) + 2) if self.full_screen else min(len(self.spec.series) + 2, 42)
         self.border_subtitle = plain_title(f"axis {self.spec.opts.range_text()}") if self.spec.opts.range_text() else ""
         self.refresh()
+        if self.is_attached:
+            self.refresh_bindings()
 
     def show_unavailable(self, message: str) -> None:
         self.note, self.error, self.items = message, "", None
-        self.styles.height = NOTE_HEIGHT
+        if not self.full_screen:
+            self.styles.height = NOTE_HEIGHT
         self.refresh()
+        if self.is_attached:
+            self.refresh_bindings()
 
     def fail(self, message: str) -> None:
         self.error = message
         self.refresh()
+        if self.is_attached:
+            self.refresh_bindings()
 
     def render(self) -> RenderResult:
         if self.note is not None:
@@ -250,19 +312,51 @@ class BarView(ChartBase, Widget):
 class TableView(ChartBase, DataTable):
     """A wandb.Table. Arrow keys move around it; Tab goes to the next chart."""
 
+    BINDINGS = [Binding("enter", "open_chart", "Open table")]
     DEFAULT_CSS = """
     TableView { height: 6; border: round $primary; margin-bottom: 1; }
     TableView:focus { border: round $accent; }
     """
 
-    def __init__(self, spec: ChartSpec, index: int) -> None:
+    def __init__(self, spec: ChartSpec, index: int, *, full_screen: bool = False) -> None:
         DataTable.__init__(self, cursor_type="cell", zebra_stripes=True)
         self._init_chart(spec, index)
+        self.full_screen = full_screen
+        self.table_data: TableData | None = None
         self.border_subtitle = "loading…"
         self._scrollbar_counted = False
+        if full_screen:
+            self.add_class("viewer-full")
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "open_chart":
+            return not self.full_screen and self.table_data is not None
+        return True
+
+    def action_open_chart(self) -> None:
+        if self.full_screen or self.table_data is None:
+            return
+        full = TableView(self.spec, 0, full_screen=True)
+        data = self.table_data
+        coord = self.cursor_coordinate if self.row_count else None
+
+        def populate() -> None:
+            full.show_table(data)
+            if coord is not None and data.rows and data.columns:
+                full.move_cursor(
+                    row=min(coord.row, len(data.rows) - 1),
+                    column=min(coord.column, len(data.columns) - 1),
+                    animate=False,
+                )
+
+        self.app.push_screen(
+            ChartViewerScreen(full, title=self.spec.title, focus_widget=True, populate=populate)
+        )
 
     def _fit_height(self, rows: int) -> None:
         """Size to the content: no empty space for small tables, scrolling for big ones."""
+        if self.full_screen:
+            return
         self.styles.height = table_height(rows)
         self._scrollbar_counted = False
         self.call_after_refresh(self._account_for_scrollbar)
@@ -276,10 +370,13 @@ class TableView(ChartBase, DataTable):
 
     def show_table(self, data: TableData) -> None:
         cursor = self.cursor_coordinate if self.row_count else None  # kept across a refresh
+        self.table_data = data
         self.clear(columns=True)
         if not data.columns:
             self.border_subtitle = "empty table"
             self._fit_height(0)
+            if self.is_attached:
+                self.refresh_bindings()
             return
         self.add_columns(*[plain(c) for c in data.columns])  # cells are literal text, never markup
         self.add_rows([[plain(c) for c in row] for row in data.rows])
@@ -294,13 +391,18 @@ class TableView(ChartBase, DataTable):
         if data.total_cols > len(data.columns):
             note += f" · first {len(data.columns)} of {data.total_cols} columns"
         self.border_subtitle = note
+        if self.is_attached:
+            self.refresh_bindings()
 
     def fail(self, message: str, heading: str = "Error") -> None:
+        self.table_data = None
         self.clear(columns=True)
         self.add_column(plain(heading))
         self.add_row(plain(message))
         self.border_subtitle = ""
         self._fit_height(1)
+        if self.is_attached:
+            self.refresh_bindings()
 
     def show_unavailable(self, message: str) -> None:
         """The table is not in this run (not an error)."""
@@ -361,6 +463,7 @@ class ImageChartView(ChartBase, Vertical):
 
     can_focus = True
     BINDINGS = [
+        Binding("enter", "open_image", "Open image"),
         Binding("left", "step(-1)", "Previous step"),
         Binding("right", "step(1)", "Next step"),
         Binding("shift+left", "step(-10)", "10 steps back", show=False),
@@ -392,7 +495,9 @@ class ImageChartView(ChartBase, Vertical):
         self.series: ImageSeries | None = None
         self.cursor = StepCursor(0)
         self.sub = 0  # which image, when a step logged several
-        self.path: Path | None = None  # the file now on screen
+        self.path: Path | None = None  # the thumbnail file shown inline
+        self.full_path: Path | None = None  # original resolution file for deep zoom / viewer
+        self.viewport = ImageViewport()
         self.waiting = True  # not "loading": Textual's Widget.loading shows a spinner and blocks focus
         self.error = ""
         self._wanted: tuple[int, int] | None = None
@@ -402,10 +507,7 @@ class ImageChartView(ChartBase, Vertical):
 
     def compose(self):
         with Vertical(id="img-area"):
-            image = BestImage(None, id="img")
-            image.styles.width = "auto"
-            image.styles.height = "auto"
-            yield image
+            yield ZoomableImage(viewport=self.viewport, interactive=False, id="zoom-img")
         yield StepSlider(id="slider")
         yield Static("loading…", id="img-info")
 
@@ -413,6 +515,8 @@ class ImageChartView(ChartBase, Vertical):
         if action == "sub":  # only offered when the step has several images
             step = self.current_step
             return step is not None and len(step.paths) > 1
+        if action == "open_image":
+            return self.path is not None and self.unavailable is None
         return True
 
     # ---- state ---------------------------------------------------------------------------
@@ -509,12 +613,28 @@ class ImageChartView(ChartBase, Vertical):
         self.refresh_bindings()  # "[" / "]" only apply to a step with several images
 
     # ---- results from the screen -----------------------------------------------------------
-    def show_image(self, path: Path, key: tuple[int, int]) -> None:
+    def show_image(self, path: Path, key: tuple[int, int], original: Path | None = None) -> None:
         if key != self._wanted:  # the slider has moved on since this was requested
             return
-        self.path, self._shown, self.waiting, self.error = path, key, False, ""
-        self.query_one("#img", BestImage).image = path
+        self.path, self.full_path, self._shown, self.waiting, self.error = path, original or path, key, False, ""
+        self.query_one("#zoom-img", ZoomableImage).set_image(path, self.full_path)
         self._update_info()
+
+    def action_open_image(self) -> None:
+        if self.path is None or self.unavailable is not None:
+            return
+        step = self.current_step
+        sub = f"step {step.step} · {self.cursor.index + 1}/{len(self.steps)}" if step else ""
+        if step and len(step.paths) > 1:
+            sub += f" · image {self.sub + 1}/{len(step.paths)}"
+        self.app.push_screen(
+            ImageViewerScreen(
+                [(self.spec.y, self.full_path or self.path, "")],
+                title=self.spec.title,
+                subtitle=sub,
+                viewport=self.viewport,
+            )
+        )
 
     def fail(self, message: str, key: tuple[int, int] | None = None) -> None:
         if key is not None and key != self._wanted:

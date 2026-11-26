@@ -141,6 +141,16 @@ async def test_charts_with_bracketed_metric_panel_and_table_text(make_app):
         text = screen_text(app)
         assert "[CLS] hi [/s]" in text and "[1, 2]" in text and "x[0]" in text and "[CLS] col [/s]" in text
         assert "Table: bad [/key]" in text
+        # Opening charts/tables full-screen also renders bracketed names and cells literally
+        from wandb_cli_tool.screens.chart_viewer import ChartViewerScreen
+        from wandb_cli_tool.screens.chart_widgets import TableView
+
+        screen.query_one(TableView).focus()
+        await settle(pilot)
+        await pilot.press("enter")
+        await settle(pilot, 4)
+        assert isinstance(app.screen, ChartViewerScreen)
+        assert "Table: bad [/key]" in screen_text(app) and "[CLS] hi [/s]" in screen_text(app)
 
 
 async def test_dialog_lists_show_bracketed_metric_names(make_app):
