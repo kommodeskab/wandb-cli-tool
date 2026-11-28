@@ -22,7 +22,7 @@ from typing import Any, Iterable, Mapping
 from .images import MAX_IMAGE_STEPS, ImageSeries, ImageStep
 
 AUDIO_TYPES = ("audio-file", "audio")
-PEAKS = 2000  # amplitude samples kept per clip (a terminal is never wider than this)
+PEAKS = 600  # amplitude samples kept per clip (a terminal is never wider than this)
 FFMPEG_RATE = 8000  # sample rate a clip is converted to when the wave module cannot read it
 
 

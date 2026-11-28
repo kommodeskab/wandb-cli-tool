@@ -185,6 +185,8 @@ class ChartsPane(ChartEditing, Vertical):
         )
 
     async def _loaded(self, data: ChartData) -> None:
+        if not self.is_attached:
+            return
         self._apply_data(data)
         # the generated panels, plus whatever the user customized in an earlier session
         self.chart_layout = ChartLayout(
@@ -225,11 +227,15 @@ class ChartsPane(ChartEditing, Vertical):
         self.app.call_from_thread(self._refreshed, data)
 
     def _refresh_failed(self, message: str) -> None:
+        if not self.is_attached:
+            return
         self._refreshing = False
         self._refresh_error = message
         self._update_status()  # what is on screen stays; only the status line mentions it
 
     async def _refreshed(self, data: ChartData) -> None:
+        if not self.is_attached:
+            return
         self._refreshing = False
         self._refresh_error = ""
         panel = self.panels[self.selected].name if self.panels else None
@@ -339,7 +345,8 @@ class ChartsPane(ChartEditing, Vertical):
 
     async def _show_panel(self, focus: int | None = None) -> None:
         async with self._render_lock:
-            self.app.workers.cancel_group(self, "series")  # nothing is fetched for a panel that is no longer shown
+            for group in ("series", "tables", "images", "audio"):
+                self.app.workers.cancel_group(self, group)  # nothing is fetched for a panel that is no longer shown
             self._shown_panel = self.selected
             container = self.query_one("#charts", VerticalScroll)
             await container.remove_children()
@@ -444,16 +451,26 @@ class ChartsPane(ChartEditing, Vertical):
         spec = view.spec
         return all((spec.system, n, spec.x) in self._cache for n in spec.series if self._in_this_run(n, spec.system))
 
+    def _view_failed(self, view, message: str) -> None:
+        if view.is_attached:
+            view.fail(message)
+
     def _deliver(self, view, quiet: bool, fetch: Callable[[], T], ready: Callable[[T], None]) -> None:
         """Run `fetch` (call this from a worker thread) and hand its result to `ready` on the UI
         thread. If it fails while refreshing (`quiet`) the chart keeps what it shows and the status
         line reports it; otherwise the chart itself shows the error."""
+        worker = get_current_worker()
         try:
             result = fetch()
         except Exception as exc:
-            self.app.call_from_thread(self._refresh_failed if quiet else view.fail, str(exc))
+            if not worker.is_cancelled:
+                if quiet:
+                    self.app.call_from_thread(self._refresh_failed, str(exc))
+                else:
+                    self.app.call_from_thread(self._view_failed, view, str(exc))
             return
-        self.app.call_from_thread(ready, result)
+        if not worker.is_cancelled:
+            self.app.call_from_thread(ready, result)
 
     @work(thread=True, group="series", exclusive=True)
     def _fetch_panel_series(self, views: list[ChartView], needed: dict[str, list[str]], quiet: bool) -> None:
@@ -504,7 +521,7 @@ class ChartsPane(ChartEditing, Vertical):
         else:
             self._fetch_steps(view, quiet)
 
-    @work(thread=True)
+    @work(thread=True, group="images")
     def _fetch_steps(self, view: ImageChartView, quiet: bool) -> None:
         self._deliver(
             view, quiet, partial(self.app.client.image_steps, self.ref, view.spec.y), partial(self._steps_ready, view, quiet)
@@ -524,12 +541,15 @@ class ChartsPane(ChartEditing, Vertical):
 
     @work(thread=True, group="images")
     def _fetch_image(self, view: ImageChartView, step: ImageStep, sub: int, token: tuple[int, int]) -> None:
+        worker = get_current_worker()
         try:
             thumb, original = fetch_image(self.app, self.ref, step, sub)
         except Exception as exc:
-            self.app.call_from_thread(view.fail, str(exc), token)
+            if not worker.is_cancelled:
+                self.app.call_from_thread(view.fail, str(exc), token)
             return
-        self.app.call_from_thread(view.show_image, thumb, token, original)
+        if not worker.is_cancelled:
+            self.app.call_from_thread(view.show_image, thumb, token, original)
 
     def _load_audio(self, view: AudioChartView, quiet: bool = False) -> None:
         if view.spec.y not in {a.key for a in self.audios}:
@@ -537,7 +557,7 @@ class ChartsPane(ChartEditing, Vertical):
         else:
             self._fetch_audio_steps(view, quiet)
 
-    @work(thread=True)
+    @work(thread=True, group="audio")
     def _fetch_audio_steps(self, view: AudioChartView, quiet: bool) -> None:
         self._deliver(
             view, quiet, partial(self.app.client.audio_steps, self.ref, view.spec.y), partial(self._audio_steps_ready, view, quiet)
@@ -557,12 +577,15 @@ class ChartsPane(ChartEditing, Vertical):
 
     @work(thread=True, group="audio")
     def _fetch_clip(self, view: AudioChartView, step: ImageStep, sub: int, token: tuple[int, int]) -> None:
+        worker = get_current_worker()
         try:
             path, waveform, note = fetch_audio(self.app, self.ref, step, sub)
         except Exception as exc:
-            self.app.call_from_thread(view.fail, str(exc), token)
+            if not worker.is_cancelled:
+                self.app.call_from_thread(view.fail, str(exc), token)
             return
-        self.app.call_from_thread(view.show_clip, path, waveform, token, note)
+        if not worker.is_cancelled:
+            self.app.call_from_thread(view.show_clip, path, waveform, token, note)
 
     def _load_bars(self, view: BarView) -> None:
         items = [(name, self.values.get(name, self.system_last.get(name))) for name in view.spec.series]
@@ -580,7 +603,7 @@ class ChartsPane(ChartEditing, Vertical):
         else:
             self._fetch_table(view, info, quiet)
 
-    @work(thread=True)
+    @work(thread=True, group="tables")
     def _fetch_table(self, view: TableView, info: TableInfo, quiet: bool = False) -> None:
         self._deliver(
             view, quiet, partial(self.app.client.table_data, self.ref, info.path), partial(self._table_ready, view, info.path)

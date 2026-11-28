@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import tempfile
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
@@ -144,11 +145,18 @@ def download_run_file(run, name: str, dest: Path) -> Path:
     if not safe_relative_path(name):
         raise ValueError(f"Refusing to download file with unsafe name: {name!r}")
     dest.mkdir(parents=True, exist_ok=True)
-    run.file(name).download(root=str(dest), replace=True, exist_ok=True).close()
     path = dest / name
-    if not is_inside(path, dest):
-        path.unlink(missing_ok=True)
-        raise ValueError(f"Refusing file outside the download directory: {name!r}")
+    with tempfile.TemporaryDirectory(dir=dest, prefix=".dl-") as stage_dir:
+        stage = Path(stage_dir)
+        run.file(name).download(root=str(stage), replace=True, exist_ok=True).close()
+        staged = stage / name
+        if not is_inside(staged, stage):
+            staged.unlink(missing_ok=True)
+            raise ValueError(f"Refusing file outside the download directory: {name!r}")
+        if not is_inside(path, dest):
+            raise ValueError(f"Refusing file outside the download directory: {name!r}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        staged.replace(path)
     return path
 
 

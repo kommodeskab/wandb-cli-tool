@@ -16,12 +16,14 @@ from textual.containers import Vertical
 from textual.screen import Screen
 from textual.widgets import Header, RichLog, Static, Tree
 from textual.widgets.tree import TreeNode
+from textual.worker import get_current_worker
 from textual_image.widget import AutoImage, HalfcellImage, UnicodeImage
 
 from .sixelimage import BEST_IMAGE
 
 from ..api import FileInfo, RunRef
 from ..formatting import fmt_size
+from ..images import IMAGE_ERRORS
 from ..imageview import FIT, ZOOMS, ImageViewport
 from .image_viewer import ZoomableImage
 from .audio_widgets import AudioPlayerView, play_label, toggle_playback
@@ -261,6 +263,7 @@ class FileScreen(Screen):
     # ---- download ------------------------------------------------------
     @work(thread=True, exclusive=True)
     def fetch_file(self) -> None:
+        worker = get_current_worker()
         cache = self.app.cache
         target = download_dir(cache.root, self.ref, self.info)
         path = target / self.info.name
@@ -269,6 +272,8 @@ class FileScreen(Screen):
             if not complete:
                 cache.prune_dir_sometimes(DOWNLOAD_NAMESPACE, DOWNLOAD_CACHE_BYTES)
                 path = self.app.client.download_file(self.ref, self.info.name, target)
+            if worker.is_cancelled:
+                return
             if self.kind == "text":
                 text, note = self._read_text(path)
             elif self.kind == "audio":
@@ -276,16 +281,17 @@ class FileScreen(Screen):
             else:
                 text, note = "", self._inspect_image(path) if self.kind == "image" else ""
         except Exception as exc:
-            self.app.call_from_thread(self._failed, str(exc))
+            if not worker.is_cancelled:
+                self.app.call_from_thread(self._failed, str(exc))
             return
-        self.app.call_from_thread(self._ready, path, text, note)
+        if not worker.is_cancelled:
+            self.app.call_from_thread(self._ready, path, text, note)
 
     def _inspect_image(self, path: Path) -> str:
         from PIL import Image as PILImage
 
         with PILImage.open(path) as im:
-            im.verify()  # raises on corrupt/unsupported data
-        with PILImage.open(path) as im:
+            im.load()  # raises on corrupt/unsupported data
             return f"{im.format} {im.width}×{im.height}"
 
     def _read_audio(self, path: Path) -> str:
@@ -308,9 +314,13 @@ class FileScreen(Screen):
         return text, ""
 
     def _failed(self, message: str) -> None:
+        if not self.is_attached:
+            return
         self._placeholder(f"Could not load this file: {message}")
 
     async def _ready(self, path: Path, text: str, note: str) -> None:
+        if not self.is_attached:
+            return
         self.path = path
         preview = self.query_one("#preview", Vertical)
         if self.kind == "image":
@@ -375,7 +385,13 @@ class FileScreen(Screen):
         pane.can_focus = True
         await preview.mount(pane)
         pane.focus()
-        pane.set_image(self.path, self.path)
+        try:
+            pane.set_image(self.path, self.path)
+        except IMAGE_ERRORS as exc:
+            self.path = None
+            await preview.remove_children()
+            self._failed(str(exc))
+            return
         self._update_image_status()
 
     @property

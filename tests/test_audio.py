@@ -314,17 +314,107 @@ async def test_compared_audio_shows_waveforms_side_by_side_and_plays_one_run_at_
         assert sorted(app.client.downloads) == ["media/audio/id1_30.wav", "media/audio/id3_40.wav"]
         view.focus()
         await settle(pilot, 3)
-        assert "space Play" in bar_text(app) and "l Listen to: run-1" in bar_text(app).replace("  ", " ")
+        assert "space Play" in bar_text(app) and "l Next audio" in bar_text(app).replace("  ", " ")
         await pilot.press("space")
         await settle(pilot)
         assert player.playing and player.played[-1].name == "id1_30.wav"
         await pilot.press("l")  # switch to the other run: the playing clip is replaced, never mixed
         await settle(pilot)
         assert view.listen == 2 and player.playing and player.played[-1].name == "id3_40.wav" and len(player.played) == 2
-        assert "Listen to: run-3" in bar_text(app)
+        labels = [l.render().plain for l in view.query(".cell-label")]
+        assert not labels[0].startswith("♪") and labels[2].startswith("♪")
+        assert "l Next audio" in bar_text(app).replace("  ", " ")
         await pilot.press("left")  # another step: playback stops
         await settle(pilot, 6)
         assert not player.playing and view.target == 30
         assert view.runs_with_clips() == [0, 2]  # run-2 has no clip: never listened to
         await pilot.press("l")
         assert view.listen == 0  # round to the first again, skipping run-2
+
+
+async def test_switching_panel_while_compared_audio_is_loading_does_not_crash(tmp_path):
+    import threading
+    from textual.widgets import OptionList
+    from test_compare_screen import compare
+    from wandb_cli_tool.charts import Customization
+    from wandb_cli_tool.layout_store import project_key
+    from wandb_cli_tool.screens.compare_widgets import CompareAudioView
+
+    started, release = threading.Event(), threading.Event()
+
+    class BlockingAudioCompareClient(AudioCompareClient):
+        def download_file(self, ref, name, dest):
+            started.set()
+            release.wait(timeout=5)
+            return super().download_file(ref, name, dest)
+
+    config.save(Credentials("k", "me"))
+    app = WandbCliApp(client_factory=BlockingAudioCompareClient, audio_player=FakePlayer())
+    app.layout_store.save(
+        project_key("me", "alpha"),
+        Customization(panels=["Sounds"], added={"Sounds": [ChartSpec("clips", kind=AUDIO)]}),
+    )
+    try:
+        async with app.run_test(size=(150, 50)) as pilot:
+            screen = await compare(pilot, 0, 1, 2)
+            await pilot.press("4")
+            await settle(pilot, 6)
+            options = screen.query_one("#panels", OptionList)
+            labels = [str(options.get_option_at_index(i).prompt).split(" (")[0] for i in range(options.option_count)]
+            screen.selected = labels.index("Sounds")
+            await screen._show_panel()
+            for _ in range(40):
+                if started.is_set() and screen.query(CompareAudioView).first().steps:
+                    break
+                await pilot.pause(0.05)
+            assert started.is_set()
+            old_view = screen.query(CompareAudioView).first()
+            token = old_view.token()
+            screen.selected = 0
+            await screen._show_panel()
+            await settle(pilot, 4)
+            assert not old_view.is_attached
+            release.set()
+            await settle(pilot, 6)
+            old_view.show_clip(0, tmp_path / "x.wav", None, token)
+            old_view.fail(0, "boom", token)
+            assert not old_view.is_attached
+    finally:
+        release.set()
+
+
+async def test_switching_panel_while_run_audio_is_loading_does_not_crash(tmp_path):
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+
+    class BlockingAudioClient(WithAudio):
+        def download_file(self, ref, name, dest):
+            started.set()
+            release.wait(timeout=5)
+            return super().download_file(ref, name, dest)
+
+    config.save(Credentials("k", "me"))
+    app = WandbCliApp(client_factory=BlockingAudioClient, audio_player=FakePlayer())
+    try:
+        async with app.run_test(size=SIZE) as pilot:
+            screen = await open_charts(pilot)
+            await pilot.press(*["down"] * 5)
+            for _ in range(40):
+                views = list(screen.query(AudioChartView))
+                if started.is_set() and views and views[0]._wanted is not None:
+                    break
+                await pilot.pause(0.05)
+            assert started.is_set()
+            old_view = screen.query(AudioChartView).first()
+            key = old_view._wanted
+            await pilot.press("up")
+            await settle(pilot, 4)
+            assert not old_view.is_attached
+            release.set()
+            await settle(pilot, 6)
+            old_view.show_clip(tmp_path / "x.wav", None, key)
+            old_view.fail("boom", key)
+            assert not old_view.is_attached
+    finally:
+        release.set()

@@ -18,16 +18,18 @@ from textual_plotext import PlotextPlot
 
 from ..barchart import layout_bars
 from ..charts import ChartSpec, axis_label, display_names
-from ..images import ImageSeries, StepCursor, index_at, slider_geometry
+from ..images import IMAGE_ERRORS, ImageSeries, StepCursor, index_at, slider_geometry
 from ..imageview import ImageViewport
 from ..palette import hex_to_rgb, series_color
 from ..plain import plain, plain_title
-from ..series import Point, prepare_points
+from ..series import Point, downsample_points, prepare_points
 from ..tables import TableData
 from .chart_viewer import ChartViewerScreen
 from .image_viewer import ImageViewerScreen, ZoomableImage
 
 PLOT_HEIGHT = 20
+PLOT_MAX_POINTS = 300
+FULL_PLOT_MAX_POINTS = 600
 NOTE_HEIGHT = 5  # a chart with nothing to show in this run collapses to a short note
 SINGLE_HEIGHT = 7  # one number instead of a plot
 TABLE_MAX_HEIGHT = 20  # taller tables scroll inside this
@@ -101,7 +103,33 @@ _NAV_BINDINGS = [
 ]
 
 
-class ChartView(ChartBase, PlotextPlot):
+class CachedPlotextPlot(PlotextPlot):
+    """A PlotextPlot that caches its rendered ANSI Text until the plot data, size, or theme changes."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._plot_version = 0
+        self._render_cache: tuple[tuple[int, int, int, str], RenderableType] | None = None
+
+    def _invalidate_plot(self) -> None:
+        self._plot_version += 1
+        self._render_cache = None
+
+    def _render_plot(self) -> RenderableType:
+        key = (
+            self._plot_version,
+            self.size.width,
+            self.size.height,
+            self._get_plotext_theme_name(self.app.theme),
+        )
+        if self._render_cache is not None and self._render_cache[0] == key:
+            return self._render_cache[1]
+        rendered = PlotextPlot.render(self)
+        self._render_cache = (key, rendered)
+        return rendered
+
+
+class ChartView(ChartBase, CachedPlotextPlot):
     """One or more series against an x-axis. One series with one point is shown as a number."""
 
     can_focus = True
@@ -133,7 +161,7 @@ class ChartView(ChartBase, PlotextPlot):
             body.append(f"{y:.6g}\n", style="bold")
             body.append(f"{axis_label(self.spec.x)} = {x:.6g}", style="dim")
             return Align.center(body, vertical="middle")
-        return super().render()
+        return self._render_plot()
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action == "open_chart":
@@ -156,8 +184,9 @@ class ChartView(ChartBase, PlotextPlot):
         if not self.full_screen:
             self.styles.height = NOTE_HEIGHT
         self.border_subtitle = ""
+        self._invalidate_plot()
         self.refresh()
-        if self.is_attached:
+        if self.is_attached and self.has_focus_within:
             self.refresh_bindings()
 
     def show(self, series: Mapping[str, list[Point]], absent: tuple[str, ...] = ()) -> None:
@@ -182,8 +211,9 @@ class ChartView(ChartBase, PlotextPlot):
             self.styles.height = SINGLE_HEIGHT if self.single else PLOT_HEIGHT
         if self.single:
             self.border_subtitle = ""
+            self._invalidate_plot()
             self.refresh()
-            if self.is_attached:
+            if self.is_attached and self.has_focus_within:
                 self.refresh_bindings()
             return
         drawn = [n for n in names if series.get(n)]
@@ -193,15 +223,17 @@ class ChartView(ChartBase, PlotextPlot):
         else:
             dark = is_dark(self)
             labels = display_names(names, spec.system)
+            limit = FULL_PLOT_MAX_POINTS if self.full_screen else PLOT_MAX_POINTS
             # Draw in reverse order so the top-listed (index 0) series paints on top of the rest
             for slot, (name, label) in reversed(list(enumerate(zip(names, labels)))):
                 points = series.get(name)
                 if not points:
                     continue
+                shown = downsample_points(points, limit)
                 options = {"marker": "braille", "color": hex_to_rgb(series_color(slot, dark))}
                 if len(names) > 1:  # a legend whenever there are two or more series
                     options["label"] = label
-                plt.plot([p[0] for p in points], [p[1] for p in points], **options)
+                plt.plot([p[0] for p in shown], [p[1] for p in shown], **options)
             plt.xlabel(axis_label(spec.x))
             apply_axis_options(plt, opts, [p[1] for n in drawn for p in series[n]], [p[0] for n in drawn for p in series[n]])
             no_data = [lab for n, lab in zip(names, labels) if n not in absent and not series.get(n)]
@@ -210,8 +242,9 @@ class ChartView(ChartBase, PlotextPlot):
                 f"  ·  not logged in this run: {', '.join(not_here)}" if not_here else ""
             )
             self.border_subtitle = plain_title(f"x: {axis_label(spec.x)}{plot_note(opts, dropped)}{note}")
+        self._invalidate_plot()
         self.refresh()
-        if self.is_attached:
+        if self.is_attached and self.has_focus_within:
             self.refresh_bindings()
 
     def fail(self, message: str) -> None:
@@ -220,8 +253,9 @@ class ChartView(ChartBase, PlotextPlot):
         self.plt.clear_figure()
         self.plt.title(f"Error: {message}")
         self.border_subtitle = ""
+        self._invalidate_plot()
         self.refresh()
-        if self.is_attached:
+        if self.is_attached and self.has_focus_within:
             self.refresh_bindings()
 
 
@@ -267,7 +301,7 @@ class BarView(ChartBase, Widget):
         self.styles.height = ("1fr" if len(values) == 1 else len(values) + 2) if self.full_screen else min(len(self.spec.series) + 2, 42)
         self.border_subtitle = plain_title(f"axis {self.spec.opts.range_text()}") if self.spec.opts.range_text() else ""
         self.refresh()
-        if self.is_attached:
+        if self.is_attached and self.has_focus_within:
             self.refresh_bindings()
 
     def show_unavailable(self, message: str) -> None:
@@ -275,13 +309,13 @@ class BarView(ChartBase, Widget):
         if not self.full_screen:
             self.styles.height = NOTE_HEIGHT
         self.refresh()
-        if self.is_attached:
+        if self.is_attached and self.has_focus_within:
             self.refresh_bindings()
 
     def fail(self, message: str) -> None:
         self.error = message
         self.refresh()
-        if self.is_attached:
+        if self.is_attached and self.has_focus_within:
             self.refresh_bindings()
 
     def render(self) -> RenderResult:
@@ -381,7 +415,7 @@ class TableView(ChartBase, DataTable):
         if not data.columns:
             self.border_subtitle = "empty table"
             self._fit_height(0)
-            if self.is_attached:
+            if self.is_attached and self.has_focus_within:
                 self.refresh_bindings()
             return
         self.add_columns(*[plain(c) for c in data.columns])  # cells are literal text, never markup
@@ -397,7 +431,7 @@ class TableView(ChartBase, DataTable):
         if data.total_cols > len(data.columns):
             note += f" · first {len(data.columns)} of {data.total_cols} columns"
         self.border_subtitle = note
-        if self.is_attached:
+        if self.is_attached and self.has_focus_within:
             self.refresh_bindings()
 
     def fail(self, message: str, heading: str = "Error") -> None:
@@ -407,7 +441,7 @@ class TableView(ChartBase, DataTable):
         self.add_row(plain(message))
         self.border_subtitle = ""
         self._fit_height(1)
-        if self.is_attached:
+        if self.is_attached and self.has_focus_within:
             self.refresh_bindings()
 
     def show_unavailable(self, message: str) -> None:
@@ -536,6 +570,8 @@ class ImageChartView(ChartBase, Vertical):
 
     def show_unavailable(self, message: str) -> None:
         """This run never logged this key: collapse to a short note."""
+        if not self.is_attached:
+            return
         self.unavailable = message
         self.query_one("#img-area").display = False
         self.query_one("#slider").display = False
@@ -553,6 +589,8 @@ class ImageChartView(ChartBase, Vertical):
     def set_steps(self, series: ImageSeries, keep_position: bool = False) -> None:
         """New list of steps. First time: show the newest. When refreshing: stay on the same
         step, unless the slider was at the end, in which case follow the newest."""
+        if not self.is_attached:
+            return
         self._leave_unavailable()
         previous = self.current_step.step if self.current_step else None
         was_end = self.cursor.at_end
@@ -620,10 +658,16 @@ class ImageChartView(ChartBase, Vertical):
 
     # ---- results from the screen -----------------------------------------------------------
     def show_image(self, path: Path, key: tuple[int, int], original: Path | None = None) -> None:
-        if key != self._wanted:  # the slider has moved on since this was requested
+        if not self.is_attached or key != self._wanted:  # the slider has moved on or the view was removed
             return
-        self.path, self.full_path, self._shown, self.waiting, self.error = path, original or path, key, False, ""
-        self.query_one("#zoom-img", ZoomableImage).set_image(path, self.full_path)
+        full_path = original or path
+        try:
+            self.query_one("#zoom-img", ZoomableImage).set_image(path, full_path)
+        except IMAGE_ERRORS as exc:
+            self.path = self.full_path = self._shown = None
+            self.fail(f"Could not read image: {exc}", key)
+            return
+        self.path, self.full_path, self._shown, self.waiting, self.error = path, full_path, key, False, ""
         self._update_info()
 
     def action_open_image(self) -> None:
@@ -643,7 +687,7 @@ class ImageChartView(ChartBase, Vertical):
         )
 
     def fail(self, message: str, key: tuple[int, int] | None = None) -> None:
-        if key is not None and key != self._wanted:
+        if not self.is_attached or (key is not None and key != self._wanted):
             return
         self.error, self.waiting = message, False
         if self.series is None:  # the steps themselves could not be read

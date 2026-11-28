@@ -174,6 +174,34 @@ def test_transparent_and_jpeg_images_work_and_junk_is_rejected(tmp_path):
         make_thumbnail(bad)
 
 
+def _corrupt_png_chunks(path) -> None:
+    """Keep the PNG signature and IHDR header intact, zeroing subsequent chunk data."""
+    raw = path.read_bytes()
+    path.write_bytes(raw[:33] + b"\x00" * 32)
+
+
+def test_a_corrupt_cached_thumbnail_is_regenerated(tmp_path):
+    p = png(tmp_path / "big.png", (400, 200))
+    thumb = make_thumbnail(p, 100)
+    _corrupt_png_chunks(thumb)
+    os.utime(thumb, (p.stat().st_mtime + 10, p.stat().st_mtime + 10))
+    repaired = make_thumbnail(p, 100)
+    assert repaired == thumb
+    with Image.open(repaired) as im:
+        im.load()
+        assert im.size == (100, 50)
+    assert not list(tmp_path.glob("*.tmp*"))
+
+
+def test_a_broken_small_png_is_rejected_by_make_thumbnail(tmp_path):
+    from wandb_cli_tool.images import IMAGE_ERRORS
+
+    p = png(tmp_path / "small.png", (40, 40))
+    _corrupt_png_chunks(p)
+    with pytest.raises(IMAGE_ERRORS):
+        make_thumbnail(p, 100)
+
+
 # ---- the image chart kind in layouts --------------------------------------------------------------
 
 
@@ -222,6 +250,24 @@ def test_the_client_reads_image_keys_from_the_summary_and_steps_from_the_history
     assert [(i.key, i.multiple) for i in c.run_images(REF)] == [("a", False)]
     series = c.image_steps(REF, "img")
     assert [s.step for s in series.steps] == [1, 2, 3] and run.asked == [["img"]]  # only this key is read
+
+
+def test_scan_history_failure_falls_back_to_sampled_history(client):
+    c, run = client
+    history_calls = []
+
+    def boom(**kwargs):
+        raise RuntimeError("RustArrowWrapper initialization failed: could not find lib")
+
+    def history(**kwargs):
+        history_calls.append(kwargs)
+        return [row(s, single(s)) for s in (1, 3)]
+
+    run.scan_history = boom
+    run.history = history
+    series = c.image_steps(REF, "img")
+    assert [s.step for s in series.steps] == [1, 3]
+    assert len(history_calls) == 1 and history_calls[0]["keys"] == ["img"]
 
 
 def test_reading_the_history_is_bounded(client, monkeypatch):

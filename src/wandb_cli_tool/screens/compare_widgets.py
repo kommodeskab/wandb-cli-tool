@@ -20,14 +20,16 @@ from textual_plotext import PlotextPlot
 from ..barchart import layout_bars
 from ..charts import axis_label
 from ..compare import MAX_COMPARE_ROWS, CompareChart, latest, merge_tables, nearest_step, union_steps
-from ..images import ImageSeries, ImageStep, StepCursor
+from ..images import IMAGE_ERRORS, ImageSeries, ImageStep, StepCursor
 from ..imageview import ImageViewport
 from ..palette import hex_to_rgb, series_color
 from ..plain import plain, plain_title
-from ..series import Point, prepare_points
+from ..series import Point, downsample_points, prepare_points
 from ..tables import TableData
 from .chart_widgets import (
-    CHART_CLASS, DEBOUNCE, NOTE_HEIGHT, StepSlider, table_height, PLOT_HEIGHT, _NAV_BINDINGS, apply_axis_options, is_dark, note_renderable, plot_note,
+    CHART_CLASS, DEBOUNCE, FULL_PLOT_MAX_POINTS, NOTE_HEIGHT, PLOT_HEIGHT, PLOT_MAX_POINTS,
+    CachedPlotextPlot, StepSlider, _NAV_BINDINGS, apply_axis_options, is_dark, note_renderable,
+    plot_note, table_height,
 )
 from .audio_widgets import AudioPlayerView, play_label, toggle_playback
 from .chart_viewer import ChartViewerScreen
@@ -135,7 +137,7 @@ class CompareBarView(CompareBase, Widget):
         self.styles.height = grouped_bars_height(groups)
         self.border_subtitle = plain_title(f"axis {self.chart.opts.range_text()}") if self.chart.opts.range_text() else ""
         self.refresh()
-        if self.is_attached:
+        if self.is_attached and self.has_focus_within:
             self.refresh_bindings()
 
     def show_unavailable(self, message: str) -> None:
@@ -143,13 +145,13 @@ class CompareBarView(CompareBase, Widget):
         if not self.full_screen:
             self.styles.height = NOTE_HEIGHT
         self.refresh()
-        if self.is_attached:
+        if self.is_attached and self.has_focus_within:
             self.refresh_bindings()
 
     def fail(self, message: str) -> None:
         self.error = message
         self.refresh()
-        if self.is_attached:
+        if self.is_attached and self.has_focus_within:
             self.refresh_bindings()
 
     def render(self) -> RenderableType:
@@ -163,7 +165,7 @@ class CompareBarView(CompareBase, Widget):
         return render_grouped_bars(self.groups, self._colors(), max(self.content_size.width, 20), opts.ymin, opts.ymax)
 
 
-class ComparePlotView(CompareBase, PlotextPlot):
+class ComparePlotView(CompareBase, CachedPlotextPlot):
     """One metric's curves, one per run, overlaid. If every run logged a single value it becomes bars."""
 
     can_focus = True
@@ -211,15 +213,16 @@ class ComparePlotView(CompareBase, PlotextPlot):
             return note_renderable(self.note)
         if self.bars is not None:
             return render_grouped_bars(self.bars, self._colors(), max(self.content_size.width, 20))
-        return super().render()
+        return self._render_plot()
 
     def show_unavailable(self, message: str) -> None:
         self.note, self.bars, self._series = message, None, None
         if not self.full_screen:
             self.styles.height = NOTE_HEIGHT
         self.border_subtitle = ""
+        self._invalidate_plot()
         self.refresh()
-        if self.is_attached:
+        if self.is_attached and self.has_focus_within:
             self.refresh_bindings()
 
     def show(self, series: Mapping[int, list[Point]], single: bool) -> None:
@@ -238,14 +241,16 @@ class ComparePlotView(CompareBase, PlotextPlot):
             else:
                 self.styles.height = grouped_bars_height(self.bars)
             self.border_subtitle = plain_title(note.removeprefix("  ·  "))
+            self._invalidate_plot()
             self.refresh()
-            if self.is_attached:
+            if self.is_attached and self.has_focus_within:
                 self.refresh_bindings()
             return
         self.bars = None
         if not self.full_screen:
             self.styles.height = PLOT_HEIGHT
         colors = self._colors()
+        limit = FULL_PLOT_MAX_POINTS if self.full_screen else PLOT_MAX_POINTS
         dropped, drawn, drawn_x = 0, [], []
         for i, points in sorted(series.items()):
             points, gone = prepare_points(points, chart.opts)  # smoothing / log axes, per run
@@ -253,15 +258,17 @@ class ComparePlotView(CompareBase, PlotextPlot):
             if points:
                 drawn += [p[1] for p in points]
                 drawn_x += [p[0] for p in points]
+                shown = downsample_points(points, limit)
                 plt.plot(
-                    [p[0] for p in points], [p[1] for p in points],
-                    marker="braille", color=hex_to_rgb(colors[i]), label=self.run_labels[i],
+                    [p[0] for p in shown], [p[1] for p in shown],
+                    marker="braille", color=hex_to_rgb(colors[i]),
                 )
         plt.xlabel(axis_label(chart.x))
         apply_axis_options(plt, chart.opts, drawn, drawn_x)
         self.border_subtitle = plain_title(f"x: {axis_label(chart.x)}{plot_note(chart.opts, dropped)}{note}")
+        self._invalidate_plot()
         self.refresh()
-        if self.is_attached:
+        if self.is_attached and self.has_focus_within:
             self.refresh_bindings()
 
     def fail(self, message: str) -> None:
@@ -270,8 +277,9 @@ class ComparePlotView(CompareBase, PlotextPlot):
         self.plt.clear_figure()
         self.plt.title(f"Error: {message}")
         self.border_subtitle = ""
+        self._invalidate_plot()
         self.refresh()
-        if self.is_attached:
+        if self.is_attached and self.has_focus_within:
             self.refresh_bindings()
 
 
@@ -342,7 +350,7 @@ class CompareTableView(CompareBase, DataTable):
         self.clear(columns=True)
         self.add_columns("Run", *[plain(c) for c in merged.columns])
         for run, cells in merged.rows:
-            self.add_row(Text.assemble(("■ ", colors[run]), self.run_labels[run]), *[plain(c) for c in cells])
+            self.add_row(Text("■", style=colors[run]), *[plain(c) for c in cells])
         if not self.full_screen:
             self.styles.height = table_height(len(merged.rows))
         if cursor is not None and merged.rows:
@@ -362,7 +370,7 @@ class CompareTableView(CompareBase, DataTable):
         self.refresh()
         if self.full_screen and self.is_attached and hasattr(self.screen, "set_status"):
             self.screen.set_status(subtitle)
-        if self.is_attached:
+        if self.is_attached and self.has_focus_within:
             self.refresh_bindings()
 
     def toggle_state(self, action: str) -> bool | None:
@@ -381,7 +389,7 @@ class CompareTableView(CompareBase, DataTable):
         if not self.full_screen:
             self.styles.height = table_height(1)
         self.border_subtitle = ""
-        if self.is_attached:
+        if self.is_attached and self.has_focus_within:
             self.refresh_bindings()
 
     def fail(self, message: str) -> None:
@@ -392,7 +400,7 @@ class CompareTableView(CompareBase, DataTable):
         if not self.full_screen:
             self.styles.height = table_height(1)
         self.border_subtitle = ""
-        if self.is_attached:
+        if self.is_attached and self.has_focus_within:
             self.refresh_bindings()
 
 
@@ -445,10 +453,21 @@ class CompareImageView(CompareBase, Vertical):
         self.sub = 0
         self.unavailable: str | None = None
         self.errors: dict[int, str] = {}
+        self._step_errors: dict[int, str] = {}
         self._debounce = None
         self._shown: dict[int, Path] = {}
         self._full_paths: dict[int, Path] = {}
         self.viewport = ImageViewport()
+
+    def _cell_viewport_size(self) -> tuple[int, int] | None:
+        sizes = [
+            (p.content_size.width, p.content_size.height)
+            for p in self.query(ZoomableImage)
+            if p.content_size.width > 0 and p.content_size.height > 0
+        ]
+        if not sizes:
+            return None
+        return min(w for w, _ in sizes), min(h for _, h in sizes)
 
     def compose(self):
         with Horizontal(id="cells"):
@@ -456,7 +475,11 @@ class CompareImageView(CompareBase, Vertical):
                 with Vertical(classes="cell cell-sep" if i else "cell"):
                     yield Static("", classes="cell-label")
                     with Vertical(classes="cell-img"):
-                        yield ZoomableImage(viewport=self.viewport, interactive=False)
+                        yield ZoomableImage(
+                            viewport=self.viewport,
+                            interactive=False,
+                            size_provider=self._cell_viewport_size,
+                        )
         yield StepSlider(id="slider")
         yield Static("loading…", id="img-info")
 
@@ -485,14 +508,24 @@ class CompareImageView(CompareBase, Vertical):
             self.unavailable = None
             self.query_one("#cells").display = True
             self.query_one("#slider").display = True
+            self.styles.min_height = None
             self.styles.height = IMAGE_COMPARE_HEIGHT
+            self.query_one("#img-info", Static).styles.height = 1
 
-    def set_series(self, series: list[ImageSeries | None], keep_position: bool = False) -> None:
+    def set_series(
+        self,
+        series: list[ImageSeries | None],
+        keep_position: bool = False,
+        step_errors: Mapping[int, str] | None = None,
+    ) -> None:
         """The runs' image steps. First time the newest step is shown; on a refresh the slider stays."""
+        if not self.is_attached:
+            return
         self._leave_unavailable()
         previous = self.target
         was_end = self.cursor.at_end
         self.series, self.steps = series, union_steps(series)
+        self._step_errors = dict(step_errors or {})
         n = len(self.steps)
         if not keep_position or was_end or previous is None:
             self.cursor = StepCursor(n, n - 1)
@@ -502,22 +535,33 @@ class CompareImageView(CompareBase, Vertical):
         self._sync(immediate=True)
 
     def show_unavailable(self, message: str) -> None:
+        if not self.is_attached:
+            return
         self.unavailable = message
         self.query_one("#cells").display = False
         self.query_one("#slider").display = False
-        self.styles.height = NOTE_HEIGHT
-        self.query_one("#img-info", Static).update(plain(message))
+        self.styles.min_height = NOTE_HEIGHT
+        self.styles.height = "auto"
+        info = self.query_one("#img-info", Static)
+        info.styles.height = "auto"
+        info.update(plain(message))
 
     # ---- showing -----------------------------------------------------------------------------------
     def _labels(self) -> None:
         colors = self._colors()
         for run, cell in enumerate(self.query(".cell-label")):
             step = self.step_for(run)
-            text = Text.assemble(("■ ", colors[run]), self.run_labels[run])
+            text = Text(no_wrap=True, overflow="ellipsis")
+            text.append("■ ", style=colors[run])
             if step is None:
-                text.append("  not logged", style="dim")
+                if run in self._step_errors:
+                    text.append(self._step_errors[run], style="red")
+                else:
+                    text.append("not logged", style="dim")
             else:
-                text.append(f"  step {step.step}", style="dim" if step.step == self.target else "yellow")
+                text.append(f"step {step.step}", style="dim" if step.step == self.target else "yellow")
+                if run in self._step_errors:
+                    text.append(f"  {self._step_errors[run]}", style="red")
             if run in self.errors:
                 text.append(f"  {self.errors[run]}", style="red")
             cell.update(text)
@@ -544,31 +588,44 @@ class CompareImageView(CompareBase, Vertical):
                 self._debounce = self.set_timer(DEBOUNCE, lambda: self.post_message(self.Wanted(self)))
 
     def show_image(self, run: int, path: Path, token: tuple[int, int], original: Path | None = None) -> None:
-        if token != self.token():  # the slider has moved on since this was requested
+        if not self.is_attached or token != self.token():  # the slider has moved on or the view was removed
+            return
+        images = list(self.query(ZoomableImage))
+        if not (0 <= run < len(images)):
+            return
+        full_path = original or path
+        try:
+            images[run].set_image(path, full_path)
+        except IMAGE_ERRORS as exc:
+            self._shown.pop(run, None)
+            self._full_paths.pop(run, None)
+            self.fail(run, f"Could not read image: {exc}", token)
             return
         self._shown[run] = path
-        self._full_paths[run] = original or path
-        self.query(ZoomableImage)[run].set_image(path, self._full_paths[run])
-        self.refresh_bindings()
+        self._full_paths[run] = full_path
+        if self.has_focus_within:
+            self.refresh_bindings()
 
     def action_open_images(self) -> None:
         if not self._shown or self.unavailable is not None:
             return
         colors = self._colors()
+        legend = list(zip(self.run_labels, colors))
         items = []
-        for run, label in enumerate(self.run_labels):
+        for run in range(len(self.run_labels)):
             step = self.step_for(run)
-            tag = f"{label}  step {step.step}" if step is not None else f"{label}  not logged"
+            tag = f"step {step.step}" if step is not None else "not logged"
             items.append((tag, self._full_paths.get(run) or self._shown.get(run), colors[run]))
         sub = f"step {self.target} · {self.cursor.index + 1}/{len(self.steps)}" if self.steps else ""
         self.app.push_screen(
-            ImageViewerScreen(items, title=self.chart.title, subtitle=sub, viewport=self.viewport)
+            ImageViewerScreen(items, title=self.chart.title, subtitle=sub, viewport=self.viewport, legend=legend)
         )
 
     def fail(self, run: int, message: str, token: tuple[int, int]) -> None:
-        if token == self.token():
-            self.errors[run] = message
-            self._labels()
+        if not self.is_attached or token != self.token():
+            return
+        self.errors[run] = message
+        self._labels()
 
     # ---- keys ----------------------------------------------------------------------------------------
     def action_step(self, delta: int) -> None:
@@ -605,7 +662,7 @@ class CompareAudioView(CompareBase, Vertical):
     can_focus = True
     BINDINGS = [
         Binding("space", "toggle_play", "Play"),
-        Binding("l", "listen_next", "Listen to"),
+        Binding("l", "listen_next", "Next audio"),
         Binding("left", "step(-1)", "Previous step"),
         Binding("right", "step(1)", "Next step"),
         Binding("shift+left", "step(-10)", "10 steps back", show=False),
@@ -645,6 +702,7 @@ class CompareAudioView(CompareBase, Vertical):
         self.listen = 0  # the run whose clip Space plays
         self.unavailable: str | None = None
         self.errors: dict[int, str] = {}
+        self._step_errors: dict[int, str] = {}
         self._debounce = None
 
     def compose(self):
@@ -675,29 +733,35 @@ class CompareAudioView(CompareBase, Vertical):
     def key_label(self, action: str) -> str | None:
         if action == "toggle_play":
             return play_label(self._listened().state) if self.players() else "Play"
-        if action == "listen_next":
-            return f"Listen to: {self.run_labels[self.listen]}" if self.listen < len(self.run_labels) else "Listen to"
         return None
 
     def _listened(self) -> AudioPlayerView:
-        return self.players()[min(self.listen, len(self.run_labels) - 1)]
+        players = self.players()
+        return players[min(self.listen, len(players) - 1)]
 
     def on_audio_player_view_state_changed(self, event: AudioPlayerView.StateChanged) -> None:
         event.stop()
+        if not self.is_attached:
+            return
         self.refresh_bindings()
         self._labels()
 
     def action_toggle_play(self) -> None:
+        players = self.players()
+        if not players:
+            return
         message = toggle_playback(self.app, self._listened())
         if message:
             self.notify(message, severity="warning")
-        for view in self.players():
+        for view in players:
             view.refresh()
         self.refresh_bindings()
 
     def action_listen_next(self) -> None:
         """Listen to the next run that has a clip here. If something is playing, that clip takes over
         at once (one clip plays at a time)."""
+        if not self.players():
+            return
         candidates = self.runs_with_clips()
         if len(candidates) < 2:
             return
@@ -736,13 +800,23 @@ class CompareAudioView(CompareBase, Vertical):
             self.unavailable = None
             self.query_one("#cells").display = True
             self.query_one("#slider").display = True
+            self.styles.min_height = None
             self.styles.height = AUDIO_COMPARE_HEIGHT
+            self.query_one("#audio-info", Static).styles.height = 1
 
-    def set_series(self, series: list[ImageSeries | None], keep_position: bool = False) -> None:
+    def set_series(
+        self,
+        series: list[ImageSeries | None],
+        keep_position: bool = False,
+        step_errors: Mapping[int, str] | None = None,
+    ) -> None:
+        if not self.is_attached:
+            return
         self._leave_unavailable()
         previous = self.target
         was_end = self.cursor.at_end
         self.series, self.steps = series, union_steps(series)
+        self._step_errors = dict(step_errors or {})
         n = len(self.steps)
         if not keep_position or was_end or previous is None:
             self.cursor = StepCursor(n, n - 1)
@@ -755,11 +829,16 @@ class CompareAudioView(CompareBase, Vertical):
         self._sync(immediate=True)
 
     def show_unavailable(self, message: str) -> None:
+        if not self.is_attached:
+            return
         self.unavailable = message
         self.query_one("#cells").display = False
         self.query_one("#slider").display = False
-        self.styles.height = NOTE_HEIGHT
-        self.query_one("#audio-info", Static).update(plain(message))
+        self.styles.min_height = NOTE_HEIGHT
+        self.styles.height = "auto"
+        info = self.query_one("#audio-info", Static)
+        info.styles.height = "auto"
+        info.update(plain(message))
 
     # ---- showing -----------------------------------------------------------------------------------
     def _labels(self) -> None:
@@ -767,9 +846,14 @@ class CompareAudioView(CompareBase, Vertical):
         for run, cell in enumerate(self.query(".cell-label")):
             step = self.step_for(run)
             marker = "♪ " if run == self.listen and step is not None else "■ "
-            text = Text.assemble((marker, colors[run]), self.run_labels[run])
+            text = Text(no_wrap=True, overflow="ellipsis")
+            text.append(marker, style=colors[run])
+            text.append(self.run_labels[run])
             if step is None:
-                text.append("  not logged", style="dim")
+                if run in self._step_errors:
+                    text.append(f"  {self._step_errors[run]}", style="red")
+                else:
+                    text.append("  not logged", style="dim")
             else:
                 text.append(f"  step {step.step}", style="dim" if step.step == self.target else "yellow")
                 if step.caption(min(self.sub, len(step.paths) - 1)):
@@ -799,15 +883,20 @@ class CompareAudioView(CompareBase, Vertical):
                 self._debounce = self.set_timer(DEBOUNCE, lambda: self.post_message(self.Wanted(self)))
 
     def show_clip(self, run: int, path: Path, waveform, token: tuple[int, int], note: str = "") -> None:
-        if token != self.token():  # the slider has moved on since this was requested
+        if not self.is_attached or token != self.token():  # the slider has moved on or the view was removed
             return
-        self.players()[run].set_clip(path, waveform, note)
-        self.refresh_bindings()
+        players = self.players()
+        if not (0 <= run < len(players)):
+            return
+        players[run].set_clip(path, waveform, note)
+        if self.has_focus_within:
+            self.refresh_bindings()
 
     def fail(self, run: int, message: str, token: tuple[int, int]) -> None:
-        if token == self.token():
-            self.errors[run] = message
-            self._labels()
+        if not self.is_attached or token != self.token():
+            return
+        self.errors[run] = message
+        self._labels()
 
     # ---- keys ----------------------------------------------------------------------------------------
     def action_step(self, delta: int) -> None:

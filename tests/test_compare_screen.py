@@ -161,7 +161,9 @@ async def test_legend_names_every_run():
     async with app.run_test(size=(150, 40)) as pilot:
         screen = await compare(pilot, 0, 1, 2)
         legend = screen.query_one("#legend").render().plain
-        assert "run-1" in legend and "run-2" in legend and "run-3" in legend
+        lines = legend.splitlines()
+        assert len(lines) == 3
+        assert "run-1" in lines[0] and "run-2" in lines[1] and "run-3" in lines[2]
 
 
 async def test_config_tab_lists_only_what_differs():
@@ -413,15 +415,20 @@ async def test_tables_of_all_runs_appear_in_one_table_with_a_color_per_run():
         screen = await compare(pilot, 0, 1, 2)
         await show_panel(pilot, screen, "Media")
         [view] = screen.query(CompareTableView)
+        colors = view._colors()
         rows = [[str(c) for c in view.get_row_at(i)] for i in range(view.row_count)]
+        row_colors = [view.get_row_at(i)[0].style for i in range(view.row_count)]
         assert [str(c.label) for c in view.columns.values()] == ["Run", "key", "value"]
-        assert rows == [["■ run-1", "a", "1"], ["■ run-1", "b", "2"], ["■ run-3", "b", "9"], ["■ run-3", "c", "3"]]
+        assert rows == [["■", "a", "1"], ["■", "b", "2"], ["■", "b", "9"], ["■", "c", "3"]]
+        assert row_colors == [colors[0], colors[0], colors[2], colors[2]]
         assert "not in: run-2" in str(view.border_subtitle) and "grouped by run" in str(view.border_subtitle)
         view.focus()
         await pilot.press("v")  # line the rows up by key
         await settle(pilot)
         rows = [[str(c) for c in view.get_row_at(i)][:2] for i in range(view.row_count)]
-        assert rows == [["■ run-1", "a"], ["■ run-1", "b"], ["■ run-3", "b"], ["■ run-3", "c"]]  # b's sit together
+        row_colors = [view.get_row_at(i)[0].style for i in range(view.row_count)]
+        assert rows == [["■", "a"], ["■", "b"], ["■", "b"], ["■", "c"]]  # b's sit together
+        assert row_colors == [colors[0], colors[0], colors[2], colors[2]]
         assert "lined up by first column" in str(view.border_subtitle)
 
 
@@ -436,6 +443,8 @@ async def test_images_of_all_runs_share_one_slider():
         assert view.step_for(0).step == 30 and view.step_for(2).step == 40 and view.step_for(1) is None
         labels = [l.render().plain for l in view.query(".cell-label")]
         assert "step 30" in labels[0] and "not logged" in labels[1] and "step 40" in labels[2]
+        assert all(l.startswith("■ ") for l in labels)
+        assert "run-1" not in labels[0] and "run-2" not in labels[1] and "run-3" not in labels[2]
         assert sorted(app.client.downloads) == ["media/images/id1_30.png", "media/images/id3_40.png"]  # one per run, not run-2
         view.focus()
         await pilot.press("left", "left")  # step 20: both runs have it exactly
@@ -458,6 +467,12 @@ async def test_images_of_all_runs_share_one_slider():
         await settle(pilot, 4)
         viewer = app.screen
         assert isinstance(viewer, ImageViewerScreen) and viewer.viewport.zoom == 1.0
+        v_legend = viewer.query_one("#viewer-legend").render().plain
+        assert len(v_legend.splitlines()) == 3
+        assert "run-1" in v_legend.splitlines()[0] and "run-2" in v_legend.splitlines()[1] and "run-3" in v_legend.splitlines()[2]
+        v_labels = [l.render().plain for l in viewer.query(".viewer-label")]
+        assert all(l.startswith("■ ") for l in v_labels)
+        assert all("run-" not in l for l in v_labels) and "step 20" in v_labels[0] and "not logged" in v_labels[1]
         await pilot.press("plus", "plus")
         await settle(pilot)
         panes = list(viewer.query(ZoomableImage))
@@ -500,7 +515,11 @@ async def test_the_legend_and_status_stay_in_view_and_the_tabs_fill_the_rest():
             await settle(pilot, 4)
             assert screen.scroll_y == 0
             assert screen.query_one("#legend").region.y < screen.query_one("#tabs").region.y
-            assert screen.query_one("#legend").region.height >= 1 and screen.query_one("#status").region.height >= 1
+            if key == "4":
+                assert not screen.query_one("#status").display
+            else:
+                assert screen.query_one("#status").display and screen.query_one("#status").region.height >= 1
+            assert screen.query_one("#legend").region.height >= 1
             assert screen.query_one("#tabs").region.bottom <= screen.size.height
 
 
@@ -1037,7 +1056,8 @@ async def test_compare_plot_bar_and_table_open_fullscreen():
         assert isinstance(app.screen.viewer_widget, ComparePlotView)
         assert app.screen.viewer_widget.full_screen is True
         assert app.screen.viewer_widget.size.height > PLOT_HEIGHT
-        assert "run-1" in app.screen.query_one("#viewer-legend").render().plain
+        viewer_legend = app.screen.query_one("#viewer-legend").render().plain
+        assert len(viewer_legend.splitlines()) == 3 and "run-1" in viewer_legend.splitlines()[0]
         assert "Open plot" not in keys_of(app.screen)
         await pilot.press("escape")
         await settle(pilot)
@@ -1075,3 +1095,138 @@ async def test_compare_plot_bar_and_table_open_fullscreen():
         await pilot.press("escape")
         await settle(pilot)
         assert app.screen is screen
+
+
+async def test_compare_plots_omit_in_plot_legend_and_cache_renders(monkeypatch):
+    from wandb_cli_tool.screens.chart_widgets import ChartView
+    from wandb_cli_tool.charts import ChartSpec
+
+    app = make()
+    async with app.run_test(size=(150, 50)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        await show_panel(pilot, screen, "trainer")
+        [view] = screen.query(ComparePlotView)
+        plot_calls = []
+        original_plot = view.plt.plot
+        monkeypatch.setattr(view.plt, "plot", lambda *a, **k: (plot_calls.append(k), original_plot(*a, **k))[1])
+        view.show(view._series, single=False)
+        assert plot_calls and all("label" not in k for k in plot_calls)
+
+        builds = []
+        original_build = view._plot.build
+        monkeypatch.setattr(view._plot, "build", lambda: (builds.append(1), original_build())[1])
+        first = view.render()
+        second = view.render()
+        assert first is second and len(builds) == 1  # cached across unchanged renders
+        view.show(view._series, single=False)
+        third = view.render()
+        assert third is not first and len(builds) == 2  # invalidated on new data
+
+        single_view = ChartView(ChartSpec("a", more=("b",)), 0)
+        app.mount(single_view)
+        await settle(pilot)
+        single_view.show({"a": [(0.0, 1.0), (1.0, 2.0)], "b": [(0.0, 2.0), (1.0, 1.0)]})
+        single_builds = []
+        orig_single_build = single_view._plot.build
+        monkeypatch.setattr(single_view._plot, "build", lambda: (single_builds.append(1), orig_single_build())[1])
+        s1 = single_view.render()
+        s2 = single_view.render()
+        assert s1 is s2 and len(single_builds) == 1
+
+
+def test_plots_ready_only_redraws_matching_views():
+    from wandb_cli_tool.api import RunRef
+    from wandb_cli_tool.charts import ChartSpec
+    from wandb_cli_tool.compare import CompareChart
+
+    class DummyView:
+        def __init__(self, metric: str, x: str = "_step") -> None:
+            self.chart = CompareChart("plot", (metric,), x, source=ChartSpec(metric, x=x))
+
+    screen = CompareScreen("me", "alpha", [(RunRef("me", "alpha", "id1"), "r1"), (RunRef("me", "alpha", "id2"), "r2")])
+    shown = []
+    screen._show_plot = lambda view: shown.append(view.chart.metric)
+    v_a = DummyView("a", "_step")
+    v_b = DummyView("b", "_step")
+    v_c = DummyView("a", "_runtime")
+    screen._plots_ready([v_a, v_b, v_c], 0, "_step", {"a": [(0.0, 1.0)]})
+    assert shown == ["a"]
+
+
+async def test_compared_images_have_identical_rendered_sizes_inline_and_fullscreen():
+    from PIL import Image
+    from wandb_cli_tool.images import ImageInfo, ImageSeries, ImageStep
+    from wandb_cli_tool.screens.image_viewer import ImageViewerScreen, ZoomableImage
+
+    class PortraitThreeClient(CompareClient):
+        def run_images(self, ref):
+            return [ImageInfo("samples")]
+
+        def image_steps(self, ref, key):
+            return ImageSeries((ImageStep(10, (f"media/images/{ref.id}_10.png",), (f"sha{ref.id}",)),), 1)
+
+        def download_file(self, ref, name, dest):
+            self.downloads.append(name)
+            path = dest / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (120, 200), (10, 80, 160)).save(path)
+            return path
+
+    app = make(PortraitThreeClient)
+    media_layout(app)
+    async with app.run_test(size=(151, 50)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        await show_panel(pilot, screen, "Media")
+        [view] = screen.query(CompareImageView)
+        inline_panes = list(view.query(ZoomableImage))
+        assert len(inline_panes) == 3
+        inline_sizes = {(p.image_widget.styles.width, p.image_widget.styles.height) for p in inline_panes}
+        assert len(inline_sizes) == 1
+
+        view.focus()
+        await pilot.press("enter")
+        await settle(pilot, 4)
+        viewer = app.screen
+        assert isinstance(viewer, ImageViewerScreen)
+        viewer_panes = list(viewer.query(ZoomableImage))
+        assert len(viewer_panes) == 3
+        viewer_sizes = {(p.image_widget.styles.width, p.image_widget.styles.height) for p in viewer_panes}
+        assert len(viewer_sizes) == 1
+
+
+async def test_one_failing_run_in_compared_images_does_not_hide_other_runs():
+    from wandb_cli_tool.api.models import RunInfo
+    from wandb_cli_tool.images import ImageInfo, ImageSeries, ImageStep
+
+    class FourRunsOneBroken(CompareClient):
+        RUNS = {
+            ("me", "alpha"): [
+                RunInfo(f"id{i}", f"run-{i}", "finished", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+                for i in range(4)
+            ]
+        }
+        CONFIGS = {f"id{i}": {"lr": 0.1} for i in range(4)}
+        METRICS_BY_RUN = {f"id{i}": ["acc"] for i in range(4)}
+        VALUES_BY_RUN = {f"id{i}": {"acc": 0.5} for i in range(4)}
+
+        def run_details(self, ref):
+            return RunInfo(ref.id, f"run-{ref.id[-1]}", "finished", "", "")
+
+        def run_images(self, ref):
+            return [ImageInfo("samples")]
+
+        def image_steps(self, ref, key):
+            if ref.id == "id3":
+                raise RuntimeError("RustArrowWrapper initialization failed: could not find lib")
+            return ImageSeries((ImageStep(10, (f"media/images/{ref.id}_10.png",), (f"sha{ref.id}",)),), 1)
+
+    app = make(FourRunsOneBroken)
+    media_layout(app)
+    async with app.run_test(size=(160, 50)) as pilot:
+        screen = await compare(pilot, 0, 1, 2, 3)
+        await show_panel(pilot, screen, "Media")
+        [view] = screen.query(CompareImageView)
+        assert view.unavailable is None
+        assert len(view._shown) == 3
+        labels = [l.render().plain for l in view.query(".cell-label")]
+        assert "step 10" in labels[0] and "RustArrowWrapper initialization failed" in labels[3]

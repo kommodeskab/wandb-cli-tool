@@ -476,3 +476,19 @@ async def test_the_options_dialog_sets_x_limits_and_grid(make_app):
         shown = app.focused
         assert isinstance(shown, ChartView) and (shown.spec.opts.xmin, shown.spec.opts.xmax, shown.spec.opts.grid) == (1.0, 3.0, True)
         assert "x 1…3, grid" in str(shown.border_subtitle)
+
+
+def test_downsample_points_caps_length_and_keeps_endpoints_and_peaks():
+    from wandb_cli_tool.series import downsample_points
+
+    short = [(float(i), float(i)) for i in range(20)]
+    assert downsample_points(short, 300) is short
+
+    pts = [(float(i), float((i * 7) % 13)) for i in range(6000)]
+    pts[1234] = (1234.0, 999.0)
+    pts[4321] = (4321.0, -999.0)
+    down = downsample_points(pts, 300)
+    assert len(down) <= 300
+    assert down[0] == pts[0] and down[-1] == pts[-1]
+    assert (1234.0, 999.0) in down and (4321.0, -999.0) in down
+    assert [p[0] for p in down] == sorted(p[0] for p in down)

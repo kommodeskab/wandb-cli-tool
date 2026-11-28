@@ -53,6 +53,7 @@ class AudioPlayerView(Widget):
         self._state = "stopped"
         self.problem = ""  # why the last attempt to play failed (shown in place of the position)
         self._last_position = 0.0
+        self._wave_cache: tuple[tuple[int, int, int], list[str]] | None = None
 
     def on_mount(self) -> None:
         self.set_interval(TICK, self._tick)
@@ -63,10 +64,12 @@ class AudioPlayerView(Widget):
         if path != self.path:
             self.problem = ""
         self.path, self.waveform, self.message = path, waveform, note
+        self._wave_cache = None
         self.refresh()
 
     def clear(self, message: str) -> None:
         self.path, self.waveform, self.message = None, None, message
+        self._wave_cache = None
         self.refresh()
 
     @property
@@ -85,6 +88,8 @@ class AudioPlayerView(Widget):
         return 0.0
 
     def _tick(self) -> None:
+        if self.path is None and self._state == "stopped":
+            return
         player = self.app.audio_player
         mine = self.path is not None and player.path == self.path
         if mine:
@@ -128,8 +133,13 @@ class AudioPlayerView(Widget):
         done, _ = progress_bar(width, fraction)
         lines: list[Text] = []
         if self.waveform is not None and height >= 5:
-            cols = columns_for(self.waveform.peaks, width)
-            for row in waveform_rows(cols, height - 2):
+            wave_key = (id(self.waveform), width, height - 2)
+            if self._wave_cache is not None and self._wave_cache[0] == wave_key:
+                wave_rows = self._wave_cache[1]
+            else:
+                wave_rows = waveform_rows(columns_for(self.waveform.peaks, width), height - 2)
+                self._wave_cache = (wave_key, wave_rows)
+            for row in wave_rows:
                 text = Text(no_wrap=True, overflow="crop")
                 text.append(row[:done], style=accent)
                 text.append(row[done:], style="dim")
@@ -236,11 +246,15 @@ class AudioChartView(ChartBase, Vertical):
             step = self.current_step
             return step is not None and len(step.paths) > 1
         if action == "toggle_play":
-            return self.player_view.path is not None and self.unavailable is None
+            views = list(self.query(AudioPlayerView))
+            return bool(views) and views[0].path is not None and self.unavailable is None
         return True
 
     def key_label(self, action: str) -> str | None:
-        return play_label(self.player_view.state) if action == "toggle_play" else None
+        if action == "toggle_play":
+            views = list(self.query(AudioPlayerView))
+            return play_label(views[0].state) if views else "Play"
+        return None
 
     @property
     def player_view(self) -> AudioPlayerView:
@@ -248,7 +262,8 @@ class AudioChartView(ChartBase, Vertical):
 
     def on_audio_player_view_state_changed(self, event: AudioPlayerView.StateChanged) -> None:
         event.stop()
-        self.refresh_bindings()
+        if self.is_attached:
+            self.refresh_bindings()
 
     def action_toggle_play(self) -> None:
         message = toggle_playback(self.app, self.player_view)
@@ -268,6 +283,8 @@ class AudioChartView(ChartBase, Vertical):
 
     def show_unavailable(self, message: str) -> None:
         """This run never logged this key: collapse to a short note."""
+        if not self.is_attached:
+            return
         self.unavailable = message
         self.player_view.display = False
         self.query_one("#slider").display = False
@@ -285,6 +302,8 @@ class AudioChartView(ChartBase, Vertical):
     def set_steps(self, series: ImageSeries, keep_position: bool = False) -> None:
         """New list of steps. First time: show the newest. When refreshing: stay on the same
         step, unless the slider was at the end, in which case follow the newest."""
+        if not self.is_attached:
+            return
         self._leave_unavailable()
         previous = self.current_step.step if self.current_step else None
         was_end = self.cursor.at_end
@@ -354,14 +373,14 @@ class AudioChartView(ChartBase, Vertical):
 
     # ---- results from the screen ---------------------------------------------------------
     def show_clip(self, path: Path, waveform: Waveform | None, key: tuple[int, int], note: str = "") -> None:
-        if key != self._wanted:  # the slider has moved on since this was requested
+        if not self.is_attached or key != self._wanted:  # the slider has moved on or the view was removed
             return
         self._shown, self.waiting, self.error = key, False, ""
         self.player_view.set_clip(path, waveform, note)
         self._update_info()
 
     def fail(self, message: str, key: tuple[int, int] | None = None) -> None:
-        if key is not None and key != self._wanted:
+        if not self.is_attached or (key is not None and key != self._wanted):
             return
         self.error, self.waiting = message, False
         if self.series is None:

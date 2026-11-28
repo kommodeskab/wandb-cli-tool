@@ -69,7 +69,7 @@ class ChartViewerScreen(Screen):
             legend = Text()
             for label, color in self._legend:
                 if legend:
-                    legend.append("   ")
+                    legend.append("\n")
                 legend.append("■ ", style=color)
                 legend.append(label)
             self.query_one("#viewer-legend", Static).update(legend)

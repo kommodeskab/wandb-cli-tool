@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from rich.text import Text
 from textual.app import ComposeResult
@@ -13,6 +13,7 @@ from textual.events import MouseDown, MouseMove, MouseScrollDown, MouseScrollUp,
 from textual.message import Message
 from textual.screen import Screen
 from textual.widgets import Header, Static
+from ..images import IMAGE_ERRORS
 from ..imageview import ImageViewport, render_crop
 from ..plain import plain
 from .keybar import KeyBar
@@ -54,6 +55,7 @@ class ZoomableImage(Vertical):
         widget_cls=None,
         allow_wheel_zoom: bool = False,
         interactive: bool = True,
+        size_provider: Callable[[], tuple[int, int] | None] | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -61,6 +63,7 @@ class ZoomableImage(Vertical):
         self._widget_cls = widget_cls or BEST_IMAGE
         self.allow_wheel_zoom = allow_wheel_zoom
         self.interactive = interactive  # False: a fitted preview, no dragging
+        self._size_provider = size_provider
         self.path: Path | None = None
         self.full_path: Path | None = None
         self._source = None
@@ -131,10 +134,20 @@ class ZoomableImage(Vertical):
                 widget.image = self.path
                 self.call_after_refresh(self.render_view)
 
+    def _viewport_size(self) -> tuple[int, int]:
+        vp_w, vp_h = self.content_size.width, self.content_size.height
+        if vp_w <= 0 or vp_h <= 0:
+            return vp_w, vp_h
+        if self._size_provider is not None:
+            shared = self._size_provider()
+            if shared is not None and shared[0] > 0 and shared[1] > 0:
+                return min(vp_w, shared[0]), min(vp_h, shared[1])
+        return vp_w, vp_h
+
     def render_view(self, draft: bool = False) -> None:
         if self._source is None or not self.is_attached:
             return
-        vp_w, vp_h = self.content_size.width, self.content_size.height
+        vp_w, vp_h = self._viewport_size()
         if vp_w <= 0 or vp_h <= 0:
             return
         img = self.image_widget
@@ -182,8 +195,9 @@ class ZoomableImage(Vertical):
         if dx == 0 and dy == 0:
             return
         self._last_xy = (event.screen_x, event.screen_y)
-        vp_w = max(1, self.content_size.width or 80)
-        vp_h = max(1, self.content_size.height or 24)
+        raw_w, raw_h = self._viewport_size()
+        vp_w = max(1, raw_w or 80)
+        vp_h = max(1, raw_h or 24)
         cell_w, cell_h = _cell_pixels()
         if not self.viewport.pan_by_cells(
             dx, dy, self._source.width, self._source.height, vp_w, vp_h, cell_w, cell_h
@@ -236,6 +250,7 @@ class ImageViewerScreen(Screen):
         Binding("down", "pan(0, 0.15)", "Pan down", show=False),
     ]
     DEFAULT_CSS = """
+    ImageViewerScreen #viewer-legend { padding: 0 1; height: auto; }
     ImageViewerScreen #viewer-status { padding: 0 1; color: $text-muted; }
     ImageViewerScreen #viewer-cells { height: 1fr; }
     ImageViewerScreen .viewer-cell { width: 1fr; height: 1fr; }
@@ -250,13 +265,25 @@ class ImageViewerScreen(Screen):
         title: str,
         subtitle: str = "",
         viewport: ImageViewport | None = None,
+        legend: Sequence[tuple[str, str]] = (),
     ) -> None:
         super().__init__()
         self.items = list(items)
         self.viewer_title = title
         self.viewer_subtitle = subtitle
         self.viewport = viewport.copy() if viewport is not None else ImageViewport()
+        self._legend = list(legend)
         self.mode_index = 0
+
+    def _cell_viewport_size(self) -> tuple[int, int] | None:
+        sizes = [
+            (p.content_size.width, p.content_size.height)
+            for p in self.query(ZoomableImage)
+            if p.content_size.width > 0 and p.content_size.height > 0
+        ]
+        if not sizes:
+            return None
+        return min(w for w, _ in sizes), min(h for _, h in sizes)
 
     def _render_modes(self):
         from . import files as files_mod
@@ -272,32 +299,49 @@ class ImageViewerScreen(Screen):
         modes = self._render_modes()
         widget_cls = modes[self.mode_index % len(modes)][1]
         yield Header()
+        if self._legend:
+            yield Static("", id="viewer-legend")
         yield Static("", id="viewer-status")
+        shared_size = self._cell_viewport_size if len(self.items) > 1 else None
         with Horizontal(id="viewer-cells"):
             for i, (label, path, color) in enumerate(self.items):
                 with Vertical(classes="viewer-cell viewer-cell-sep" if i else "viewer-cell"):
                     if len(self.items) > 1:
-                        header = Text()
+                        header = Text(no_wrap=True, overflow="ellipsis")
                         if color:
                             header.append("■ ", style=color)
-                        header.append(label)
+                        header.append(label, style="dim" if self._legend else "")
                         yield Static(header, classes="viewer-label")
                     if path is None:
                         yield Static("not logged", classes="viewer-empty")
                     else:
                         yield ZoomableImage(
-                            viewport=self.viewport, widget_cls=widget_cls, allow_wheel_zoom=True
+                            viewport=self.viewport,
+                            widget_cls=widget_cls,
+                            allow_wheel_zoom=True,
+                            size_provider=shared_size,
                         )
         yield KeyBar()
 
     def on_mount(self) -> None:
         self.title = self.viewer_title
         self.sub_title = self.viewer_subtitle
+        if self._legend:
+            legend = Text()
+            for label, color in self._legend:
+                if legend:
+                    legend.append("\n")
+                legend.append("■ ", style=color)
+                legend.append(label)
+            self.query_one("#viewer-legend", Static).update(legend)
         panes = list(self.query(ZoomableImage))
         idx = 0
         for _, path, _ in self.items:
             if path is not None and idx < len(panes):
-                panes[idx].set_image(path, path)
+                try:
+                    panes[idx].set_image(path, path)
+                except IMAGE_ERRORS as exc:
+                    self.notify(f"Could not read image: {exc}", severity="warning")
                 idx += 1
         self._update_status()
         self.refresh_bindings()

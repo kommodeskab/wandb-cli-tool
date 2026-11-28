@@ -9,6 +9,8 @@ and several images logged at once under one key as
 
 from __future__ import annotations
 
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -17,6 +19,7 @@ MAX_IMAGE_STEPS = 1000  # steps offered on the slider; more are sampled evenly (
 MAX_SCAN_ROWS = 50_000  # history rows read while looking for a key's images
 THUMBNAIL_SIDE = 1600  # longest side of the copy that is actually drawn (big images are slow to decode)
 IMAGE_TYPES = ("image-file", "images/separated")
+IMAGE_ERRORS = (OSError, SyntaxError, ValueError)
 
 
 @dataclass(frozen=True)
@@ -159,6 +162,18 @@ def index_at(x: int, width: int, n: int) -> int:
     return max(0, min(n - 1, round(max(0, min(x, width - 1)) * (n - 1) / (width - 1))))
 
 
+def _is_readable_image(path: Path) -> bool:
+    """Return True if `path` can be opened and fully decoded as an image."""
+    from PIL import Image
+
+    try:
+        with Image.open(path) as im:
+            im.load()
+        return True
+    except IMAGE_ERRORS:
+        return False
+
+
 def make_thumbnail(path: Path, max_side: int = THUMBNAIL_SIDE) -> Path:
     """A screen-sized copy of an image next to the original (cached), or the original itself if
     it is small already. Raises if the file is not a readable image."""
@@ -166,16 +181,23 @@ def make_thumbnail(path: Path, max_side: int = THUMBNAIL_SIDE) -> Path:
 
     thumb = path.with_name(f"{path.stem}.thumb{max_side}.png")
     if thumb.is_file() and thumb.stat().st_mtime >= path.stat().st_mtime:
-        return thumb  # made earlier: no need to read (and checksum) the big original again
-    with Image.open(path) as im:
-        im.verify()
+        if _is_readable_image(thumb):
+            return thumb  # made earlier: no need to read (and checksum) the big original again
+        thumb.unlink(missing_ok=True)
     with Image.open(path) as im:
         if max(im.size) <= max_side:
+            im.load()
             return path
         im.draft("RGB", (max_side * 2, max_side * 2))  # JPEGs decode at reduced size
         copy = im.copy()
     copy.thumbnail((max_side, max_side))
-    tmp = thumb.with_suffix(".tmp.png")
-    copy.save(tmp, format="PNG")
-    tmp.replace(thumb)
+    fd, tmp_name = tempfile.mkstemp(dir=thumb.parent, prefix=f".{thumb.stem}.", suffix=".tmp.png")
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        copy.save(tmp, format="PNG")
+        tmp.replace(thumb)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
     return thumb

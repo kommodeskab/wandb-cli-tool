@@ -237,10 +237,10 @@ class CompareScreen(ChartEditing, Screen):
     def on_mount(self) -> None:
         self.title = f"Compare — {len(self.runs)} runs"
         self.sub_title = f"{self.entity}/{self.project}"
-        legend = Text()  # every run's color and name, kept in view above all the tabs
+        legend = Text()  # every run's color and name, stacked vertically above all the tabs
         for color, label in zip(self._colors(), self.labels):
             if legend:
-                legend.append("   ")
+                legend.append("\n")
             legend.append("■ ", style=color)
             legend.append(label)
         self.query_one("#legend", Static).update(legend)
@@ -298,7 +298,11 @@ class CompareScreen(ChartEditing, Screen):
         return Text.assemble(("■ ", self._colors()[i]), label)
 
     def _status(self, text: str) -> None:
-        self.query_one("#status", Static).update(plain(text))
+        if not self.is_attached:
+            return
+        bar = self.query_one("#status", Static)
+        bar.display = bool(text)
+        bar.update(plain(text))
 
     # ---- loading ---------------------------------------------------------------------
     @work(thread=True, exclusive=True, group="load")
@@ -327,11 +331,15 @@ class CompareScreen(ChartEditing, Screen):
         self.load()
 
     def _progress(self) -> None:
+        if not self.is_attached:
+            return
         self._loaded_count += 1
         if not self.ready:
             self._status(f"Loading runs… {self._loaded_count}/{len(self.runs)}")
 
     async def _loaded(self, data: list[RunData]) -> None:
+        if not self.is_attached:
+            return
         panel = self.panels[self.selected].name if self.panels else None
         focused = self.focused
         focused_chart = (focused.chart, focused.index) if isinstance(focused, CompareBase) else None
@@ -385,7 +393,7 @@ class CompareScreen(ChartEditing, Screen):
         elif tab == "metrics":
             self._status(self._metrics_summary)
         elif tab == "charts":
-            self._status(f"{len(self.panels)} panels")
+            self._status("")
         else:
             hidden = f"  ·  {self._hidden_overview_rows} identical rows hidden" if self._hidden_overview_rows else ""
             self._status(f"{len(self.runs)} runs{hidden}")
@@ -682,7 +690,8 @@ class CompareScreen(ChartEditing, Screen):
 
     async def _show_panel(self, focus: int | None = None, *, focus_view: int | None = None) -> None:
         async with self._render_lock:
-            self.workers.cancel_group(self, "plots")  # nothing is fetched for a panel that is no longer shown
+            for group in ("plots", "tables", "images", "audio"):
+                self.workers.cancel_group(self, group)  # nothing is fetched for a panel that is no longer shown
             self._shown_panel = self.selected
             container = self.query_one("#charts", VerticalScroll)
             await container.remove_children()
@@ -820,7 +829,8 @@ class CompareScreen(ChartEditing, Screen):
         for name, points in found.items():
             self._series_cache[(run, False, name, x)] = points
         for view in views:
-            self._show_plot(view)
+            if view.chart.x == x and view.chart.metric in found:
+                self._show_plot(view)
 
     def _plots_failed(self, views: list[ComparePlotView], message: str) -> None:
         for view in views:
@@ -836,8 +846,10 @@ class CompareScreen(ChartEditing, Screen):
         else:
             self._fetch_tables(view, infos)
 
-    @work(thread=True)
+    @work(thread=True, group="tables")
     def _fetch_tables(self, view: CompareTableView, infos: list[TableInfo | None]) -> None:
+        worker = get_current_worker()
+
         def one(i: int) -> TableData | None:
             return self.app.client.table_data(self.runs[i][0], infos[i].path) if infos[i] else None
 
@@ -845,9 +857,15 @@ class CompareScreen(ChartEditing, Screen):
             with ThreadPoolExecutor(max_workers=min(len(infos), SERIES_WORKERS)) as pool:
                 tables = list(pool.map(one, range(len(infos))))
         except Exception as exc:
-            self.app.call_from_thread(view.fail, str(exc))
+            if not worker.is_cancelled:
+                self.app.call_from_thread(self._tables_failed, view, str(exc))
             return
-        self.app.call_from_thread(self._tables_ready, view, tables)
+        if not worker.is_cancelled:
+            self.app.call_from_thread(self._tables_ready, view, tables)
+
+    def _tables_failed(self, view: CompareTableView, message: str) -> None:
+        if view.is_attached:
+            view.fail(message)
 
     def _tables_ready(self, view: CompareTableView, tables: list[TableData | None]) -> None:
         if view.is_attached:
@@ -861,23 +879,38 @@ class CompareScreen(ChartEditing, Screen):
         else:
             self._fetch_steps(view, key, have, keep_position)
 
-    @work(thread=True)
+    @work(thread=True, group="images")
     def _fetch_steps(self, view: CompareImageView, key: str, have: list[int], keep_position: bool = False) -> None:
-        def one(i: int) -> ImageSeries:
-            return self.app.client.image_steps(self.runs[i][0], key)
+        worker = get_current_worker()
 
-        try:
-            with ThreadPoolExecutor(max_workers=min(len(have), SERIES_WORKERS)) as pool:
-                found = dict(zip(have, pool.map(one, have)))
-        except Exception as exc:
-            self.app.call_from_thread(view.show_unavailable, f"Could not read the images: {exc}")
+        def one(i: int) -> tuple[ImageSeries | None, str | None]:
+            try:
+                return self.app.client.image_steps(self.runs[i][0], key), None
+            except Exception as exc:
+                return None, str(exc)
+
+        with ThreadPoolExecutor(max_workers=min(len(have), SERIES_WORKERS)) as pool:
+            results = dict(zip(have, pool.map(one, have)))
+        if worker.is_cancelled:
+            return
+        found = {i: s for i, (s, _) in results.items() if s is not None}
+        errors = {i: err for i, (_, err) in results.items() if err is not None}
+        if not found:
+            first_error = next(iter(errors.values()), "unknown error")
+            self.app.call_from_thread(view.show_unavailable, f"Could not read the images: {first_error}")
             return
         series = [found.get(i) for i in range(len(self.runs))]
-        self.app.call_from_thread(self._steps_ready, view, series, keep_position)
+        self.app.call_from_thread(self._steps_ready, view, series, keep_position, errors)
 
-    def _steps_ready(self, view: CompareImageView, series: list[ImageSeries | None], keep_position: bool = False) -> None:
+    def _steps_ready(
+        self,
+        view: CompareImageView,
+        series: list[ImageSeries | None],
+        keep_position: bool = False,
+        errors: dict[int, str] | None = None,
+    ) -> None:
         if view.is_attached:
-            view.set_series(series, keep_position=keep_position)
+            view.set_series(series, keep_position=keep_position, step_errors=errors)
 
     def on_compare_image_view_wanted(self, event: CompareImageView.Wanted) -> None:
         view = event.view
@@ -891,12 +924,15 @@ class CompareScreen(ChartEditing, Screen):
 
     @work(thread=True, group="images")
     def _fetch_image(self, view: CompareImageView, run: int, step: ImageStep, sub: int, token: tuple[int, int]) -> None:
+        worker = get_current_worker()
         try:
             thumb, original = fetch_image(self.app, self.runs[run][0], step, sub)
         except Exception as exc:
-            self.app.call_from_thread(view.fail, run, str(exc), token)
+            if not worker.is_cancelled:
+                self.app.call_from_thread(view.fail, run, str(exc), token)
             return
-        self.app.call_from_thread(view.show_image, run, thumb, token, original)
+        if not worker.is_cancelled:
+            self.app.call_from_thread(view.show_image, run, thumb, token, original)
 
     def _load_audio(self, view: CompareAudioView, keep_position: bool = False) -> None:
         key = view.chart.metric
@@ -906,23 +942,38 @@ class CompareScreen(ChartEditing, Screen):
         else:
             self._fetch_audio_steps(view, key, have, keep_position)
 
-    @work(thread=True)
+    @work(thread=True, group="audio")
     def _fetch_audio_steps(self, view: CompareAudioView, key: str, have: list[int], keep_position: bool = False) -> None:
-        def one(i: int) -> ImageSeries:
-            return self.app.client.audio_steps(self.runs[i][0], key)
+        worker = get_current_worker()
 
-        try:
-            with ThreadPoolExecutor(max_workers=min(len(have), SERIES_WORKERS)) as pool:
-                found = dict(zip(have, pool.map(one, have)))
-        except Exception as exc:
-            self.app.call_from_thread(view.show_unavailable, f"Could not read the audio: {exc}")
+        def one(i: int) -> tuple[ImageSeries | None, str | None]:
+            try:
+                return self.app.client.audio_steps(self.runs[i][0], key), None
+            except Exception as exc:
+                return None, str(exc)
+
+        with ThreadPoolExecutor(max_workers=min(len(have), SERIES_WORKERS)) as pool:
+            results = dict(zip(have, pool.map(one, have)))
+        if worker.is_cancelled:
+            return
+        found = {i: s for i, (s, _) in results.items() if s is not None}
+        errors = {i: err for i, (_, err) in results.items() if err is not None}
+        if not found:
+            first_error = next(iter(errors.values()), "unknown error")
+            self.app.call_from_thread(view.show_unavailable, f"Could not read the audio: {first_error}")
             return
         series = [found.get(i) for i in range(len(self.runs))]
-        self.app.call_from_thread(self._audio_steps_ready, view, series, keep_position)
+        self.app.call_from_thread(self._audio_steps_ready, view, series, keep_position, errors)
 
-    def _audio_steps_ready(self, view: CompareAudioView, series: list[ImageSeries | None], keep_position: bool = False) -> None:
+    def _audio_steps_ready(
+        self,
+        view: CompareAudioView,
+        series: list[ImageSeries | None],
+        keep_position: bool = False,
+        errors: dict[int, str] | None = None,
+    ) -> None:
         if view.is_attached:
-            view.set_series(series, keep_position=keep_position)
+            view.set_series(series, keep_position=keep_position, step_errors=errors)
 
     def on_compare_audio_view_wanted(self, event: CompareAudioView.Wanted) -> None:
         event.stop()
@@ -937,12 +988,15 @@ class CompareScreen(ChartEditing, Screen):
 
     @work(thread=True, group="audio")
     def _fetch_clip(self, view: CompareAudioView, run: int, step: ImageStep, sub: int, token: tuple[int, int]) -> None:
+        worker = get_current_worker()
         try:
             path, waveform, note = fetch_audio(self.app, self.runs[run][0], step, sub)
         except Exception as exc:
-            self.app.call_from_thread(view.fail, run, str(exc), token)
+            if not worker.is_cancelled:
+                self.app.call_from_thread(view.fail, run, str(exc), token)
             return
-        self.app.call_from_thread(view.show_clip, run, path, waveform, token, note)
+        if not worker.is_cancelled:
+            self.app.call_from_thread(view.show_clip, run, path, waveform, token, note)
 
     # ---- focus -----------------------------------------------------------------------
     def action_focus_chart(self, delta: int) -> None:

@@ -12,7 +12,7 @@ from typing import Any, Iterator, Protocol
 from ..formatting import parse_time
 from ..series import Point, extract_points, numeric_values, plottable_keys
 from ..audio import AudioInfo, audio_entries, parse_audio_steps
-from ..images import MAX_SCAN_ROWS, ImageInfo, ImageSeries, image_entries, parse_image_steps
+from ..images import MAX_IMAGE_STEPS, MAX_SCAN_ROWS, ImageInfo, ImageSeries, image_entries, parse_image_steps
 from ..tables import MAX_TABLE_BYTES, TableData, TableInfo, parse_table, table_entries
 from .models import (  # noqa: F401  (safe_relative_path is re-exported)
     CopyEstimate, FileInfo, ProjectInfo, RunInfo, RunMetadata, RunRef, download_run_file, is_inside,
@@ -322,9 +322,17 @@ class WandbApiClient:
         return image_entries(self._run(ref).summary_metrics)
 
     def _key_rows(self, ref: RunRef, key: str):
-        for n, row in enumerate(self._run(ref).scan_history(keys=[key], page_size=500)):
-            if n >= MAX_SCAN_ROWS:  # a bound, so one huge run cannot stall the screen
-                return
+        run = self._run(ref)
+        try:
+            for n, row in enumerate(run.scan_history(keys=[key], page_size=500)):
+                if n >= MAX_SCAN_ROWS:  # a bound, so one huge run cannot stall the screen
+                    return
+                yield row
+            return
+        except Exception:
+            if not hasattr(run, "history"):
+                raise
+        for row in run.history(keys=[key], x_axis="_step", samples=MAX_IMAGE_STEPS, pandas=False):
             yield row
 
     def image_steps(self, ref: RunRef, key: str) -> ImageSeries:

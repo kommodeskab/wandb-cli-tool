@@ -434,3 +434,74 @@ async def test_image_chart_offers_zoom_only_once_the_image_is_opened(make_app):
         await settle(pilot)
         assert isinstance(app.screen, RunScreen) and app.screen.active_tab == "charts"
         assert view.viewport.zoom == 1.0  # the chart's preview stays fitted
+
+
+async def test_detached_image_views_ignore_late_callbacks(make_app, tmp_path):
+    from test_compare_screen import MediaClient, compare, make, media_layout, show_panel
+    from wandb_cli_tool.screens.compare_widgets import CompareImageView
+
+    app, ctx = await start(make_app)
+    async with ctx as pilot:
+        screen, view = await with_images(pilot)
+        key = view._wanted
+        screen.selected = 0
+        await screen._show_panel()
+        await settle(pilot, 4)
+        assert not view.is_attached
+        view.show_image(tmp_path / "x.png", key)
+        view.fail("boom", key)
+        view.show_unavailable("gone")
+
+    cmp_app = make(MediaClient)
+    media_layout(cmp_app)
+    async with cmp_app.run_test(size=(150, 50)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        await show_panel(pilot, screen, "Media")
+        [cview] = screen.query(CompareImageView)
+        token = cview.token()
+        screen.selected = 0
+        await screen._show_panel()
+        await settle(pilot, 4)
+        assert not cview.is_attached
+        cview.show_image(0, tmp_path / "x.png", token)
+        cview.fail(0, "boom", token)
+        cview.show_unavailable("gone")
+
+
+async def test_corrupt_cached_image_is_redownloaded_and_unreadable_images_do_not_crash(make_app, tmp_path):
+    from test_compare_screen import MediaClient, compare, make, media_layout, show_panel
+    from wandb_cli_tool.api import FileInfo, RunRef
+    from wandb_cli_tool.screens.compare_widgets import CompareImageView
+    from wandb_cli_tool.screens.files import download_dir
+    from wandb_cli_tool.screens.imagefetch import fetch_image
+
+    app, ctx = await start(make_app)
+    async with ctx as pilot:
+        step = FakeClient.IMAGE_STEPS["samples"][0]
+        ref = RunRef("me", "alpha", "id1")
+        folder = download_dir(app.cache.root, ref, FileInfo(step.paths[0], step.size(0), step.identity(0)))
+        cached = folder / step.paths[0]
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (40, 40), (1, 2, 3)).save(cached)
+        cached.write_bytes(cached.read_bytes()[:33] + b"\x00" * 32)
+        app.client.downloads.clear()
+        thumb, original = fetch_image(app, ref, step, 0)
+        assert app.client.downloads == [step.paths[0]] and original == cached
+        with Image.open(thumb) as im:
+            im.load()
+
+        broken = tmp_path / "broken.png"
+        Image.new("RGB", (40, 40), (1, 2, 3)).save(broken)
+        broken.write_bytes(broken.read_bytes()[:33] + b"\x00" * 32)
+        screen, view = await with_images(pilot)
+        view.show_image(broken, view._wanted)
+        assert "Could not read image" in info(view)
+
+    cmp_app = make(MediaClient)
+    media_layout(cmp_app)
+    async with cmp_app.run_test(size=(150, 50)) as pilot:
+        screen = await compare(pilot, 0, 1, 2)
+        await show_panel(pilot, screen, "Media")
+        [cview] = screen.query(CompareImageView)
+        cview.show_image(0, broken, cview.token())
+        assert "Could not read image" in cview.errors.get(0, "")

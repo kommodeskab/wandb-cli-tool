@@ -73,3 +73,41 @@ def prepare_points(points: list[Point], opts) -> tuple[list[Point], int]:
     shown = smooth_ema(points, opts.smooth)
     kept = [p for p in shown if (not opts.logx or p[0] > 0) and (not opts.logy or p[1] > 0)]
     return kept, len(shown) - len(kept)
+
+
+def downsample_points(points: list[Point], max_points: int) -> list[Point]:
+    """Reduce a long series to at most `max_points` points using min-max bucketing while preserving
+    exact endpoints and local extrema in order."""
+    if max_points < 4 or len(points) <= max_points:
+        return points
+    out: list[Point] = [points[0]]
+    interior = points[1:-1]
+    m = len(interior)
+    buckets = (max_points - 2) // 2
+    for i in range(buckets):
+        start = i * m // buckets
+        end = (i + 1) * m // buckets
+        if start >= end:
+            continue
+        min_i = start
+        max_i = start
+        min_y = interior[start][1]
+        max_y = min_y
+        for j in range(start + 1, end):
+            y = interior[j][1]
+            if y < min_y:
+                min_y = y
+                min_i = j
+            if y > max_y:
+                max_y = y
+                max_i = j
+        if min_i == max_i:
+            out.append(interior[min_i])
+        elif min_i < max_i:
+            out.append(interior[min_i])
+            out.append(interior[max_i])
+        else:
+            out.append(interior[max_i])
+            out.append(interior[min_i])
+    out.append(points[-1])
+    return out

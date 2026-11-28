@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..api import FileInfo, RunRef
-from ..images import ImageStep, make_thumbnail
+from ..images import IMAGE_ERRORS, THUMBNAIL_SIDE, ImageStep, make_thumbnail
 from ..media import MAX_IMAGE_BYTES
 from .files import DOWNLOAD_CACHE_BYTES, DOWNLOAD_NAMESPACE, download_dir
 
@@ -24,10 +24,19 @@ def fetch_image(app: "WandbCliApp", ref: RunRef, step: ImageStep, sub: int) -> t
         raise ValueError(f"The image is too large to display ({size // 1024 // 1024} MB).")
     folder = download_dir(app.cache.root, ref, FileInfo(path, size, step.identity(sub)))
     target = folder / path
-    if not (target.is_file() and (size is None or target.stat().st_size == size)):
+    cached = target.is_file() and (size is None or target.stat().st_size == size)
+    if not cached:
         app.cache.prune_dir_sometimes(DOWNLOAD_NAMESPACE, DOWNLOAD_CACHE_BYTES)
         app.client.download_file(ref, path, folder)
-    return make_thumbnail(target), target
+    try:
+        return make_thumbnail(target), target
+    except IMAGE_ERRORS:
+        if not cached:
+            raise
+        target.unlink(missing_ok=True)
+        target.with_name(f"{target.stem}.thumb{THUMBNAIL_SIDE}.png").unlink(missing_ok=True)
+        app.client.download_file(ref, path, folder)
+        return make_thumbnail(target), target
 
 
 def fetch_thumbnail(app: "WandbCliApp", ref: RunRef, step: ImageStep, sub: int) -> Path:
